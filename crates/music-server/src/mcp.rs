@@ -1815,8 +1815,8 @@ fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "assistant_set",
-                description: "Choose the writing assistant: provider none, local (an OpenAI-compatible server at local_base_url with local_model), managed (a model the studio runs: managed_model, or a GGUF at managed_path) or openrouter (openrouter_model); reasoning_effort off, minimal, low, medium or high.",
-                schema: || object(json!({ "provider": { "type": "string", "enum": ["none", "local", "managed", "openrouter"] }, "local_base_url": { "type": "string" }, "local_model": { "type": "string" }, "managed_model": { "type": "string" }, "managed_path": { "type": "string" }, "openrouter_model": { "type": "string" }, "reasoning_effort": { "type": "string" } }), &[]),
+                description: "Choose the writing assistant: provider none, local (an OpenAI-compatible server at local_base_url with local_model), managed (a model the studio runs: managed_model, or a GGUF at managed_path), openrouter (openrouter_model), agent (the connected MCP agent) or cli (an agent CLI on this machine: cli_agent, cli_model, cli_path); reasoning_effort off, minimal, low, medium or high.",
+                schema: || object(json!({ "provider": { "type": "string", "enum": ["none", "local", "managed", "openrouter", "agent", "cli"] }, "local_base_url": { "type": "string" }, "local_model": { "type": "string" }, "managed_model": { "type": "string" }, "managed_path": { "type": "string" }, "openrouter_model": { "type": "string" }, "cli_agent": { "type": "string" }, "cli_model": { "type": "string" }, "cli_path": { "type": "string" }, "reasoning_effort": { "type": "string" } }), &[]),
                 call: |args| send(Method::PUT, "/v1/assistant/status".into(), args.clone()),
             },
             Tool {
