@@ -3,7 +3,7 @@ import { libraryChanged, useActivity, useAssistantStatus, useSetupStatus, type A
 import { hasSungLines, karaokeReason } from '../services/karaoke';
 import {
   AlertTriangle, AudioLines, ChevronDown, CircleAlert, Dices, Ear, Eye, EyeOff, FileMusic, FolderOpen, Loader2,
-  Grid2x2, ListChecks, Music2, Pause, Piano, Play, RotateCcw, Save, Sparkles, Square, Tags, Upload, Wand2, Settings2, X,
+  Grid2x2, Guitar, ListChecks, Music2, Pause, Piano, Play, RotateCcw, Save, Sparkles, Square, Tags, Upload, Wand2, Settings2, X,
 } from 'lucide-react';
 import { AudioWaveform } from './AudioWaveform';
 import type { Playlist, Song, YueCot, YueHarmony, YueOutputFormat, YueRequest, YueSampling } from '../types';
@@ -17,13 +17,14 @@ import { MidiImportDialog } from './MidiImportDialog';
 import { isMidiFile } from '../services/midiFiles';
 import { trackMidiBase64 } from '../services/midiEditor';
 import { composePlans, composeScore, transcribe, type ScorePlan } from '../services/transcription';
-import { chordBed, failed, matchSections, type SectionProposal } from '../services/scoreApi';
+import { chordBed, failed, instrumentalScore, matchSections, type SectionProposal } from '../services/scoreApi';
+import { sectionTagsOnly } from '../services/instrumental';
 import { profileLabel as setLabel } from '../services/modelCatalog';
 import { REQUEST_FILE_ACCEPT, parseRequestFile, requestFileTitle, serializeRequest, type RequestFileFormat } from '../services/requestFile';
 import { AdapterPicker } from './AdapterPicker';
 import { CreatePlaylistModal } from './PlaylistModals';
 import { SlideToEnable } from './SlideToEnable';
-import { usesFromSettings, type AdapterUse } from '../services/adapters';
+import { fetchAdapters, installCatalogAdapters, startingScales, usesFromSettings, type AdapterUse } from '../services/adapters';
 import { engineParityLabels, planLabels } from '../i18n/engineParity';
 import { midiImportOptions } from '../i18n/midiImportOptions';
 import { SongTextParts } from './SongTextParts';
@@ -106,6 +107,8 @@ const CHORD_SYMBOL = /"[^"\n]+"/;
 const CHORD_SYMBOLS = /"[^"\n]+"/g;
 const BED_KEYS = ['C', 'G', 'D', 'A', 'E', 'B', 'F#', 'Db', 'Ab', 'Eb', 'Bb', 'F', 'Am', 'Em', 'Bm', 'F#m', 'C#m', 'G#m', 'Ebm', 'Bbm', 'Fm', 'Cm', 'Gm', 'Dm'];
 const BED_METERS = ['4/4', '3/4', '6/8', '2/4'];
+/** The catalogue LoRA an instrumental takes along. */
+const INSTRUMENTAL_LORA = 'yue2-instrumental';
 const SECTION_TAGS = ['[Intro]', '[Verse 1]', '[Pre-Chorus]', '[Chorus]', '[Verse 2]', '[Bridge]', '[Instrumental Break]', '[Outro]'];
 
 const PROFILE_LABEL: Record<string, string> = {
@@ -926,6 +929,41 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   // snapshot, so editing the form meanwhile does not change the next songs.
   const [forever, setForever] = useState(false);
   const foreverRequest = useRef<YueRequest | null>(null);
+  // the voice of the score becomes rests before anything is sung, so the model plays without singing
+  const [instrumental, setInstrumental] = useState(false);
+  // the model was trained to sing: the Instrumental LoRA is what keeps it from it, so the switch takes it along
+  const [instrumentalLoraLoading, setInstrumentalLoraLoading] = useState(false);
+  const switchInstrumental = async (on: boolean) => {
+    setInstrumental(on);
+    if (!on) return;
+    try {
+      const installed = async () => {
+        const state = await fetchAdapters();
+        return { state, lora: state.installed.find(adapter => adapter.origin.catalog_id === INSTRUMENTAL_LORA && !adapter.error) };
+      };
+      let { state, lora } = await installed();
+      if (!lora) {
+        setInstrumentalLoraLoading(true);
+        await installCatalogAdapters([INSTRUMENTAL_LORA]);
+        for (;;) {
+          await new Promise(resolve => window.setTimeout(resolve, 1000));
+          ({ state, lora } = await installed());
+          if (lora) break;
+          if (state.download?.error) throw new Error(state.download.error);
+          if (!state.installing.includes(INSTRUMENTAL_LORA) && !state.download) throw new Error(tt('instrumentalLoraFailed'));
+        }
+        window.dispatchEvent(new CustomEvent('yue:adapters-changed'));
+      }
+      const chosen = lora;
+      setAdapters(current => current.some(use => use.id === chosen.id)
+        ? current.map(use => (use.id === chosen.id ? { ...use, disabled: false } : use))
+        : [...current, { id: chosen.id, scales: startingScales(chosen, state.slots) }]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setInstrumentalLoraLoading(false);
+    }
+  };
   useEffect(() => {
     const stop = () => setForever(false);
     window.addEventListener('yue:cancel-all', stop);
@@ -947,10 +985,38 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [forever, activeJobCount]);
 
+  /** An instrumental: the score - the form's, or one written now - with its voice moved to the
+   *  instrument, and the lyrics' section tags without their words, so nothing is left to sing. */
+  const createInstrumental = async () => {
+    setComposing(true);
+    const controller = new AbortController();
+    composeRun.current = controller;
+    try {
+      if (effectiveCot === 'off') setCot('full');
+      const written = abc.trim() || await writeScoreAlone(controller.signal);
+      const answer = await instrumentalScore(written);
+      if (failed(answer)) throw new Error(answer.error);
+      setAbc(answer.abc.trimEnd());
+      setSemanticTokens('');
+      const request = buildRequest();
+      request.abc = answer.abc.trim();
+      request.cot = effectiveCot === 'off' ? 'full' : effectiveCot;
+      request.lyrics = sectionTagsOnly(lyrics);
+      delete request.semantic_tokens;
+      generate(request);
+    } catch (reason) {
+      if (!(reason instanceof DOMException && reason.name === 'AbortError')) setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      composeRun.current = null;
+      setComposing(false);
+    }
+  };
+
   const submit = () => {
     if (!ready) { setError(t('downloadProfileFirst')); return; }
     if (!style.trim() && !lyrics.trim() && !semanticTokens.trim()) { setError(tt('styleOrLyricsRequired')); return; }
     setError(null);
+    if (instrumental) { void createInstrumental(); return; }
     // Audio codes hold a performance already sung: ask whether to render that
     // take again or perform the prompt anew, as the engine's own WebUI does.
     if (semanticTokens.trim()) { setTakeChoiceOpen(true); return; }
@@ -989,6 +1055,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     mp3_bitrate: [mp3Bitrate, setMp3Bitrate],
     transpose: [transpose, setTranspose],
     vocals_only: [vocalsOnly, value => setVocalsOnly(value === 'true')],
+    instrumental: [instrumental, value => void switchInstrumental(value === 'true')],
     fade_in: [fadeIn, setFadeIn],
     fade_out: [fadeOut, setFadeOut],
     lyric_timing: [lyricTiming, value => setLyricTiming(value !== 'false')],
@@ -1874,6 +1941,14 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
           onClose={() => setNewPlaylistOpen(false)}
           onCreate={(name, description) => void onCreatePlaylist(name, description).then(playlist => { if (playlist) choosePlaylist(playlist.id); })}
         />
+        <label className="mb-2 flex cursor-pointer items-start gap-2 rounded-lg border border-zinc-200 px-3 py-2 text-xs dark:border-white/10">
+          <input type="checkbox" checked={instrumental} onChange={event => void switchInstrumental(event.target.checked)} className="mt-0.5 h-4 w-4 accent-pink-500" />
+          <span className="min-w-0">
+            <span className="flex items-center gap-1.5 font-semibold text-zinc-900 dark:text-white"><Guitar size={13} />{tt('instrumentalOnly')}</span>
+            {instrumental && <span className="mt-0.5 block leading-5 text-zinc-500 dark:text-zinc-400">{tt('instrumentalOnlyHint')}</span>}
+            {instrumentalLoraLoading && <span className="mt-1 flex items-center gap-1.5 leading-5 text-pink-600 dark:text-pink-300"><Loader2 size={12} className="animate-spin" />{tt('instrumentalLoraLoading')}</span>}
+          </span>
+        </label>
         {/* songs without end are switched on by a deliberate slide, never by a stray click */}
         <div className="mb-2">
           <SlideToEnable
@@ -1889,8 +1964,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
           onClick={submit}
           className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-linear-to-r from-orange-500 to-pink-600 text-base font-bold text-white shadow-lg transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {isGenerating ? <Square size={18} /> : <Sparkles size={18} />}
-          {t('create')}
+          {isGenerating ? <Square size={18} /> : instrumental ? <Guitar size={18} /> : <Sparkles size={18} />}
+          {composing && instrumental ? tt('composingScore') : instrumental ? tt('createInstrumental') : t('create')}
           {activeJobCount > 0 && <span className="rounded-full bg-white/20 px-2 py-0.5 text-xs">{activeJobCount}</span>}
         </button>
       </footer>
