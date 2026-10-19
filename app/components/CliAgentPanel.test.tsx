@@ -90,6 +90,19 @@ describe('CLI agent panel', () => {
     expect(host.textContent).toContain('warm piano pop');
   });
 
+  it('tests the CLI it shows as chosen when none was picked', async () => {
+    await mount({ provider: 'cli', cli_agent: null, cli_model: null, cli_path: null });
+    expect(host.textContent).toContain('cliSelected');
+    await act(async () => {
+      buttonWith('cliTest').click();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(host.textContent).not.toContain('cliTestNeedsChoice');
+    const put = calls.filter((call) => call.url.endsWith('/v1/assistant/status') && call.init?.method === 'PUT').pop();
+    expect(JSON.parse(put!.init!.body as string)).toMatchObject({ provider: 'cli', cli_agent: 'claude' });
+    expect(host.textContent).toContain('warm piano pop');
+  });
+
   it('answers a classified failure in the interface language', async () => {
     await mount({ provider: 'cli', cli_agent: 'claude', cli_model: null, cli_path: null });
     writeAnswer = { ok: false, status: 502, body: { error: 'Claude Code is not signed in: run `claude auth login` [cli_not_signed_in]' } };

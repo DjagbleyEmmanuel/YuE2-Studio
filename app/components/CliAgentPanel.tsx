@@ -3,6 +3,7 @@ import { Check, Loader2 } from 'lucide-react';
 import { useI18n } from '../context/I18nContext';
 import { apiUrl } from '../services/apiBase';
 import { assistantStatusChanged } from '../services/studioQueries';
+import { CLI_SIGNIN, explainCliFailure } from '../services/cliFailure';
 
 interface CliAgent {
   id: string;
@@ -25,12 +26,11 @@ interface AssistantStatus {
   cli_path?: string | null;
 }
 
-/** The machine tags the server appends to classified CLI failures. */
-const FAILURE_TAGS: Array<{ tag: string; key: 'cliNotSignedIn' | 'cliNoCredit' | 'cliThrottled' }> = [
-  { tag: '[cli_not_signed_in]', key: 'cliNotSignedIn' },
-  { tag: '[cli_no_credit]', key: 'cliNoCredit' },
-  { tag: '[cli_throttled]', key: 'cliThrottled' },
-];
+/** CLIs that are not installed by a command. */
+const INSTALL_PROSE: Record<string, 'cliInstallAgy' | 'cliInstallMuse'> = {
+  antigravity: 'cliInstallAgy',
+  muse: 'cliInstallMuse',
+};
 
 const INPUT =
   'w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 outline-hidden focus:border-pink-400 dark:border-white/10 dark:bg-black/20 dark:text-white';
@@ -100,15 +100,24 @@ export const CliAgentPanel: React.FC = () => {
     save(id, model, path);
   };
 
-  const explain = (raw: string): string => {
-    for (const { tag, key } of FAILURE_TAGS) {
-      if (raw.includes(tag)) return `${t(key)} ${raw.replace(tag, '').trim()}`;
-    }
-    return raw;
+  // the server answers with the first installed CLI when none is chosen
+  const effective = chosen || agents?.find((candidate) => candidate.installed)?.id || '';
+
+  const explain = (raw: string): string => explainCliFailure(raw, t, effective);
+
+  const signinHow = (id: string) => {
+    const [before, after] = t('cliSigninHow').split('{command}');
+    return (
+      <>
+        {before}
+        <code className="rounded bg-zinc-100 px-1 py-0.5 font-mono text-[11px] dark:bg-black/30">{CLI_SIGNIN[id] ?? id}</code>
+        {after}
+      </>
+    );
   };
 
   const test = async () => {
-    const agent = agents?.find((candidate) => candidate.id === chosen && candidate.installed);
+    const agent = agents?.find((candidate) => candidate.id === effective && candidate.installed);
     if (!agent) {
       setTestResult({ tone: 'error', text: t('cliTestNeedsChoice') });
       return;
@@ -150,7 +159,7 @@ export const CliAgentPanel: React.FC = () => {
 
       <div className="space-y-2">
         {(agents ?? []).map((agent) => {
-          const selected = provider === 'cli' && (chosen === agent.id || (!chosen && agent.installed && agents?.find((candidate) => candidate.installed)?.id === agent.id));
+          const selected = provider === 'cli' && effective === agent.id;
           return (
             <div key={agent.id} className={`rounded-xl border p-3 ${selected ? 'border-pink-400 dark:border-pink-500/60' : 'border-zinc-200 dark:border-white/10'}`}>
               <div className="flex items-center gap-2">
@@ -181,13 +190,17 @@ export const CliAgentPanel: React.FC = () => {
                 <div className="mt-1.5 space-y-1 pl-7 text-xs leading-5 text-zinc-500 dark:text-zinc-400">
                   <div className="break-all font-mono text-[11px]">{agent.path}</div>
                   {agent.default_model && <div>{t('cliModel')}: {agent.default_model}</div>}
-                  <div>{t('cliSignin')}: {agent.signin}</div>
+                  <div>{t('cliSignin')}: {signinHow(agent.id)}</div>
                 </div>
               ) : (
                 <div className="mt-1.5 space-y-1 pl-7 text-xs leading-5 text-zinc-500 dark:text-zinc-400">
-                  <div>
-                    {t('cliInstallLabel')}: <code className="rounded bg-zinc-100 px-1 py-0.5 font-mono text-[11px] dark:bg-black/30">{agent.install}</code>
-                  </div>
+                  {INSTALL_PROSE[agent.id] ? (
+                    <div>{t(INSTALL_PROSE[agent.id])}</div>
+                  ) : (
+                    <div>
+                      {t('cliInstallLabel')}: <code className="rounded bg-zinc-100 px-1 py-0.5 font-mono text-[11px] dark:bg-black/30">{agent.install}</code>
+                    </div>
+                  )}
                   {agent.docs && (
                     <div>
                       <a href={agent.docs} target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-zinc-900 dark:hover:text-white">
@@ -208,12 +221,12 @@ export const CliAgentPanel: React.FC = () => {
           <input
             value={model}
             onChange={(event) => setModel(event.target.value)}
-            placeholder={agents?.find((agent) => agent.id === chosen)?.default_model ?? ''}
+            placeholder={agents?.find((agent) => agent.id === effective)?.default_model ?? ''}
             list="cli-suggested-models"
             className={`${INPUT} mt-1`}
           />
           <datalist id="cli-suggested-models">
-            {(agents?.find((agent) => agent.id === chosen)?.suggested_models ?? []).map((suggestion) => (
+            {(agents?.find((agent) => agent.id === effective)?.suggested_models ?? []).map((suggestion) => (
               <option key={suggestion} value={suggestion} />
             ))}
           </datalist>

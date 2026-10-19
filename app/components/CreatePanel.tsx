@@ -30,6 +30,7 @@ import { SongTextParts } from './SongTextParts';
 import { writerInstruction } from '../services/songWriting';
 import { songWritingStrings } from '../i18n/songWriting';
 import { NumberField } from './NumberField';
+import { explainCliFailure } from '../services/cliFailure';
 
 /**
  * The YuE2 request form.
@@ -860,7 +861,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
       }
     } catch (reason) {
       const cancelled = reason instanceof DOMException && reason.name === 'AbortError';
-      if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason));
+      if (!cancelled) setError(explainCliFailure(reason instanceof Error ? reason.message : String(reason), t));
     } finally {
       assistRun.current = null;
       setAssisting(null);
@@ -889,7 +890,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
       setLyrics(body.lyrics);
     } catch (reason) {
       const cancelled = reason instanceof DOMException && reason.name === 'AbortError';
-      if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason));
+      if (!cancelled) setError(explainCliFailure(reason instanceof Error ? reason.message : String(reason), t));
     } finally {
       assistRun.current = null;
       setAssisting(null);

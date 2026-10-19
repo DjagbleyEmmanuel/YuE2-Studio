@@ -342,8 +342,8 @@ export const OptionalGroup: React.FC<{
                 if (serverField && engine === 'local') {
                   return null;
                 }
-                // the connected agent needs neither a key nor a download
-                if (engine === 'agent') {
+                // the connected agent and an agent CLI need neither a key nor a download
+                if (engine === 'agent' || engine === 'cli') {
                   return null;
                 }
                 return (
