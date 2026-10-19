@@ -3,6 +3,12 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## Unreleased
+
+### Fixed
+
+- **A cover from a FLAC, OGG or M4A recording.** The engine reads WAV and MP3 only, and any other recording stopped at "cannot decode audio"; the studio now decodes it itself and gives the engine a WAV ([#121](https://github.com/timoncool/YuE2-Studio/issues/121), [#93](https://github.com/timoncool/YuE2-Studio/issues/93)).
+
 ## 2026-10-20 — 3.6.1
 
 ### Fixed

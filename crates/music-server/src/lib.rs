@@ -8329,12 +8329,31 @@ async fn create_transcription(
     if bytes.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "The audio is empty.".into()));
     }
+    let (bytes, name) = tokio::task::spawn_blocking(move || engine_readable(bytes, name))
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
     let remote = state
         .music_server
         .transcribe(bytes, name, melody_only)
         .await
         .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, format!("the engine refused the transcription: {error}")))?;
     Ok((StatusCode::ACCEPTED, Json(ScoreJob::running(remote.id))))
+}
+
+/// A recording as the engine's reader takes it: WAV and MP3 go as they are,
+/// any other format the library holds (FLAC, OGG, M4A) is decoded here and
+/// goes as a 24-bit WAV.
+fn engine_readable(bytes: Vec<u8>, name: String) -> anyhow::Result<(Vec<u8>, String)> {
+    let mp3 = bytes.starts_with(b"ID3") || (bytes.len() > 1 && bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0);
+    if bytes.starts_with(b"RIFF") || mp3 {
+        return Ok((bytes, name));
+    }
+    let path = std::path::Path::new(&name);
+    let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("recording").to_owned();
+    let audio = audio_pcm::decode_stereo_bytes(bytes, &extension).with_context(|| format!("decode {name}"))?;
+    Ok((audio_pcm::wav24_bytes(&audio)?, format!("{stem}.wav")))
 }
 
 /// The score a finished job carries. A transcription answers with JSON; a
@@ -8955,6 +8974,20 @@ mod tests {
         assert!(lost_job_reason("ggml_cuda_compute_forward: MUL_MAT failed").contains("CUDA or driver error"));
         assert!(lost_job_reason("[NAR] Step 2/16, 87844 ms\n[NAR] Step 3/16\n[studio] the engine stopped answering").contains("its last line was [NAR] Step 3/16."));
         assert!(lost_job_reason("[Server] listening").contains("stopped during this song"));
+    }
+
+    #[test]
+    fn a_cover_recording_reaches_the_engine_as_wav_or_mp3() {
+        let audio = audio_post::Stereo { left: vec![0.25; 4_800], right: vec![-0.25; 4_800], rate: 48_000 };
+        let (sent, name) = engine_readable(audio_post::encode::flac(&audio).unwrap(), "Song.flac".into()).unwrap();
+        assert!(sent.starts_with(b"RIFF") && name == "Song.wav", "{name}");
+        let heard = audio_pcm::decode_stereo_bytes(sent, "wav").unwrap();
+        assert_eq!((heard.rate, heard.left.len()), (48_000, 4_800));
+        assert!((heard.left[100] - 0.25).abs() < 1e-5 && (heard.right[100] + 0.25).abs() < 1e-5);
+        let wav = audio_pcm::wav24_bytes(&audio).unwrap();
+        assert_eq!(engine_readable(wav.clone(), "a.wav".into()).unwrap().0, wav);
+        let mp3 = b"ID3\x04\x00rest".to_vec();
+        assert_eq!(engine_readable(mp3.clone(), "a.mp3".into()).unwrap().0, mp3);
     }
 
     #[test]
