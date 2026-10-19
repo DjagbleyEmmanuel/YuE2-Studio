@@ -7,6 +7,7 @@ Windows build.
 
 ### Added
 
+- **Lyrics in a video clip, found where they are.** The video screen's Text tab always shows the lyrics overlay: a song without karaoke timing gets a button that makes it there, and the overlay turns on when it is done; without karaoke set up it says where to set it up. Until now the overlay section was hidden for such a song ([#118](https://github.com/timoncool/YuE2-Studio/issues/118)).
 - **Fade in and fade out.** The create page's extra settings take seconds for a fade at the start and at the end of the made song, so an ending no longer stops abruptly; the studio applies them to the song it keeps, Reuse Prompt and a re-render keep them, and agents give `fade_in` and `fade_out` ([#109](https://github.com/timoncool/YuE2-Studio/issues/109)).
 
 ### Fixed
