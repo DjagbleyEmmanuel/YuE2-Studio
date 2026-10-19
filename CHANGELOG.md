@@ -19,6 +19,10 @@ Windows build.
 - **A computer's memory as its box says it.** The studio counted RAM in 10⁹-byte gigabytes, so a 32 GB computer read 34 GB (in the issue form too); memory is now counted in 2³⁰-byte gigabytes, as video memory already was, and so are the model sets' needs.
 - **A cover from a FLAC, OGG or M4A recording.** The engine reads WAV and MP3 only, and any other recording stopped at "cannot decode audio"; the studio now decodes it itself and gives the engine a WAV ([#121](https://github.com/timoncool/YuE2-Studio/issues/121), [#93](https://github.com/timoncool/YuE2-Studio/issues/93)).
 
+### Changed
+
+- **Audio to MIDI and the training pack are one download.** The MIDI transcriber, the trainer and the captioner come from one HOT-Step build that shares its graphics-card libraries, in one folder: 133 MB once instead of 126 and 132 MB apart, and installing either one installs both ([YuE2 Studio #104](https://github.com/timoncool/YuE2-Studio/issues/104)).
+
 ## 2026-10-20 — 3.6.1
 
 ### Fixed
