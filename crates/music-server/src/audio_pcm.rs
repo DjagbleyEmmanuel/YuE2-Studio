@@ -97,6 +97,19 @@ pub fn write_wav_f32(path: &Path, audio: &audio_post::Stereo) -> Result<()> {
     Ok(())
 }
 
+/// Stereo as a 32-bit IEEE float WAV in memory, at its own rate and unclipped.
+pub fn wav_f32_bytes(audio: &audio_post::Stereo) -> Result<Vec<u8>> {
+    let spec = hound::WavSpec { channels: 2, sample_rate: audio.rate, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    let mut out = hound::WavWriter::new(&mut bytes, spec)?;
+    for frame in 0..audio.frames() {
+        out.write_sample(audio.left[frame])?;
+        out.write_sample(audio.right[frame])?;
+    }
+    out.finalize().context("finish writing the WAV")?;
+    Ok(bytes.into_inner())
+}
+
 /// Every channel kept apart, at the file's own sample rate.
 /// What a file's own tags say about it; empty where they say nothing.
 #[derive(Debug, Clone, Default)]

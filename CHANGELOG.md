@@ -5,6 +5,10 @@ Windows build.
 
 ## Unreleased
 
+### Added
+
+- **Fade in and fade out.** The create page's extra settings take seconds for a fade at the start and at the end of the made song, so an ending no longer stops abruptly; the studio applies them to the song it keeps, Reuse Prompt and a re-render keep them, and agents give `fade_in` and `fade_out` ([#109](https://github.com/timoncool/YuE2-Studio/issues/109)).
+
 ### Fixed
 
 - **The training page says where to install the card runtime.** When preparation measures tempo on the processor, its notice now names the way to the graphics-card ONNX Runtime: Settings → Models → Optional extras → Karaoke timings → Graphics card.

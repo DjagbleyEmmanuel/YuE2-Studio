@@ -1385,6 +1385,8 @@ fn tools() -> &'static [Tool] {
                     "transpose": { "type": "integer", "minimum": -24, "maximum": 24, "description": "move a supplied abc score before singing; requires full or melody cot and no semantic_tokens" },
                     "lyric_timing": { "type": "boolean", "description": "with a supplied abc score, each section's words wait until the score reaches it, so the voice keeps to the band; on unless false" },
                     "vocals_only": { "type": "boolean", "description": "extract vocals after synthesis using the installed separator; output_format must be mp3 or wav32" },
+                    "fade_in": { "type": "number", "minimum": 0, "description": "seconds the studio fades the made song in over; 0 or absent leaves the start as sung" },
+                    "fade_out": { "type": "number", "minimum": 0, "description": "seconds the studio fades the made song out over at its end; 0 or absent leaves the end as sung" },
                     "playlist_id": { "type": "string", "description": "a playlist (see playlist_list) the made songs are added to" },
                     "cot": { "type": "string", "enum": ["full", "melody", "off"] },
                     "duration_seconds": { "type": "number" },

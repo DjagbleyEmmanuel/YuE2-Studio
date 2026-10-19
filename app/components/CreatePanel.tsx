@@ -347,6 +347,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   const harmonyField = (key: keyof HarmonyText) => (value: string) => setHarmony(current => ({ ...current, [key]: key === 'follow_lyrics' ? value === 'true' : value }));
   const [transpose, setTranspose] = useState('0');
   const [vocalsOnly, setVocalsOnly] = useState(false);
+  const [fadeIn, setFadeIn] = useState('');
+  const [fadeOut, setFadeOut] = useState('');
   const [lyricTiming, setLyricTiming] = useState(true);
   // the decoder companion: auto leaves it to the service (on only under a LoRA trained in the studio)
   const [realaudio, setRealaudio] = useState<'auto' | 'on' | 'off'>('auto');
@@ -511,6 +513,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     setContinueScore(request.abc_continue === true);
     setTranspose(asText(request.transpose) || '0');
     setVocalsOnly(request.vocals_only === true);
+    setFadeIn(request.fade_in ? asText(request.fade_in) : '');
+    setFadeOut(request.fade_out ? asText(request.fade_out) : '');
     setLyricTiming(request.lyric_timing !== false);
     setRealaudio(request.companion_scale === undefined ? 'auto' : request.companion_scale === 0 ? 'off' : 'on');
     if (request.mp3_bitrate !== undefined) setMp3Bitrate(asText(request.mp3_bitrate));
@@ -620,6 +624,10 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     if (abc.trim() && effectiveCot !== 'off' && !lyricTiming) request.lyric_timing = false;
     if (realaudio !== 'auto') request.companion_scale = realaudio === 'on' ? 1 : 0;
     if (vocalsOnly) request.vocals_only = true;
+    const fadeInValue = numberOrUndefined(fadeIn);
+    if (fadeInValue !== undefined && fadeInValue > 0) request.fade_in = fadeInValue;
+    const fadeOutValue = numberOrUndefined(fadeOut);
+    if (fadeOutValue !== undefined && fadeOutValue > 0) request.fade_out = fadeOutValue;
     if (cot) request.cot = cot;
     const durationValue = numberOrUndefined(duration);
     if (durationValue !== undefined) request.duration_seconds = Math.min(Math.max(durationValue, 1), MAX_DURATION_SECONDS);
@@ -980,6 +988,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     mp3_bitrate: [mp3Bitrate, setMp3Bitrate],
     transpose: [transpose, setTranspose],
     vocals_only: [vocalsOnly, value => setVocalsOnly(value === 'true')],
+    fade_in: [fadeIn, setFadeIn],
+    fade_out: [fadeOut, setFadeOut],
     lyric_timing: [lyricTiming, value => setLyricTiming(value !== 'false')],
     chord_strength: [harmony.strength, harmonyField('strength')],
     chord_identity: [harmony.identity, harmonyField('identity')],
@@ -1792,6 +1802,10 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
                       </Field>
                     </div>
                     <div className="mb-3"><Switch checked={vocalsOnly} onChange={setVocalsOnly} label={engineParityLabels[language].vocals} hint={engineParityLabels[language].vocalsHint} /></div>
+                    <div className="mb-3 grid grid-cols-2 gap-2">
+                      <Field label={t('fadeInLabel')}><input value={fadeIn} onChange={event => setFadeIn(event.target.value)} placeholder="0" inputMode="decimal" className={CONTROL} /></Field>
+                      <Field label={t('fadeOutLabel')}><input value={fadeOut} onChange={event => setFadeOut(event.target.value)} placeholder="0" inputMode="decimal" className={CONTROL} /></Field>
+                    </div>
                     <div className="mt-3 grid grid-cols-2 gap-2">
                       <Field label={t('mp3Bitrate')}>
                         <select value={mp3Bitrate || String(defaults.mp3_bitrate ?? 128)} onChange={event => setMp3Bitrate(event.target.value)} disabled={format !== 'mp3'} className={CONTROL}>

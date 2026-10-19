@@ -235,6 +235,11 @@ struct CreateMusicJobRequest {
     lyric_timing: Option<bool>,
     #[serde(default)]
     vocals_only: bool,
+    /// Seconds the studio fades the made song in and out over; none or 0 leaves it as sung.
+    #[serde(default)]
+    fade_in: Option<f32>,
+    #[serde(default)]
+    fade_out: Option<f32>,
     /// The playlist the made songs are added to.
     #[serde(default)]
     playlist_id: Option<String>,
@@ -8023,20 +8028,32 @@ async fn import_completed_result(state: &AppState, job: &MusicJob, job_id: &str)
         // the engine's float output is kept at the level it came: lossless FLAC unless MP3 was asked for
         if extension == "wav" {
             let kbps = job.generation_settings.get("mp3_bitrate").and_then(Value::as_u64).map_or(DEFAULT_MP3_KBPS, |value| value as u32);
-            if format != "wav32" {
+            let seconds = |key: &str| job.generation_settings.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let fades = (seconds("fade_in"), seconds("fade_out"));
+            let faded = fades.0 > 0.0 || fades.1 > 0.0;
+            if format != "wav32" || faded {
                 let target = format.clone();
                 audio = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-                    let stereo = audio_pcm::decode_stereo_bytes(audio, "wav")?;
+                    let mut stereo = audio_pcm::decode_stereo_bytes(audio, "wav")?;
                     if !vocals_only {
                         if let Some(problem) = audio_pcm::stereo_problem(&stereo) {
                             anyhow::bail!("The engine returned {problem} instead of a song, so nothing was kept. Make it again; if it repeats, the engine log has the cause.");
                         }
                     }
-                    if target == "mp3" { audio_post::encode::mp3(&stereo, kbps) } else { audio_post::encode::flac(&stereo) }
+                    audio_post::encode::fade(&mut stereo, fades.0, fades.1);
+                    match target.as_str() {
+                        "mp3" => audio_post::encode::mp3(&stereo, kbps),
+                        "wav32" => audio_pcm::wav_f32_bytes(&stereo),
+                        _ => audio_post::encode::flac(&stereo),
+                    }
                 })
                 .await
                 .context("the encoder stopped")??;
-                extension = if format == "mp3" { "mp3" } else { "flac" };
+                extension = match format.as_str() { "mp3" => "mp3", "wav32" => "wav", _ => "flac" };
+            }
+            if faded {
+                replay["fade_in"] = Value::from(fades.0);
+                replay["fade_out"] = Value::from(fades.1);
             }
             for record in [&mut *settings, replay.as_object_mut().context("the replay request is not a JSON object")?] {
                 record.insert("output_format".into(), Value::from(if format == "mp3" { "mp3" } else if format == "wav32" { "wav32" } else { "flac" }));
@@ -8629,7 +8646,7 @@ fn drawn_seed() -> i64 {
 /// nothing changes its loudness on the way.
 fn engine_submission(body: &Value) -> Value {
     let mut engine = body.clone();
-    if let Some(fields) = engine.as_object_mut() { fields.remove("vocals_only"); fields.remove("score_edit"); }
+    if let Some(fields) = engine.as_object_mut() { fields.remove("vocals_only"); fields.remove("score_edit"); fields.remove("fade_in"); fields.remove("fade_out"); }
     if let Some(fields) = engine.as_object_mut() {
         fields.insert("output_format".into(), Value::from("wav32"));
         fields.remove("mp3_bitrate");
@@ -8719,6 +8736,11 @@ fn yue_request_from(request: &CreateMusicJobRequest, max_batch: u32) -> Result<V
     });
     if request.vocals_only {
         body["vocals_only"] = Value::Bool(true);
+    }
+    for (key, seconds) in [("fade_in", request.fade_in), ("fade_out", request.fade_out)] {
+        if let Some(seconds) = seconds.filter(|seconds| *seconds > 0.0) {
+            body[key] = Value::from(seconds);
+        }
     }
     let step = request.transpose.unwrap_or(0);
     if let Some(source) = request.abc.as_deref() {
@@ -9193,6 +9215,20 @@ mod tests {
         let body = yue_request_from(&request, 1).unwrap();
         assert_eq!(body["vocals_only"], true);
         assert!(engine_submission(&body).get("vocals_only").is_none());
+    }
+
+    #[test]
+    fn fades_are_studio_processing_and_never_engine_flags() {
+        let request = CreateMusicJobRequest { fade_in: Some(0.0), fade_out: Some(4.5), ..sample_request() };
+        let body = yue_request_from(&request, 4).unwrap();
+        assert_eq!(body["fade_out"], 4.5);
+        assert!(body.get("fade_in").is_none(), "a zero fade is no fade");
+        let engine = engine_submission(&body);
+        assert!(engine.get("fade_in").is_none() && engine.get("fade_out").is_none());
+        let mut audio = audio_post::Stereo { left: vec![1.0; 48_000], right: vec![1.0; 48_000], rate: 48_000 };
+        audio_post::encode::fade(&mut audio, 0.0, 0.5);
+        assert_eq!((audio.left[0], audio.left[23_999]), (1.0, 1.0));
+        assert!(audio.left[47_999] < 0.001 && (audio.left[36_000] - 0.5).abs() < 0.01);
     }
 
     #[test]
