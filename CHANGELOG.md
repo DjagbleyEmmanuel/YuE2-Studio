@@ -7,6 +7,7 @@ Windows build.
 
 ### Fixed
 
+- **A computer's memory as its box says it.** The studio counted RAM in 10⁹-byte gigabytes, so a 32 GB computer read 34 GB (in the issue form too); memory is now counted in 2³⁰-byte gigabytes, as video memory already was, and so are the model sets' needs.
 - **A cover from a FLAC, OGG or M4A recording.** The engine reads WAV and MP3 only, and any other recording stopped at "cannot decode audio"; the studio now decodes it itself and gives the engine a WAV ([#121](https://github.com/timoncool/YuE2-Studio/issues/121), [#93](https://github.com/timoncool/YuE2-Studio/issues/93)).
 
 ## 2026-10-20 — 3.6.1
