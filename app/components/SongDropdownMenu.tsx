@@ -301,6 +301,13 @@ export const SongDropdownMenu: React.FC<SongDropdownMenuProps> = ({
                     onClick={() => handleAction(() => actions.reusePrompt?.(song))}
                 />
             )}
+            {actions.reusePrompt && typeof (song.generationParams as Record<string, unknown> | undefined)?.abc === 'string' && (
+                <MenuItem
+                    icon={<Repeat size={14} />}
+                    label={t('resingNewLyrics' as never)}
+                    onClick={() => handleAction(() => window.dispatchEvent(new CustomEvent('yue:resing', { detail: { song } })))}
+                />
+            )}
             {actions.replay && song.nativeReplayAvailable && (
                 <MenuItem
                     icon={<Repeat size={14} />}

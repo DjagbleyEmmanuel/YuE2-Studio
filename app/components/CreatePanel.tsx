@@ -19,6 +19,7 @@ import { trackMidiBase64 } from '../services/midiEditor';
 import { composePlans, composeScore, transcribe, type ScorePlan } from '../services/transcription';
 import { chordBed, failed, instrumentalScore, matchSections, type SectionProposal } from '../services/scoreApi';
 import { sectionTagsOnly } from '../services/instrumental';
+import { lyricSyllables, syllableChangesOf, type SyllableChange } from '../services/syllables';
 import { profileLabel as setLabel } from '../services/modelCatalog';
 import { REQUEST_FILE_ACCEPT, parseRequestFile, requestFileTitle, serializeRequest, type RequestFileFormat } from '../services/requestFile';
 import { AdapterPicker } from './AdapterPicker';
@@ -50,6 +51,7 @@ import { explainCliFailure } from '../services/cliFailure';
 export type CreateRequest =
   | { id: number; kind: 'transcribe'; song: Song; melodyOnly: boolean }
   | { id: number; kind: 'midi'; song: Song }
+  | { id: number; kind: 'resing'; song: Song }
   | { id: number; kind: 'score'; abc: string; cot?: YueCot; lyrics?: string; title?: string; edit?: boolean };
 
 interface CreatePanelProps {
@@ -561,6 +563,16 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
       if (song.lyrics?.trim()) setLyrics(current => (current.trim() ? current : song.lyrics));
       setMode('cover');
       void runTranscription({ songId: song.id }, melodyOnly);
+    } else if (request.kind === 'resing') {
+      // the song again with other words: its score and seeds stay, its sung take goes, as the take would
+      // sing the old words whatever the lyrics say
+      const { song } = request;
+      const settings = (song.generationParams ?? {}) as Record<string, unknown>;
+      applyRequest({ style: song.style, lyrics: song.lyrics, ...settings }, song.title || '');
+      setAdapters(usesFromSettings(settings));
+      setSemanticTokens('');
+      setMode('studio');
+      setResingFrom({ title: song.title, lyrics: song.lyrics ?? '' });
     } else if (request.kind === 'midi') {
       // a track made or edited in the MIDI editor: its MIDI becomes the score,
       // through the MIDI import, where the voice's part is chosen
@@ -933,6 +945,18 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   const [instrumental, setInstrumental] = useState(false);
   // the model was trained to sing: the Instrumental LoRA is what keeps it from it, so the switch takes it along
   const [instrumentalLoraLoading, setInstrumentalLoraLoading] = useState(false);
+  // the song being sung again with new words, and the sung lines whose syllable counts left the old ones
+  const [resingFrom, setResingFrom] = useState<{ title: string; lyrics: string } | null>(null);
+  const [syllableChanges, setSyllableChanges] = useState<SyllableChange[]>([]);
+  useEffect(() => {
+    if (!resingFrom) { setSyllableChanges([]); return; }
+    const timer = window.setTimeout(() => {
+      void Promise.all([lyricSyllables(resingFrom.lyrics), lyricSyllables(lyrics)])
+        .then(([before, after]) => setSyllableChanges(syllableChangesOf(before, after)))
+        .catch(reason => setError(reason instanceof Error ? reason.message : String(reason)));
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [resingFrom, lyrics]);
   const switchInstrumental = async (on: boolean) => {
     setInstrumental(on);
     if (!on) return;
@@ -1507,6 +1531,25 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
               aria-label={t('lyrics')}
               className={`${CONTROL} resize-none overflow-y-auto font-mono text-xs leading-5 custom-scrollbar`}
             />
+            {resingFrom && (
+              <div className="mt-2 rounded-lg border border-pink-500/25 bg-pink-500/5 p-2 text-[11px] leading-5 text-zinc-600 dark:text-zinc-300">
+                <div className="flex items-start justify-between gap-2">
+                  <span>{tt('resingNote').replace('{title}', resingFrom.title)}</span>
+                  <button type="button" onClick={() => setResingFrom(null)} className={ICON} title={t('close')}><X size={12} /></button>
+                </div>
+                {syllableChanges.length > 0 && (
+                  <ul className="mt-1 space-y-0.5 text-amber-700 dark:text-amber-300">
+                    {syllableChanges.map(change => (
+                      <li key={change.line}>
+                        {change.before === null ? tt('resingLineAdded').replace('{line}', String(change.line)).replace('{after}', String(change.after))
+                          : change.after === null ? tt('resingLineDropped').replace('{line}', String(change.line)).replace('{before}', String(change.before))
+                          : tt('resingLineChanged').replace('{line}', String(change.line)).replace('{before}', String(change.before)).replace('{after}', String(change.after))}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
             <p className="mt-2 text-[11px] leading-4 text-zinc-500">{tt('lyricsHintYue')}</p>
             <SongTextParts kind="lyrics" value={lyrics} onChange={setLyrics} style={style} cot={effectiveCot} />
           </Card>

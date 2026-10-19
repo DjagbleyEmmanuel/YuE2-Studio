@@ -1120,6 +1120,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/training/datasets/{id}/items/{item}/audio", get(training_item_audio))
         .route("/v1/training/datasets/{id}/prepare", post(prepare::start))
         .route("/v1/lyrics/find", post(find_lyrics))
+        .route("/v1/lyrics/syllables", post(lyric_syllables))
         // a clip of a long song is more than the router's 256 MB
         .route("/v1/videos", post(store_video).layer(DefaultBodyLimit::max(TRAINING_UPLOAD_LIMIT)))
         .route("/v1/writing/guide", get(writing_guide))
@@ -2000,6 +2001,24 @@ async fn import_adapter_folder(State(state): State<AppState>, body: axum::body::
     .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
     Ok(Json(serde_json::json!({ "picked": true, "folder": folder.display().to_string(), "imported": imported })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SyllablesRequest {
+    lyrics: String,
+}
+
+/// Each sung line of the lyrics with the syllables the score lays it out by: new words of the same
+/// count keep a score's melody, a line of another count moves it.
+async fn lyric_syllables(Json(request): Json<SyllablesRequest>) -> Json<Value> {
+    let lines: Vec<Value> = request
+        .lyrics
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !(line.starts_with('[') && line.ends_with(']')))
+        .map(|line| serde_json::json!({ "line": line, "syllables": score::phrasing::syllables(line) }))
+        .collect();
+    Json(serde_json::json!({ "lines": lines }))
 }
 
 async fn update_adapter(
