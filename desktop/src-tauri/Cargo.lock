@@ -3244,6 +3244,7 @@ dependencies = [
  "tower-http 0.7.1",
  "unicode-normalization-alignments",
  "uuid",
+ "windows-sys 0.61.2",
  "zip 8.6.0",
 ]
 

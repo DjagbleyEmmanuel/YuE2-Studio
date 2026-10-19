@@ -1134,6 +1134,7 @@ export const SetupGate: React.FC<{ onReady?: () => void; mode?: 'first-run' | 's
                 { id: 'local', label: t('assistantLocal'), device: false, byAddress: true },
                 { id: 'open_router', label: 'OpenRouter', device: false },
                 { id: 'agent', label: t('assistantAgent'), device: false },
+                { id: 'cli', label: t('assistantCli'), device: false },
                 { id: 'none', label: t('assistantDisabled'), device: false },
               ]}
               settingsUrl="/v1/assistant/status"
