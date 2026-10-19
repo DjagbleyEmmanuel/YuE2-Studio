@@ -262,6 +262,9 @@ fn probe_features(kind: &Kind, resolved: &ResolvedCli) -> Vec<String> {
     if help.contains("--model ") || help.contains("--model,") || help.ends_with("--model") {
         features.push("model-flag".to_string());
     }
+    if help.contains("--sandbox") {
+        features.push("sandbox".to_string());
+    }
     features
 }
 
@@ -919,9 +922,18 @@ fn invocation_opencode(kind: &Kind, resolved: &ResolvedCli, workdir: &Path, syst
 fn invocation_agy(kind: &Kind, resolved: &ResolvedCli, workdir: &Path, system: &str, user: &str, model: Option<&str>) -> Result<Invocation, Failure> {
     let prompt = combined_prompt(system, user);
     argv_prompt(kind, resolved, &prompt)?;
+    let _ = workdir;
     // Probed on this exact binary: an override may point at another release.
-    let features = probe_features(kind, resolved);
-    let mut args: Vec<std::ffi::OsString> = vec!["-p".into(), prompt.into()];
+    invocation_agy_with(kind, &probe_features(kind, resolved), prompt, model)
+}
+
+fn invocation_agy_with(kind: &Kind, features: &[String], prompt: String, model: Option<&str>) -> Result<Invocation, Failure> {
+    // The lyrics travel inside the prompt, and without --sandbox a headless run
+    // takes whatever tool permissions the user saved for their own sessions.
+    if !features.iter().any(|feature| feature == "sandbox") {
+        return Err(Failure::Failed(format!("the installed {} has no --sandbox flag, and the studio runs it only sandboxed: update {}", kind.display_name, kind.command)));
+    }
+    let mut args: Vec<std::ffi::OsString> = vec!["-p".into(), prompt.into(), "--sandbox".into()];
     let parse = if features.iter().any(|feature| feature == "json-output") {
         args.push("--output-format".into());
         args.push("json".into());
@@ -938,7 +950,6 @@ fn invocation_agy(kind: &Kind, resolved: &ResolvedCli, workdir: &Path, system: &
             return Err(Failure::Failed(format!("the installed {} has no --model flag: clear the model or update {}", kind.display_name, kind.command)));
         }
     }
-    let _ = workdir;
     Ok(Invocation { args, env: Vec::new(), stdin_text: None, parse })
 }
 
@@ -1419,17 +1430,26 @@ mod tests {
 
     #[test]
     fn old_agy_runs_positional_text_without_model() {
-        let missing = direct("C:/definitely/not/agy.exe");
-        let built = invocation("antigravity", &missing, None);
+        let sandbox = vec!["sandbox".to_string()];
+        let built = invocation_agy_with(kind("antigravity"), &sandbox, "system contract\n\nuser request".into(), None).unwrap();
         let args: Vec<String> = built.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
-        assert_eq!(&args[0..2], &["-p", "system contract\n\nuser request"]);
+        assert_eq!(&args[0..3], &["-p", "system contract\n\nuser request", "--sandbox"]);
         assert!(!args.contains(&"--output-format".to_string()));
         assert!(args.contains(&"--print-timeout".to_string()));
         assert_eq!(built.parse, ParseMode::AgyText);
         assert!(built.stdin_text.is_none());
-        let workdir = tempfile::tempdir().unwrap();
-        let refused = build_invocation(kind("antigravity"), &missing, workdir.path(), "system", "user", Some("gemini-3-pro"));
+        let refused = invocation_agy_with(kind("antigravity"), &sandbox, "prompt".into(), Some("gemini-3-pro"));
         assert!(matches!(refused, Err(Failure::Failed(ref message)) if message.contains("no --model flag")), "{refused:?}");
+    }
+
+    #[test]
+    fn agy_without_a_sandbox_is_refused() {
+        let refused = invocation_agy_with(kind("antigravity"), &[], "prompt".into(), None);
+        assert!(matches!(refused, Err(Failure::Failed(ref message)) if message.contains("--sandbox")), "{refused:?}");
+        let missing = direct("C:/definitely/not/agy.exe");
+        let workdir = tempfile::tempdir().unwrap();
+        let refused = build_invocation(kind("antigravity"), &missing, workdir.path(), "system", "user", None);
+        assert!(matches!(refused, Err(Failure::Failed(ref message)) if message.contains("--sandbox")), "{refused:?}");
     }
 
     #[test]
