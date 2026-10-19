@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, Copy, Download, FileAudio, KeyboardMusic, Loader2, Music, Play, RefreshCw, Scissors, Search, SlidersHorizontal, Wand2 } from 'lucide-react';
 import { useI18n } from '../context/I18nContext';
 import { saveFile } from '../services/saveFile';
+import { tempoAndKey } from '../services/songDownload';
 import { DevicePicker } from './DevicePicker';
 import { transcribeWithNativeOpenRouter } from '../services/nativeOpenRouter';
 import { apiUrl } from '../services/apiBase';
@@ -405,7 +406,11 @@ export function StudioToolsPanel({ initialSongId }: { initialSongId?: string | n
                     </div>
                     <button
                       type="button"
-                      onClick={() => void saveFile(`${songs.find(song => song.id === songId)?.title ?? 'track'} - ${stem}.wav`, { url })}
+                      onClick={() => {
+                        const song = songs.find(candidate => candidate.id === songId);
+                        const tempoKey = song ? tempoAndKey((song.generation_settings as Record<string, unknown> | null | undefined)?.abc) : '';
+                        void saveFile(`${song?.title ?? 'track'} - ${stem}${tempoKey ? ` - ${tempoKey}` : ''}.wav`, { url });
+                      }}
                       className="shrink-0 text-zinc-400 hover:text-pink-500"
                       title={t('download')}
                     >
