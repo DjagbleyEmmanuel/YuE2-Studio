@@ -506,6 +506,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   /** Fills the form from a stored request: a reused track, a file, an example. */
   const applyRequest = useCallback((request: Record<string, unknown>, title?: string) => {
     setResingFrom(null);
+    instrumentalChange.current = null;
     if (title !== undefined) setName(title);
     if (typeof request.style === 'string') setStyle(request.style);
     if (typeof request.lyrics === 'string') setLyrics(request.lyrics);
@@ -618,6 +619,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
 
   const reset = () => {
     setResingFrom(null);
+    instrumentalChange.current = null;
     setName(''); setStyle(''); setLyrics(''); setAbc(''); setCot(''); setContinueScore(false);
     setPlans([]); setSelectedPlan(0);
     resetParameters();
@@ -958,9 +960,11 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   const [instrumental, setInstrumental] = useState(false);
   // the model was trained to sing: the Instrumental LoRA is what keeps it from it, so the switch takes it along
   const [instrumentalLoraLoading, setInstrumentalLoraLoading] = useState(false);
-  // the switch as it is now: a LoRA download outlives a click, and only a switch still on takes the LoRA
-  const instrumentalWanted = useRef(false);
-  useEffect(() => () => { instrumentalWanted.current = false; }, []);
+  // the latest press of the switch: a LoRA download outlives a click, and only the latest press acts on its result
+  const instrumentalRun = useRef(0);
+  useEffect(() => () => { instrumentalRun.current += 1; }, []);
+  // what the switch did to the form's LoRAs, so switching it off undoes that and nothing the user chose
+  const instrumentalChange = useRef<{ id: string; added: boolean } | null>(null);
   // the song being sung again with new words, and the sung lines whose syllable counts left the old ones
   const [resingFrom, setResingFrom] = useState<{ title: string; lyrics: string } | null>(null);
   const [syllableChanges, setSyllableChanges] = useState<SyllableChange[]>([]);
@@ -975,8 +979,19 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   }, [resingFrom, lyrics]);
   const switchInstrumental = async (on: boolean) => {
     setInstrumental(on);
-    instrumentalWanted.current = on;
-    if (!on) return;
+    const run = ++instrumentalRun.current;
+    const latest = () => instrumentalRun.current === run;
+    if (!on) {
+      setInstrumentalLoraLoading(false);
+      const change = instrumentalChange.current;
+      instrumentalChange.current = null;
+      if (change) {
+        setAdapters(current => change.added
+          ? current.filter(use => use.id !== change.id)
+          : current.map(use => (use.id === change.id ? { ...use, disabled: true } : use)));
+      }
+      return;
+    }
     try {
       const installed = async () => {
         const state = await fetchAdapters();
@@ -985,10 +1000,11 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
       let { state, lora } = await installed();
       if (!lora) {
         setInstrumentalLoraLoading(true);
-        await installCatalogAdapters([INSTRUMENTAL_LORA]);
+        // a download an earlier press started is waited for, not asked for again
+        if (!state.installing.includes(INSTRUMENTAL_LORA)) await installCatalogAdapters([INSTRUMENTAL_LORA]);
         for (;;) {
           await new Promise(resolve => window.setTimeout(resolve, 1000));
-          if (!instrumentalWanted.current) return;
+          if (!latest()) return;
           ({ state, lora } = await installed());
           if (lora) break;
           if (state.download?.error) throw new Error(state.download.error);
@@ -996,15 +1012,20 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
         }
         window.dispatchEvent(new CustomEvent('yue:adapters-changed'));
       }
-      if (!instrumentalWanted.current) return;
+      if (!latest()) return;
       const chosen = lora;
-      setAdapters(current => current.some(use => use.id === chosen.id)
-        ? current.map(use => (use.id === chosen.id ? { ...use, disabled: false } : use))
-        : [...current, { id: chosen.id, scales: startingScales(chosen, state.slots) }]);
+      setAdapters(current => {
+        const present = current.find(use => use.id === chosen.id);
+        if (present && !present.disabled) return current;
+        instrumentalChange.current = { id: chosen.id, added: !present };
+        return present
+          ? current.map(use => (use.id === chosen.id ? { ...use, disabled: false } : use))
+          : [...current, { id: chosen.id, scales: startingScales(chosen, state.slots) }];
+      });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (latest()) setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setInstrumentalLoraLoading(false);
+      if (latest()) setInstrumentalLoraLoading(false);
     }
   };
   useEffect(() => {
