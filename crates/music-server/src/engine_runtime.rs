@@ -15,9 +15,7 @@
 //! Toolkit, which is exactly why this was invisible until someone without the
 //! Toolkit ran the release.
 
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 #[cfg(test)]
@@ -118,7 +116,6 @@ impl EngineRuntime {
     }
 
     /// Where the libraries live once installed - beside the engine.
-    #[cfg(test)]
     pub fn library_dir(&self) -> PathBuf {
         self.downloader.root().to_path_buf()
     }

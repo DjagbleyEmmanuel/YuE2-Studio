@@ -235,6 +235,11 @@ struct CreateMusicJobRequest {
     lyric_timing: Option<bool>,
     #[serde(default)]
     vocals_only: bool,
+    /// Seconds the studio fades the made song in and out over; none or 0 leaves it as sung.
+    #[serde(default)]
+    fade_in: Option<f32>,
+    #[serde(default)]
+    fade_out: Option<f32>,
     /// The playlist the made songs are added to.
     #[serde(default)]
     playlist_id: Option<String>,
@@ -813,6 +818,12 @@ struct AssistantConfig {
     /// How hard a reasoning model should think, in OpenRouter's own terms:
     /// minimal, low, medium, high, xhigh, max - or none.
     reasoning_effort: Option<String>,
+    /// Which agent CLI answers; empty means the first one detected.
+    cli_agent: Option<String>,
+    /// Model override for that CLI; empty means its configured model.
+    cli_model: Option<String>,
+    /// Explicit executable for that CLI; empty means PATH.
+    cli_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -827,6 +838,8 @@ enum AssistantProvider {
     /// The agent connected over MCP: the studio asks it what it would ask its
     /// own model, with the same instructions and answer schema.
     Agent,
+    /// An agent CLI on this machine, run headless for one draft.
+    Cli,
 }
 
 impl AssistantConfig {
@@ -848,6 +861,8 @@ impl AssistantConfig {
                 self.managed_model.as_deref().is_some_and(|model| !model.trim().is_empty())
                     || self.managed_path.as_deref().is_some_and(|path| !path.trim().is_empty())
             }
+            // Install state is probed in `assistant_available`, not here.
+            AssistantProvider::Cli => self.cli_agent.as_deref().is_none_or(|id| providers::cli_agent::find_kind(id.trim()).is_some()),
         }
     }
 }
@@ -988,7 +1003,7 @@ pub async fn serve() -> anyhow::Result<()> {
             &studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")),
         )),
         lyrics_sync_config: Arc::new(RwLock::new(
-            persisted.as_ref().map(|settings| settings.lyrics_sync.clone()).unwrap_or_default(),
+            persisted.as_ref().map(|settings| settings.lyrics_sync.clone().migrated()).unwrap_or_default(),
         )),
         hub: start_hub(),
     };
@@ -998,6 +1013,11 @@ pub async fn serve() -> anyhow::Result<()> {
         if let Err(error) = persist_studio_settings(&state).await {
             eprintln!("[ERROR] the key made for access from the network was not saved and changes at the next start: {error:#}");
         }
+    }
+    state.lyrics_sync.set_cuda_libraries(state.engine_runtime.library_dir());
+    {
+        let sync = state.lyrics_sync.clone();
+        tokio::task::spawn_blocking(move || sync.remove_retired_parakeet());
     }
     prepare::resume(&state);
     tokio::spawn(resume_unfinished_jobs(state.clone()));
@@ -1042,6 +1062,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/network/proxy/test", post(test_proxy))
         .route("/v1/assistant/status", get(assistant_status).put(update_assistant_settings))
         .route("/v1/assistant/local-models", get(assistant_local_models))
+        .route("/v1/assistant/cli-agents", get(assistant_cli_agents))
         .route("/v1/assistant/local-key", post(set_local_server_key))
         .route("/v1/assistant/write", post(assistant_write))
         .route("/v1/assistant/write/stream", post(assistant_write_stream))
@@ -1072,6 +1093,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/separation/remove", post(remove_separation_model))
         .route("/v1/adapters", get(list_adapters))
         .route("/v1/adapters/import", post(import_adapter))
+        .route("/v1/adapters/import-folder", post(import_adapter_folder))
         .route("/v1/adapters/cancel", post(cancel_adapter_download))
         .route("/v1/adapters/install", post(install_catalog_adapters))
         .route("/v1/adapters/hub", get(search_hub_adapters))
@@ -1103,6 +1125,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/training/datasets/{id}/items/{item}/audio", get(training_item_audio))
         .route("/v1/training/datasets/{id}/prepare", post(prepare::start))
         .route("/v1/lyrics/find", post(find_lyrics))
+        .route("/v1/lyrics/syllables", post(lyric_syllables))
         // a clip of a long song is more than the router's 256 MB
         .route("/v1/videos", post(store_video).layer(DefaultBodyLimit::max(TRAINING_UPLOAD_LIMIT)))
         .route("/v1/writing/guide", get(writing_guide))
@@ -1241,7 +1264,9 @@ pub async fn serve() -> anyhow::Result<()> {
             let mut was_running = false;
             loop {
                 let ready = state.model_manager.status(effective_install_target(&state).await).await.ready;
-                let running = state.music_server.health().await;
+                // an engine inside a long step does not answer /health in time; while it is still a
+                // running process with a job on it, it is at work, not gone
+                let running = state.music_server.health().await || engine_at_work(&state).await;
                 // the card has one owner: a preparation or a training run
                 // holding it is left alone, and the engine comes back after
                 let preparing = state.prepare.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().is_some_and(|job| !job.finished);
@@ -1252,13 +1277,14 @@ pub async fn serve() -> anyhow::Result<()> {
                         // explains a log which suddenly starts again from
                         // "Listening on". Written once, not once a cycle.
                         music_engine::yue_server::note_in_log("the engine stopped answering; restarting it");
-                        // Under Auto a device that died of its own fault is
-                        // not tried again: the restart moves down the chain.
+                        // Under Auto a device is left for the session only when
+                        // the log names a device failure: a silent exit (OOM, a
+                        // kill, a slow start) is no fault of the device.
                         let auto = state.engine_options.read().await.backend == music_engine::yue_server::ComputeBackend::Auto;
                         let active = *state.active_device.read().await;
                         if let Some(device) = active.filter(|device| auto && *device != music_engine::yue_server::ComputeBackend::Cpu) {
                             let log = last_run_log().to_lowercase();
-                            if describes_device_failure(&log) || died_silently(&log) {
+                            if describes_device_failure(&log) {
                                 music_engine::yue_server::note_in_log(&format!("{} failed on this machine; leaving it for this session", device_name(device)));
                                 state.failed_devices.write().await.push(device);
                             }
@@ -1473,6 +1499,17 @@ fn derivation(from: &library::Song, tool: &str, settings: Value) -> Value {
 }
 
 /// The track a derived track was made from, and by which tool.
+/// The style, words and title a track's unique pattern is drawn from: a stem's
+/// are its song's, so it wears the same pattern.
+fn unique_texts(state: &AppState, song: &library::Song) -> anyhow::Result<(String, String, String)> {
+    if let Some((from, "stems")) = derived_from(song) {
+        if let Some(parent) = state.library.get_song(from)? {
+            return Ok((parent.caption, parent.lyrics, parent.title));
+        }
+    }
+    Ok((song.caption.clone(), song.lyrics.clone(), song.title.clone()))
+}
+
 fn derived_from(song: &library::Song) -> Option<(&str, &str)> {
     let derived = song.metadata.get("derived")?;
     Some((derived.get("from")?.as_str()?, derived.get("tool")?.as_str()?))
@@ -1497,7 +1534,7 @@ fn cover_like(state: &AppState, from: &library::Song, to: &str) -> anyhow::Resul
 /// wears the original's cover. Separating the song again replaces its stems
 /// in the library instead of adding more: the new ones are in before the old
 /// ones go, so a stem file held open by a player costs nothing but itself.
-fn stems_into_library(state: &AppState, song_id: &str, stems: &[String], overlap: f64) -> anyhow::Result<(Vec<String>, Option<String>)> {
+fn stems_into_library(state: &AppState, song_id: &str, stems: &[String], overlap: f64, model: &str) -> anyhow::Result<(Vec<String>, Option<String>)> {
     let original = state.library.get_song(song_id)?.ok_or_else(|| anyhow::anyhow!("the song {song_id} is gone"))?;
     let replaced: Vec<library::Song> = state
         .library
@@ -1518,7 +1555,7 @@ fn stems_into_library(state: &AppState, song_id: &str, stems: &[String], overlap
             // the words belong to the voice, not to the drums
             lyrics: if stem == "vocals" { original.lyrics.clone() } else { String::new() },
             metadata: serde_json::json!({
-                "derived": derivation(&original, "stems", serde_json::json!({ "stem": stem, "model": "HT-Demucs", "overlap": overlap })),
+                "derived": derivation(&original, "stems", serde_json::json!({ "stem": stem, "model": model, "overlap": overlap })),
                 "duration_seconds": duration,
             }),
             generation_settings: Value::Null,
@@ -1550,9 +1587,35 @@ fn stem_path(state: &AppState, song_id: &str, stem: &str) -> PathBuf {
     state.library.media_dir().join(format!("{song_id}-{stem}.wav"))
 }
 
+/// The stems a separator leaves.
+fn engine_stems(engine: separation::Engine) -> &'static [&'static str] {
+    match engine {
+        separation::Engine::Htdemucs => &separation::STEMS,
+        separation::Engine::Roformer => &separation::ROFORMER_STEMS,
+    }
+}
+
+/// Whether Mel-Band RoFormer runs on the card: an NVIDIA card, a runtime choice other than the
+/// processor, and a cuBLAS 13 the CUDA build's loader finds - the engine's, or one on PATH.
+fn roformer_on_card(state: &AppState, runtime: lyrics_sync::OnnxFlavour) -> bool {
+    let found = |name: &str| {
+        state.engine_runtime.library_dir().join(name).is_file()
+            || std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|folder| folder.join(name).is_file()))
+    };
+    runtime != lyrics_sync::OnnxFlavour::Cpu
+        && lyrics_sync::OnnxFlavour::Auto.card() == Some(lyrics_sync::OnnxCard::Cuda)
+        && (!cfg!(windows) || engine_runtime::CUDA13_LIBRARIES.iter().all(|name| found(name)))
+}
+
+/// The separator's files to download for its engine: HT-Demucs's model, or RoFormer's model and engine build.
+fn roformer_set(gpu: bool) -> Vec<&'static downloads::Asset> {
+    std::iter::once(&separation::ROFORMER_MODEL).chain(separation::Separator::roformer_engine(gpu)).collect()
+}
+
 fn stems_on_disk(state: &AppState, song_id: &str) -> Vec<String> {
     separation::STEMS
         .iter()
+        .chain(separation::ROFORMER_STEMS.iter().filter(|stem| !separation::STEMS.contains(stem)))
         .filter(|stem| stem_path(state, song_id, stem).is_file())
         .map(|stem| (*stem).to_string())
         .collect()
@@ -1562,6 +1625,26 @@ fn stems_on_disk(state: &AppState, song_id: &str) -> Vec<String> {
 /// running. The same envelope the assistant and karaoke use, because the models
 /// page lists all three the same way.
 async fn separation_assets(State(state): State<AppState>) -> Json<Value> {
+    let config = state.separation_config.read().await.clone();
+    if config.engine == separation::Engine::Roformer {
+        let gpu = roformer_on_card(&state, config.runtime);
+        let set = roformer_set(gpu);
+        let downloader = state.separator.downloader();
+        let assets: Vec<Value> = set
+            .iter()
+            .map(|asset| serde_json::json!({ "id": asset.id, "label": asset.label, "bytes": asset.bytes, "note": asset.note, "installed": downloader.is_installed(asset) }))
+            .collect();
+        let bytes: u64 = set.iter().map(|asset| asset.bytes).sum();
+        let installed_bytes: u64 = set.iter().filter(|asset| downloader.is_installed(asset)).map(|asset| asset.bytes).sum();
+        return Json(serde_json::json!({
+            "assets": assets,
+            "settings": { "runtime": config.runtime, "engine": config.engine },
+            // a platform without a BSRoformer.cpp build has no set to install
+            "set": { "bytes": bytes, "installed_bytes": installed_bytes, "ready": set.len() > 1 && installed_bytes == bytes, "files": set.len() },
+            "active_download": downloader.active_for("separation").await,
+            "waiting_for_server": crate::chunked::waiting_for_server(),
+        }));
+    }
     let runtime_installed = state.lyrics_sync.onnxruntime_library().is_some();
     let mut assets = vec![serde_json::json!({
         "id": separation::MODEL.id,
@@ -1580,7 +1663,6 @@ async fn separation_assets(State(state): State<AppState>) -> Json<Value> {
             "installed": if shared { runtime_installed } else { state.lyrics_sync.downloader().is_installed(asset) },
         })
     }));
-    let config = state.separation_config.read().await.clone();
     let mut set: Vec<&'static lyrics_sync::Asset> = Vec::new();
     if let Some(asset) = lyrics_sync::asset("onnxruntime") { set.push(asset); }
     set.extend(separation_card_assets(config.runtime).iter().filter_map(|id| lyrics_sync::asset(id)));
@@ -1591,7 +1673,7 @@ async fn separation_assets(State(state): State<AppState>) -> Json<Value> {
         + if model_installed { separation::MODEL.bytes } else { 0 };
     Json(serde_json::json!({
         "assets": assets,
-        "settings": { "runtime": config.runtime },
+        "settings": { "runtime": config.runtime, "engine": config.engine },
         "set": {
             "bytes": bytes,
             "installed_bytes": installed_bytes,
@@ -1609,17 +1691,6 @@ async fn separation_assets(State(state): State<AppState>) -> Json<Value> {
 #[derive(Debug, Deserialize)]
 struct InstallSeparationAssetRequest {
     asset_id: String,
-}
-
-/// The runtime parts work set to `runtime` needs on this machine's card:
-/// CUDA's on an NVIDIA card that runs it, DirectML's on any other card,
-/// none on the processor.
-fn card_assets(runtime: lyrics_sync::OnnxFlavour) -> &'static [&'static str] {
-    match runtime.card() {
-        Some(lyrics_sync::OnnxCard::Cuda) => lyrics_sync::CUDA_ASSETS,
-        Some(lyrics_sync::OnnxCard::DirectMl) => &lyrics_sync::DIRECTML_ASSETS,
-        None => &[],
-    }
 }
 
 /// Whether separation runs on this card: CUDA only. HT-Demucs's ONNX export
@@ -1695,6 +1766,29 @@ async fn install_separation_asset(
     // The separator as one thing: its model, the runtime that loads it, and -
     // for the card - the CUDA provider. Six rows of file names asked the user
     // to work out which of them belong together.
+    if matches!(request.asset_id.as_str(), "auto" | "cuda" | "cpu") && state.separation_config.read().await.engine == separation::Engine::Roformer {
+        let wanted = if request.asset_id == "cpu" { lyrics_sync::OnnxFlavour::Cpu } else { lyrics_sync::OnnxFlavour::Auto };
+        let gpu = roformer_on_card(&state, wanted);
+        let set = roformer_set(gpu);
+        if set.len() < 2 {
+            return Err(api_error(StatusCode::BAD_REQUEST, "Mel-Band RoFormer has no build for this platform; HT-Demucs separates here".into()));
+        }
+        let separator = state.separator.clone();
+        let libraries = state.engine_runtime.library_dir();
+        tokio::spawn(async move {
+            match separator.downloader().install_all("separation", &set).await {
+                Ok(()) if gpu => {
+                    if let Err(error) = separator.link_cuda_libraries(&libraries) {
+                        eprintln!("[ERROR] BSRoformer.cpp has no cuBLAS beside it: {error:#}");
+                        separator.downloader().fail("separation", format!("BSRoformer.cpp has no cuBLAS beside it: {error:#}")).await;
+                    }
+                }
+                Ok(()) => {}
+                Err(error) => eprintln!("[ERROR] Mel-Band RoFormer could not be installed: {error:#}"),
+            }
+        });
+        return Ok(Json(serde_json::json!({ "started": true })));
+    }
     if matches!(request.asset_id.as_str(), "auto" | "cuda" | "cpu") {
         let wanted = if request.asset_id == "cpu" { lyrics_sync::OnnxFlavour::Cpu } else { lyrics_sync::OnnxFlavour::Auto };
         let separator = state.separator.clone();
@@ -1762,12 +1856,10 @@ async fn write_separation_settings(
 ) -> Result<Json<separation::SeparationConfig>, (StatusCode, Json<ApiError>)> {
     // A run that writes nothing is a run nobody wanted; an empty choice means
     // everything, which is also what the studio starts with.
-    let stems: Vec<String> = if config.stems.is_empty() {
-        separation::STEMS.iter().map(|stem| (*stem).to_string()).collect()
-    } else {
-        config.stems.iter().filter(|stem| separation::STEMS.contains(&stem.as_str())).cloned().collect()
-    };
-    let stored = separation::SeparationConfig { runtime: config.runtime, stems, overlap: config.sane_overlap() };
+    let offered = engine_stems(config.engine);
+    let stems: Vec<String> = config.stems.iter().filter(|stem| offered.contains(&stem.as_str())).cloned().collect();
+    let stems = if stems.is_empty() { offered.iter().map(|stem| (*stem).to_string()).collect() } else { stems };
+    let stored = separation::SeparationConfig { runtime: config.runtime, stems, overlap: config.sane_overlap(), engine: config.engine };
     *state.separation_config.write().await = stored.clone();
     persist_studio_settings(&state)
         .await
@@ -1777,28 +1869,44 @@ async fn write_separation_settings(
 
 async fn separation_status(State(state): State<AppState>) -> Json<Value> {
     let runtime = state.lyrics_sync.onnxruntime_library();
+    let (engine, runtime_choice) = { let config = state.separation_config.read().await; (config.engine, config.runtime) };
     let card = lyrics_sync::OnnxFlavour::Auto.card().filter(|card| separates_on(*card));
+    let model = match engine {
+        separation::Engine::Roformer => &separation::ROFORMER_MODEL,
+        separation::Engine::Htdemucs => &separation::MODEL,
+    };
+    let model_installed = match engine {
+        separation::Engine::Roformer => state.separator.roformer_installed(roformer_on_card(&state, runtime_choice)),
+        separation::Engine::Htdemucs => state.separator.is_installed(),
+    };
     Json(serde_json::json!({
         "model": {
-            "id": separation::MODEL.id,
-            "label": separation::MODEL.label,
-            "bytes": separation::MODEL.bytes,
-            "note": separation::MODEL.note,
-            "installed": state.separator.is_installed(),
+            "id": model.id,
+            "label": model.label,
+            "bytes": model.bytes,
+            "note": model.note,
+            "installed": model_installed,
         },
         "runtime_installed": runtime.is_some(),
         // the card separation takes on this machine, none on any card but
         // CUDA's, and whether every library of it is installed
         "card": card,
-        "card_runtime_installed": card.is_some_and(|card| state.lyrics_sync.has_card_libraries(card)),
+        "card_runtime_installed": match engine {
+            separation::Engine::Roformer => roformer_on_card(&state, lyrics_sync::OnnxFlavour::Auto),
+            separation::Engine::Htdemucs => card.is_some_and(|card| state.lyrics_sync.has_card_libraries(card)),
+        },
         "card_missing_bytes": separation_card_assets(lyrics_sync::OnnxFlavour::Auto)
             .iter()
             .filter_map(|id| lyrics_sync::asset(id))
             .filter(|asset| !state.lyrics_sync.downloader().is_installed(asset))
             .map(|asset| asset.bytes)
             .sum::<u64>(),
-        "ready": state.separator.ready(runtime.as_deref()),
-        "stems": separation::STEMS,
+        "ready": match engine {
+            separation::Engine::Roformer => state.separator.roformer_installed(roformer_on_card(&state, runtime_choice)),
+            separation::Engine::Htdemucs => state.separator.ready(runtime.as_deref()),
+        },
+        "engine": engine,
+        "stems": engine_stems(engine),
         // Either downloader may be the busy one: the model has its own, the
         // card libraries come through karaoke's. Reporting only the first is
         // what made a running download look like a dead button.
@@ -1940,6 +2048,60 @@ async fn import_adapter(
         .import(&name, files, adapters::Origin::Imported)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok((StatusCode::CREATED, Json(meta)))
+}
+
+/// Takes LoRAs from a folder the user keeps them in for every program - ComfyUI's, a trainer's -
+/// without copying them: a folder the window picks, or the one an agent names.
+async fn import_adapter_folder(State(state): State<AppState>, body: axum::body::Bytes) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let named = serde_json::from_slice::<Value>(&body).ok().and_then(|value| value.get("path").and_then(Value::as_str).map(std::path::PathBuf::from));
+    let picked = match named {
+        Some(folder) => Some(folder),
+        None => tokio::task::spawn_blocking(|| rfd::FileDialog::new().set_title("Folder with LoRA").pick_folder())
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+    };
+    let Some(folder) = picked else {
+        return Ok(Json(serde_json::json!({ "picked": false, "imported": [] })));
+    };
+    if !folder.is_dir() {
+        return Err(api_error(StatusCode::BAD_REQUEST, format!("{} is not a folder", folder.display())));
+    }
+    let library = state.adapters.clone();
+    let searched = folder.clone();
+    let imported = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
+        let mut imported = Vec::new();
+        for (name, files) in adapters::found_in(&searched, 2) {
+            if let Some(meta) = library.imported_from(&files) {
+                imported.push(serde_json::json!({ "id": meta.id, "name": name, "copied": false, "already": true }));
+                continue;
+            }
+            let (meta, copied) = library.import_linked(&name, &files, adapters::Origin::Imported)?;
+            imported.push(serde_json::json!({ "id": meta.id, "name": name, "copied": copied }));
+        }
+        Ok(imported)
+    })
+    .await
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    Ok(Json(serde_json::json!({ "picked": true, "folder": folder.display().to_string(), "imported": imported })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SyllablesRequest {
+    lyrics: String,
+}
+
+/// Each sung line of the lyrics with the syllables the score lays it out by: new words of the same
+/// count keep a score's melody, a line of another count moves it.
+async fn lyric_syllables(Json(request): Json<SyllablesRequest>) -> Json<Value> {
+    let lines: Vec<Value> = request
+        .lyrics
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !(line.starts_with('[') && line.ends_with(']')))
+        .map(|line| serde_json::json!({ "line": line, "syllables": score::phrasing::syllables(line) }))
+        .collect();
+    Json(serde_json::json!({ "lines": lines }))
 }
 
 async fn update_adapter(
@@ -2294,15 +2456,33 @@ impl training::VocalSeparator for StudioSeparator {
     }
 }
 
+/// Mel-Band RoFormer for the vocals training measures on, when it is the chosen separator.
+struct RoformerVocals {
+    separator: Arc<separation::Separator>,
+    gpu: bool,
+}
+
+impl training::VocalSeparator for RoformerVocals {
+    fn separate(&self, mix: &std::path::Path, out: &std::path::Path) -> anyhow::Result<()> {
+        let audio = audio_pcm::decode_stereo_44k(mix)?;
+        let (vocals, _) = self.separator.separate_roformer(&audio, self.gpu)?;
+        separation::write_wav_stereo(out, &vocals)
+    }
+}
+
 /// The separator when its model and a runtime are on disk. The training page
 /// and the models page ask this on every read, so it only looks at the files:
 /// a runtime bound here would be the processor build whenever that lands
 /// before the card's libraries, and it stays bound until the studio restarts.
 async fn vocal_separator(state: &AppState) -> Option<Arc<dyn training::VocalSeparator>> {
+    let config = state.separation_config.read().await.clone();
+    if config.engine == separation::Engine::Roformer {
+        let gpu = roformer_on_card(state, config.runtime);
+        return state.separator.roformer_installed(gpu).then(|| Arc::new(RoformerVocals { separator: state.separator.clone(), gpu }) as Arc<dyn training::VocalSeparator>);
+    }
     if !state.separator.is_installed() || state.lyrics_sync.onnxruntime_library().is_none() {
         return None;
     }
-    let config = state.separation_config.read().await.clone();
     Some(Arc::new(StudioSeparator {
         model: state.separator.model_path(),
         overlap: config.sane_overlap(),
@@ -2828,7 +3008,7 @@ async fn card_free_for_training(state: &AppState) -> Result<(), String> {
 /// is a CUDA 13 build and computes on the card only: on the processor one run
 /// would take days.
 fn trainer_card_refusal() -> Option<String> {
-    match hardware::hardware().cuda {
+    match hardware::hardware().card_cuda {
         Some(hardware::CudaBuild::Cuda13) => None,
         Some(hardware::CudaBuild::Cuda12) => Some(format!(
             "training needs NVIDIA driver {} or newer: the trainer is a CUDA 13 build, and this card or its driver runs CUDA 12 only",
@@ -2842,7 +3022,7 @@ fn trainer_card_refusal() -> Option<String> {
 /// "nvidia" on a machine with no CUDA card, "driver" where the card or its
 /// driver runs CUDA 12 only.
 fn trainer_card_needs() -> Option<&'static str> {
-    match hardware::hardware().cuda {
+    match hardware::hardware().card_cuda {
         Some(hardware::CudaBuild::Cuda13) => None,
         Some(hardware::CudaBuild::Cuda12) => Some("driver"),
         None => Some("nvidia"),
@@ -2852,7 +3032,8 @@ fn trainer_card_needs() -> Option<&'static str> {
 /// Whether the cuBLAS the trainer's CUDA backend loads is missing. It comes
 /// from beside the engine, which fetches it only for a CUDA 13 run of its own.
 fn trainer_cublas_missing(state: &AppState) -> bool {
-    !state.engine_runtime.missing(Some(hardware::CudaBuild::Cuda13)).is_empty()
+    // elsewhere the trainer is a local build linked against the system's CUDA
+    cfg!(windows) && !state.engine_runtime.missing(Some(hardware::CudaBuild::Cuda13)).is_empty()
 }
 
 /// Refuses a run the trainer could not compute on the card.
@@ -2955,7 +3136,7 @@ async fn read_stem_audio(
     Path((id, stem)): Path<(String, String)>,
     request: Request,
 ) -> Result<axum::response::Response, (StatusCode, Json<ApiError>)> {
-    if !separation::STEMS.contains(&stem.as_str()) {
+    if !separation::STEMS.contains(&stem.as_str()) && !separation::ROFORMER_STEMS.contains(&stem.as_str()) {
         return Err(api_error(StatusCode::BAD_REQUEST, format!("unknown stem {stem}")));
     }
     let path = stem_path(&state, &id, &stem);
@@ -2987,12 +3168,21 @@ async fn start_separation(
         return Err(api_error(StatusCode::CONFLICT, "a track is already being separated".into()));
     }
     let wanted_runtime = state.separation_config.read().await.runtime;
-    let card = state
-        .lyrics_sync
-        .onnx_card(wanted_runtime)
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?
-        .filter(|card| separates_on(*card));
-    if !state.separator.is_installed() {
+    let engine = state.separation_config.read().await.engine;
+    // the ONNX Runtime and its card are HT-Demucs's; Mel-Band RoFormer runs its own engine
+    let card = match engine {
+        separation::Engine::Htdemucs => state
+            .lyrics_sync
+            .onnx_card(wanted_runtime)
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?
+            .filter(|card| separates_on(*card)),
+        separation::Engine::Roformer => None,
+    };
+    let roformer_gpu = roformer_on_card(&state, wanted_runtime);
+    if engine == separation::Engine::Roformer && !state.separator.roformer_installed(roformer_gpu) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Mel-Band RoFormer is not installed yet: Settings - Models - Stems".into()));
+    }
+    if engine == separation::Engine::Htdemucs && !state.separator.is_installed() {
         return Err(api_error(StatusCode::BAD_REQUEST, "the separation model is not installed yet".into()));
     }
     let audio_path = state
@@ -3009,9 +3199,21 @@ async fn start_separation(
     let wanted = config.stems.clone();
     let background = state.clone();
     let song_id = id.clone();
+    let separator = state.separator.clone();
     tokio::task::spawn_blocking(move || {
         let outcome = (|| -> anyhow::Result<(Vec<String>, bool)> {
             let audio = audio_pcm::decode_stereo_44k(&audio_path)?;
+            if engine == separation::Engine::Roformer {
+                let (vocals, instrumental) = separator.separate_roformer(&audio, roformer_gpu)?;
+                let mut written = Vec::new();
+                for (name, samples) in [("vocals", vocals), ("instrumental", instrumental)] {
+                    if wanted.iter().any(|stem| stem == name) {
+                        separation::write_wav_stereo(&stem_path(&background, &song_id, name), &samples)?;
+                        written.push(name.to_string());
+                    }
+                }
+                return Ok((written, roformer_gpu));
+            }
             let handle = tokio::runtime::Handle::current();
             let separated = separation::separate(&model, &audio, separation::STEMS.len(), overlap, card, |fraction| {
                 let state = background.clone();
@@ -3034,7 +3236,8 @@ async fn start_separation(
             Ok((written, ran_on_gpu))
         })();
         // still on this thread: the stems are hundreds of megabytes to copy
-        let library = outcome.as_ref().ok().map(|(stems, _)| stems_into_library(&background, &song_id, stems, overlap));
+        let model = if engine == separation::Engine::Roformer { "Mel-Band RoFormer" } else { "HT-Demucs" };
+        let library = outcome.as_ref().ok().map(|(stems, _)| stems_into_library(&background, &song_id, stems, overlap, model));
 
         let handle = tokio::runtime::Handle::current();
         handle.spawn(async move {
@@ -3135,7 +3338,7 @@ async fn read_activity(State(state): State<AppState>) -> Json<Value> {
 /// carries on.
 async fn ensure_local_recogniser(state: &AppState, config: &lyrics_sync::LyricsSyncConfig, song_id: &str) -> bool {
     let ready = |state: &AppState| match config.provider {
-        lyrics_sync::AsrProvider::Parakeet => state.lyrics_sync.parakeet_ready(config.whisper_model.as_deref()),
+        lyrics_sync::AsrProvider::Parakeet => state.lyrics_sync.parakeet_ready(config.runtime, config.whisper_model.as_deref()),
         lyrics_sync::AsrProvider::Whisper => {
             state.lyrics_sync.whisper_binary().is_some() && state.lyrics_sync.whisper_model_ready(config)
         }
@@ -3146,10 +3349,9 @@ async fn ensure_local_recogniser(state: &AppState, config: &lyrics_sync::LyricsS
     }
 
     let missing: Vec<&'static lyrics_sync::Asset> = match config.provider {
-        lyrics_sync::AsrProvider::Parakeet => lyrics_sync::parakeet_variant(config.whisper_model.as_deref())
-            .0
-            .iter()
-            .filter_map(|id| lyrics_sync::asset(id))
+        lyrics_sync::AsrProvider::Parakeet => lyrics_sync::parakeet_assets(config.runtime, config.whisper_model.as_deref())
+            .into_iter()
+            .filter_map(lyrics_sync::asset)
             .filter(|asset| !state.lyrics_sync.downloader().is_installed(asset))
             .collect(),
         // Whatever the chosen recogniser is made of, by the same reckoning the
@@ -3192,7 +3394,10 @@ async fn ensure_local_recogniser(state: &AppState, config: &lyrics_sync::LyricsS
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         }
     }
-    ready(state)
+    // the download was this record's work: done or failed here, so no caller leaves it "downloading"
+    let now_ready = ready(state);
+    note_activity(state, song_id, &title, "karaoke", if now_ready { "done" } else { "failed" }, (!now_ready).then(|| "karaoke.model-missing".to_string())).await;
+    now_ready
 }
 
 async fn time_lyrics_for(state: AppState, song_id: String) {
@@ -3226,7 +3431,7 @@ async fn time_lyrics_for(state: AppState, song_id: String) {
         lyrics_sync::AsrProvider::Parakeet => {
             let sync = state.lyrics_sync.clone();
             let path = std::path::PathBuf::from(&audio);
-            match tokio::task::spawn_blocking(move || sync.parakeet_words(config.runtime, config.whisper_model.as_deref(), &path)).await {
+            match tokio::task::spawn_blocking(move || sync.parakeet_words(config.runtime, config.whisper_model.as_deref(), &path, None)).await {
                 Ok(result) => result,
                 Err(error) => Err(anyhow::anyhow!("the recogniser stopped: {error}")),
             }
@@ -3548,6 +3753,8 @@ struct CoverLookRequest {
     #[serde(default)]
     pattern: Option<String>,
     #[serde(default)]
+    unique: Option<bool>,
+    #[serde(default)]
     keep: Option<bool>,
 }
 
@@ -3556,6 +3763,7 @@ async fn cover_look_reply(state: &AppState) -> Value {
     serde_json::json!({
         "photo": look.photo,
         "pattern": look.pattern,
+        "unique": look.unique,
         "keep": look.keep,
         "patterns": cover_art::PATTERNS,
         "problem": state.cover_problem.read().await.clone(),
@@ -3582,6 +3790,9 @@ async fn write_cover_look(
         }
         if let Some(pattern) = request.pattern {
             look.pattern = pattern;
+        }
+        if let Some(unique) = request.unique {
+            look.unique = unique;
         }
         if let Some(keep) = request.keep {
             look.keep = keep;
@@ -3636,6 +3847,13 @@ async fn placeholder_image(
             }
         }
     }
+    if look.unique {
+        let (style, lyrics, title) = unique_texts(state, song)?;
+        let label = cover_art::Unique::label(&look.pattern, &style, &lyrics, &title);
+        let unique = cover_art::unique(&look.pattern, &style, &lyrics, &title);
+        let image = tokio::task::spawn_blocking(move || unique.png(cover_art::KEPT_SIZE)).await.context("the pattern drawing stopped")??;
+        return Ok((image, "image/png", label, None));
+    }
     let pattern = look.pattern.clone();
     let label = format!("pattern:{pattern}");
     let image = tokio::task::spawn_blocking(move || cover_art::pattern_png(&pattern, &seed, cover_art::KEPT_SIZE))
@@ -3660,7 +3878,13 @@ async fn pin_placeholder(state: &AppState, song_id: &str) -> anyhow::Result<bool
         }
         return Ok(removed);
     }
-    if pinned.as_deref() == Some(look.label().as_str()) {
+    let wanted = if !look.photo && look.unique {
+        let (style, lyrics, title) = unique_texts(state, &song)?;
+        cover_art::Unique::label(&look.pattern, &style, &lyrics, &title)
+    } else {
+        look.label()
+    };
+    if pinned.as_deref() == Some(wanted.as_str()) {
         return Ok(false);
     }
     // a stem wears its song's cover: it takes the song's, drawn for the song first
@@ -3901,9 +4125,24 @@ async fn import_library_audio(State(state): State<AppState>, mut multipart: Mult
     Ok((StatusCode::CREATED, Json(song)))
 }
 async fn update_library_song(State(state):State<AppState>,Path(id):Path<String>,Json(input):Json<library::SongInput>)->Result<Json<library::Song>,(StatusCode,Json<ApiError>)>{
+    let before = state.library.get_song(&id).ok().flatten().map(|song| (song.caption, song.lyrics, song.title));
     let song = state.library.update_song(&id,input).map_err(|e|api_error(StatusCode::BAD_REQUEST,e.to_string()))?.ok_or_else(||api_error(StatusCode::NOT_FOUND,"Song not found".into()))?;
+    let texts_changed = before.as_ref() != Some(&(song.caption.clone(), song.lyrics.clone(), song.title.clone()));
     // A rename is a title change, and the file carries the title.
     tag_stored_song(&state, &id).await;
+    // a unique pattern is drawn from the style and the words: a new one of either draws it again, the stems' too
+    if texts_changed && state.cover_look.read().await.unique {
+        let state = state.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            let stems: Vec<String> = state.library.list_songs().map(|songs| songs.into_iter().filter(|song| derived_from(song) == Some((id.as_str(), "stems"))).map(|song| song.id).collect()).unwrap_or_default();
+            for song_id in std::iter::once(id.clone()).chain(stems) {
+                if let Err(error) = pin_placeholder(&state, &song_id).await {
+                    eprintln!("[ERROR] could not draw the unique pattern of {song_id} again: {error:#}");
+                }
+            }
+        });
+    }
     Ok(Json(song))
 }
 /// Removes a song and its files; a file that cannot go (a player holds it)
@@ -3929,7 +4168,7 @@ async fn delete_library_song(State(state): State<AppState>, Path(id): Path<Strin
 /// stems and its cover. Anything outside the media folder is not ours to remove.
 fn song_files(state: &AppState, song: &library::Song) -> Vec<PathBuf> {
     let media = state.library.media_dir();
-    let mut files: Vec<PathBuf> = separation::STEMS.iter().map(|stem| stem_path(state, &song.id, stem)).collect();
+    let mut files: Vec<PathBuf> = separation::STEMS.iter().chain(["instrumental"].iter()).map(|stem| stem_path(state, &song.id, stem)).collect();
     if let Some(audio) = state.library.media_path_for_song(song) {
         files.push(audio);
     }
@@ -4062,7 +4301,7 @@ async fn update_configuration(
         match selection.capability {
             Capability::SpeechToText => {
                 let mut sync = state.lyrics_sync_config.write().await;
-                let installed_parakeet = state.lyrics_sync.installed_parakeet();
+                let installed_parakeet = state.lyrics_sync.installed_parakeet(sync.runtime);
                 sync.provider = match selection.mode {
                     ExecutionMode::OpenRouter => lyrics_sync::AsrProvider::OpenRouter,
                     ExecutionMode::Local => match selection.local_engine.as_deref() {
@@ -4074,7 +4313,7 @@ async fn update_configuration(
                     },
                 };
                 // picked because some Parakeet is there: the one named must be that one
-                if sync.provider == lyrics_sync::AsrProvider::Parakeet && selection.local_engine.is_none() && !state.lyrics_sync.parakeet_ready(sync.whisper_model.as_deref()) {
+                if sync.provider == lyrics_sync::AsrProvider::Parakeet && selection.local_engine.is_none() && !state.lyrics_sync.parakeet_ready(sync.runtime, sync.whisper_model.as_deref()) {
                     sync.whisper_model = installed_parakeet.map(String::from);
                 }
                 if selection.mode == ExecutionMode::OpenRouter {
@@ -4090,7 +4329,7 @@ async fn update_configuration(
                             assistant.openrouter_model = Some(model);
                         }
                     }
-                    ExecutionMode::Local if assistant.provider == AssistantProvider::Agent => {}
+                    ExecutionMode::Local if matches!(assistant.provider, AssistantProvider::Agent | AssistantProvider::Cli) => {}
                     ExecutionMode::Local => {
                         // Whichever local shape is set up: a managed model the
                         // studio downloaded, or a server the user runs.
@@ -4220,6 +4459,12 @@ async fn pick_engine_executable() -> Result<Json<Value>, (StatusCode, Json<ApiEr
         "picked": picked.is_some(),
         "path": picked.map(|path| path.to_string_lossy().into_owned()),
     })))
+}
+
+/// A job is running and the engine the studio started is still a running process.
+async fn engine_at_work(state: &AppState) -> bool {
+    let working = state.jobs.read().await.values().any(|job| matches!(job.status, MusicJobStatus::Running));
+    working && state.engine.lock().await.as_mut().is_some_and(|engine| engine.process_alive())
 }
 
 async fn restart_engine(state: &AppState) -> Result<(), String> {
@@ -4383,14 +4628,6 @@ fn device_error_line(log: &str) -> Option<String> {
         .map(|line| line.chars().take(140).collect())
 }
 
-/// Whether the engine ended without a word about why. Its own failures -
-/// an assertion, an error, running out of memory - are written before it
-/// goes; a device lost under the driver takes the process with nothing said.
-fn died_silently(log: &str) -> bool {
-    !["error", "assert", "fatal", "exception", "abort", "failed", "out of memory"]
-        .iter()
-        .any(|marker| log.contains(marker))
-}
 
 /// Whether a lowercased engine log says the compute device itself failed -
 /// a CUDA or Vulkan error, a device lost, the engine's self-test - as opposed
@@ -5125,7 +5362,7 @@ async fn proxy_image(
 async fn assistant_status(State(state): State<AppState>) -> Json<Value> {
     let config = state.assistant.read().await.clone();
     let runtime = state.assistant_runtime.status().await;
-    let available = assistant_available(&config, &runtime);
+    let available = assistant_ready(config.clone(), runtime.clone()).await;
     Json(serde_json::json!({
         "available": available,
         "managed_model": config.managed_model,
@@ -5137,7 +5374,21 @@ async fn assistant_status(State(state): State<AppState>) -> Json<Value> {
         "local_model": config.local_model,
         "local_api_key_set": credentials::local_server_key().is_some(),
         "openrouter_model": config.openrouter_model,
+        "cli_agent": config.cli_agent,
+        "cli_model": config.cli_model,
+        "cli_path": config.cli_path,
     }))
+}
+
+/// `assistant_available` off the runtime's threads: for the cli provider it may run every CLI's `--version`.
+async fn assistant_ready(config: AssistantConfig, runtime: assistant_runtime::RuntimeStatus) -> bool {
+    if config.provider != AssistantProvider::Cli {
+        return assistant_available(&config, &runtime);
+    }
+    tokio::task::spawn_blocking(move || assistant_available(&config, &runtime)).await.unwrap_or_else(|error| {
+        eprintln!("[ERROR] detecting the agent CLIs stopped: {error}");
+        false
+    })
 }
 
 fn assistant_available(config: &AssistantConfig, runtime: &assistant_runtime::RuntimeStatus) -> bool {
@@ -5155,6 +5406,19 @@ fn assistant_available(config: &AssistantConfig, runtime: &assistant_runtime::Ru
                 .is_some_and(|path| !path.trim().is_empty() && std::path::Path::new(path.trim()).is_file());
             has_runtime && (downloaded || own_file)
         }
+        AssistantProvider::Cli => {
+            if !config.available() {
+                return false;
+            }
+            if let Some(path) = config.cli_path.as_deref().map(str::trim).filter(|path| !path.is_empty()) {
+                return std::path::Path::new(path).is_file();
+            }
+            let detected = providers::cli_agent::detect();
+            match config.cli_agent.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+                Some(id) => detected.iter().any(|cli| cli.id == id),
+                None => !detected.is_empty(),
+            }
+        }
         _ => config.available(),
     }
 }
@@ -5170,6 +5434,9 @@ struct AssistantSettingsRequest {
     managed_model: Option<Option<String>>,
     managed_path: Option<Option<String>>,
     reasoning_effort: Option<Option<String>>,
+    cli_agent: Option<Option<String>>,
+    cli_model: Option<Option<String>>,
+    cli_path: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5209,6 +5476,14 @@ async fn assistant_local_models(
         .map(|list| list.iter().filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string)).collect())
         .unwrap_or_default();
     Ok(Json(serde_json::json!({ "models": models })))
+}
+
+/// Known agent CLIs with install state.
+async fn assistant_cli_agents() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let agents = tokio::task::spawn_blocking(providers::cli_agent::list)
+        .await
+        .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "detecting the agent CLIs failed".into()))?;
+    Ok(Json(serde_json::json!({ "agents": agents })))
 }
 
 /// A request to the user's own server with its key, when one is stored. The
@@ -5268,8 +5543,16 @@ async fn update_assistant_settings(
             managed_model: incoming.managed_model.unwrap_or(current.managed_model),
             managed_path: incoming.managed_path.unwrap_or(current.managed_path),
             reasoning_effort: incoming.reasoning_effort.unwrap_or(current.reasoning_effort),
+            cli_agent: incoming.cli_agent.unwrap_or(current.cli_agent).map(|id| id.trim().to_string()).filter(|id| !id.is_empty()),
+            cli_model: incoming.cli_model.unwrap_or(current.cli_model),
+            cli_path: incoming.cli_path.unwrap_or(current.cli_path),
         }
     };
+    if let Some(id) = request.cli_agent.as_deref() {
+        if providers::cli_agent::find_kind(id).is_none() {
+            return Err(api_error(StatusCode::BAD_REQUEST, format!("unknown agent CLI: {id}")));
+        }
+    }
     if request.provider == AssistantProvider::Local {
         let base = request.local_base_url.as_deref().unwrap_or_default();
         let url = reqwest::Url::parse(base)
@@ -5331,7 +5614,7 @@ async fn assistant_runtime_status(State(state): State<AppState>) -> Json<Value> 
         // the panel's "installed" is about the chosen provider: OpenRouter or a server of the user's downloads nothing;
         // switched off, it is about the files
         if config.provider != AssistantProvider::None {
-            fields.insert("set".into(), serde_json::json!({ "ready": assistant_available(&config, &status) }));
+            fields.insert("set".into(), serde_json::json!({ "ready": assistant_ready(config.clone(), status.clone()).await }));
         }
     }
     Json(value)
@@ -5473,15 +5756,10 @@ async fn karaoke_status(State(state): State<AppState>) -> Json<Value> {
     Json(value)
 }
 
-/// What choosing this recogniser model downloads: its own file and the ones that come with it
-/// (a Parakeet encoder's decoder, vocabulary and, for fp32, its weights; a Whisper model's folder).
+/// What choosing this recogniser model downloads: a Parakeet's one file, a Whisper model's folder.
 fn karaoke_variant_bytes(id: &str) -> Option<u64> {
-    let files: Vec<&'static lyrics_sync::Asset> = if id.starts_with("parakeet-") {
-        let (ids, _) = lyrics_sync::parakeet_variant(Some(id));
-        if !ids.first().is_some_and(|first| *first == id) {
-            return None;
-        }
-        ids.iter().filter_map(|id| lyrics_sync::asset(id)).collect()
+    let files: Vec<&'static lyrics_sync::Asset> = if [lyrics_sync::PARAKEET_V3, lyrics_sync::PARAKEET_ULTRA].contains(&id) {
+        lyrics_sync::asset(id).into_iter().collect()
     } else if let Some(size) = id.strip_prefix("whisper-").filter(|_| lyrics_sync::asset(id).is_some_and(|asset| asset.vram_gb.is_some())) {
         let prefix = format!("models/whisper/faster-whisper-{size}/");
         lyrics_sync::ASSETS.iter().filter(|asset| asset.relative_path.starts_with(&prefix)).collect()
@@ -5566,11 +5844,14 @@ fn karaoke_set(name: &str, device: lyrics_sync::OnnxFlavour, whisper_model: Opti
     let mut wanted: Vec<String> = Vec::new();
     match name {
         "parakeet" => {
-            wanted.push("onnxruntime".into());
-            wanted.extend(card_assets(device).iter().map(|id| id.to_string()));
-            // The precision is chosen the same way a Whisper model is: through
-            // the dropdown, which names one of the encoders.
-            wanted.extend(lyrics_sync::parakeet_variant(whisper_model).0.iter().map(|id| id.to_string()));
+            // the transcribe.cpp build this machine runs and the model the dropdown names; on a card CUDA does not
+            // run, DirectML comes with it for the tempo model, as before transcribe.cpp (on NVIDIA, separation brings
+            // the CUDA runtime)
+            if device.card() == Some(lyrics_sync::OnnxCard::DirectMl) {
+                wanted.push("onnxruntime".into());
+                wanted.extend(lyrics_sync::DIRECTML_ASSETS.iter().map(|id| id.to_string()));
+            }
+            wanted.extend(lyrics_sync::parakeet_assets(device, whisper_model).into_iter().map(String::from));
         }
         "whisper" => {
             // One binary whichever device is chosen; the card needs CUDA 11's
@@ -5666,7 +5947,7 @@ async fn recognised_words(
         lyrics_sync::AsrProvider::Parakeet => {
             let sync = state.lyrics_sync.clone();
             let (runtime, variant) = (config.runtime, config.whisper_model.clone());
-            tokio::task::spawn_blocking(move || sync.parakeet_words(runtime, variant.as_deref(), &path))
+            tokio::task::spawn_blocking(move || sync.parakeet_words(runtime, variant.as_deref(), &path, language.as_deref()))
                 .await
                 .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
                 .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))
@@ -5763,12 +6044,6 @@ async fn create_song_karaoke(
     if !config.available() {
         return Err(api_error(StatusCode::CONFLICT, "karaoke.off".into()));
     }
-    // Pressing the button on a track is the instruction to time it. If the
-    // chosen local recogniser is not on disk yet, that is a download to start,
-    // not a refusal to hand back.
-    if !ensure_local_recogniser(&state, &config, &id).await {
-        return Err(api_error(StatusCode::CONFLICT, "karaoke.model-missing".into()));
-    }
     let song = state
         .library
         .get_song(&id)
@@ -5781,6 +6056,12 @@ async fn create_song_karaoke(
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "this track has no audio to listen to".into()))?;
     if !auto_title::has_sung_lines(&song.lyrics) {
         return Err(api_error(StatusCode::BAD_REQUEST, "karaoke.instrumental".into()));
+    }
+    // Pressing the button on a track is the instruction to time it. If the
+    // chosen local recogniser is not on disk yet, that is a download to start,
+    // not a refusal to hand back.
+    if !ensure_local_recogniser(&state, &config, &id).await {
+        return Err(api_error(StatusCode::CONFLICT, "karaoke.model-missing".into()));
     }
 
     let words = recognised_words(&state, &config, std::path::PathBuf::from(&audio), request.language.clone(), song.lyrics.clone()).await?;
@@ -5928,6 +6209,65 @@ async fn assistant_write_stream(
                     }
                 }
                 Err(error) => emit(sender.clone(), serde_json::json!({ "error": error })).await,
+            }
+            return;
+        }
+
+        // Unlike the connected agent, a CLI run can be stopped.
+        if config.provider == AssistantProvider::Cli {
+            let selected = match tokio::task::spawn_blocking({
+                let config = config.clone();
+                move || select_cli_agent(&config)
+            })
+            .await
+            {
+                Ok(selected) => selected,
+                Err(_) => Err("detecting the agent CLIs failed".to_string()),
+            };
+            let (kind, resolved) = match selected {
+                Ok(selected) => selected,
+                Err(error) => {
+                    emit(sender.clone(), serde_json::json!({ "error": error })).await;
+                    return;
+                }
+            };
+            let model = format!("cli:{}", kind.id);
+            emit(sender.clone(), serde_json::json!({ "stage": "sent", "model": model })).await;
+            request_log::asked("assistant", &model, system.chars().count() + user.chars().count());
+            let started = std::time::Instant::now();
+            let mut run = match providers::cli_agent::spawn(kind, &resolved, &system, &user, config.cli_model.as_deref()).await {
+                Ok(run) => run,
+                Err(failure) => {
+                    request_log::failed("assistant", &model, &failure.message());
+                    emit(sender.clone(), serde_json::json!({ "error": failure.message() })).await;
+                    return;
+                }
+            };
+            let answer = tokio::select! {
+                _ = sender.closed() => {
+                    request_log::failed("assistant", &model, "stopped by the user");
+                    run.kill().await;
+                    return;
+                }
+                answer = run.run_to_completion() => answer,
+            };
+            match answer {
+                Ok(text) => {
+                    request_log::answered("assistant", &model, 200, started.elapsed().as_secs_f64(), text.chars().count());
+                    emit(sender.clone(), serde_json::json!({ "stage": "writing" })).await;
+                    emit(sender.clone(), serde_json::json!({ "delta": text })).await;
+                    match assistant::parse_draft(&text, &required) {
+                        Ok(draft) => emit(sender.clone(), serde_json::json!({ "stage": "done", "text": text, "draft": draft })).await,
+                        Err(error) => {
+                            request_log::unusable("assistant", &model, &error.to_string(), &text);
+                            emit(sender.clone(), serde_json::json!({ "error": format!("the {} answer does not fit the schema: {error}", kind.display_name) })).await;
+                        }
+                    }
+                }
+                Err(failure) => {
+                    request_log::failed("assistant", &model, &failure.message());
+                    emit(sender.clone(), serde_json::json!({ "error": failure.message() })).await;
+                }
             }
             return;
         }
@@ -6232,6 +6572,21 @@ fn assist_target_name(target: assistant::AssistTarget) -> String {
     serde_json::to_value(target).ok().and_then(|value| value.as_str().map(str::to_string)).unwrap_or_default()
 }
 
+/// Blocking (it probes the machine): callers run it on the blocking pool.
+fn select_cli_agent(config: &AssistantConfig) -> Result<(&'static providers::cli_agent::Kind, providers::cli_agent::ResolvedCli), String> {
+    let kind = match config.cli_agent.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => providers::cli_agent::find_kind(id).ok_or_else(|| format!("unknown agent CLI: {id}"))?,
+        None => {
+            let first = providers::cli_agent::detect().into_iter().next().ok_or_else(|| {
+                "No agent CLI is installed. Install one - Claude Code, Codex, opencode, agy or Muse Code - or pick another assistant.".to_string()
+            })?;
+            providers::cli_agent::find_kind(first.id).expect("detection only reports known kinds")
+        }
+    };
+    let resolved = providers::cli_agent::resolve(kind, config.cli_path.as_deref())?;
+    Ok((kind, resolved))
+}
+
 /// One chat completion from the configured writing assistant: the system and
 /// user messages, the answer's text. `schema` enforces the answer's shape where
 /// the provider can; `target` sizes the answer. The assistant stays loaded:
@@ -6257,6 +6612,33 @@ async fn assistant_ask(
 
     if config.provider == AssistantProvider::Agent {
         return mcp::ask_agent(system, user, schema, &assist_target_name(target)).await.map_err(|error| api_error(StatusCode::BAD_GATEWAY, error));
+    }
+
+    if config.provider == AssistantProvider::Cli {
+        let selected = tokio::task::spawn_blocking({
+            let config = config.clone();
+            move || select_cli_agent(&config)
+        })
+        .await
+        .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "detecting the agent CLIs failed".into()))?
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+        let (kind, resolved) = selected;
+        let model = format!("cli:{}", kind.id);
+        request_log::asked("assistant", &model, system.chars().count() + user.chars().count());
+        let started = std::time::Instant::now();
+        let mut run = providers::cli_agent::spawn(kind, &resolved, system, user, config.cli_model.as_deref())
+            .await
+            .map_err(|failure| {
+                request_log::failed("assistant", &model, &failure.message());
+                api_error(StatusCode::BAD_GATEWAY, failure.message())
+            })?;
+        return run.run_to_completion().await.map_err(|failure| {
+            request_log::failed("assistant", &model, &failure.message());
+            api_error(StatusCode::BAD_GATEWAY, failure.message())
+        }).map(|text| {
+            request_log::answered("assistant", &model, 200, started.elapsed().as_secs_f64(), text.chars().count());
+            text
+        });
     }
 
     let response: Value = match config.provider {
@@ -6348,6 +6730,7 @@ async fn assistant_ask(
         }
         AssistantProvider::None => return Err(api_error(StatusCode::CONFLICT, "No writing assistant is configured.".into())),
         AssistantProvider::Agent => unreachable!("the agent answered above"),
+        AssistantProvider::Cli => unreachable!("the CLI answered above"),
     };
 
     let content = assistant::content_of(&response).map_err(|error| {
@@ -7232,13 +7615,14 @@ async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesRespons
     let whisper_installed = state.lyrics_sync.whisper_binary().is_some();
     let assistant = state.assistant.read().await.clone();
     let assistant_installed = assistant.available();
+    let cli_agents = tokio::task::spawn_blocking(providers::cli_agent::detect).await.unwrap_or_default();
     Json(CapabilitiesResponse {
-        engines: capability_engines_with(primary_installed, parakeet_installed, whisper_installed, assistant_installed),
+        engines: capability_engines_with(primary_installed, parakeet_installed, whisper_installed, assistant_installed, &cli_agents),
     })
 }
 
 fn capability_engines(primary_installed: bool) -> Vec<EngineDescriptor> {
-    capability_engines_with(primary_installed, false, false, false)
+    capability_engines_with(primary_installed, false, false, false, &[])
 }
 
 /// The engines the studio can offer, including the local ones it only has when
@@ -7250,13 +7634,14 @@ fn capability_engines_with(
     parakeet_installed: bool,
     whisper_installed: bool,
     assistant_installed: bool,
+    cli_agents: &[providers::cli_agent::Detected],
 ) -> Vec<EngineDescriptor> {
     let openrouter_capabilities = vec![
         Capability::SpeechToText,
         Capability::PromptEnhancement,
         Capability::CoverArt,
     ];
-    vec![
+    let mut engines = vec![
         EngineDescriptor {
             id: PRIMARY_MUSIC_ENGINE_ID.into(),
             display_name: "YuE2 (yue2.cpp)".into(),
@@ -7294,7 +7679,17 @@ fn capability_engines_with(
             execution_mode: ExecutionMode::OpenRouter,
             installed: false,
         },
-    ]
+    ];
+    for cli in cli_agents {
+        engines.push(EngineDescriptor {
+            id: format!("cli-{}", cli.id),
+            display_name: format!("{} (agent CLI)", cli.display_name),
+            capabilities: vec![Capability::PromptEnhancement],
+            execution_mode: ExecutionMode::Local,
+            installed: true,
+        });
+    }
+    engines
 }
 
 /// Gets the writing assistant off the graphics card before the engine needs it.
@@ -7978,22 +8373,35 @@ async fn import_completed_result(state: &AppState, job: &MusicJob, job_id: &str)
         if vocals_only {
             let model = state.separator.model_path();
             let config = state.separation_config.read().await.clone();
-            let card = state.lyrics_sync.onnx_card(config.runtime)?.filter(|card| separates_on(*card));
+            let card = if config.engine == separation::Engine::Roformer { None } else { state.lyrics_sync.onnx_card(config.runtime)?.filter(|card| separates_on(*card)) };
             let progress_state = state.clone();
             let progress_id = job_id.to_string();
+            let roformer = (config.engine == separation::Engine::Roformer).then(|| (state.separator.clone(), roformer_on_card(state, config.runtime)));
+            if let Some((separator, gpu)) = &roformer {
+                if !separator.roformer_installed(*gpu) {
+                    anyhow::bail!("Mel-Band RoFormer is the chosen separator and is not installed: Settings - Models - Stems");
+                }
+            }
             {
                 let mut jobs = state.jobs.write().await;
                 let active = jobs.get_mut(job_id).context("the vocals-only job no longer exists")?;
                 if matches!(active.status, MusicJobStatus::Cancelled) { anyhow::bail!("Vocals extraction cancelled"); }
                 active.status = MusicJobStatus::Running;
                 active.phase = MusicJobPhase::ExtractingVocals;
-                active.message = "Loading the vocals separator.".into();
+                active.message = if roformer.is_some() { "Extracting vocals with Mel-Band RoFormer.".into() } else { "Loading the vocals separator.".into() };
             }
             let (voice_audio, used_gpu) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, bool)> {
                 let temporary = tempfile::tempdir()?;
                 let input = temporary.path().join(format!("mix.{extension}"));
                 std::fs::write(&input, audio)?;
                 let samples = audio_pcm::decode_stereo_44k(&input)?;
+                if let Some((separator, gpu)) = roformer {
+                    let (voice, _) = separator.separate_roformer(&samples, gpu)?;
+                    let stereo = audio_post::Stereo { rate: 44_100, left: voice.iter().step_by(2).copied().collect(), right: voice.iter().skip(1).step_by(2).copied().collect() };
+                    let output = temporary.path().join("vocals.wav");
+                    audio_pcm::write_wav_f32(&output, &stereo)?;
+                    return Ok((std::fs::read(output).context("read the extracted vocals")?, gpu));
+                }
                 let mut loaded = separation::load(&model, card)?;
                 if card.is_some() && !loaded.used_gpu { anyhow::bail!("The requested GPU separator could not load its execution provider; vocals extraction was stopped instead of running on CPU"); }
                 let separated = separation::separate_with_checked(&mut loaded, &samples, separation::STEMS.len(), config.sane_overlap(), |fraction| {
@@ -8023,20 +8431,32 @@ async fn import_completed_result(state: &AppState, job: &MusicJob, job_id: &str)
         // the engine's float output is kept at the level it came: lossless FLAC unless MP3 was asked for
         if extension == "wav" {
             let kbps = job.generation_settings.get("mp3_bitrate").and_then(Value::as_u64).map_or(DEFAULT_MP3_KBPS, |value| value as u32);
-            if format != "wav32" {
+            let seconds = |key: &str| job.generation_settings.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let fades = (seconds("fade_in"), seconds("fade_out"));
+            let faded = fades.0 > 0.0 || fades.1 > 0.0;
+            if format != "wav32" || faded {
                 let target = format.clone();
                 audio = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-                    let stereo = audio_pcm::decode_stereo_bytes(audio, "wav")?;
+                    let mut stereo = audio_pcm::decode_stereo_bytes(audio, "wav")?;
                     if !vocals_only {
                         if let Some(problem) = audio_pcm::stereo_problem(&stereo) {
                             anyhow::bail!("The engine returned {problem} instead of a song, so nothing was kept. Make it again; if it repeats, the engine log has the cause.");
                         }
                     }
-                    if target == "mp3" { audio_post::encode::mp3(&stereo, kbps) } else { audio_post::encode::flac(&stereo) }
+                    audio_post::encode::fade(&mut stereo, fades.0, fades.1);
+                    match target.as_str() {
+                        "mp3" => audio_post::encode::mp3(&stereo, kbps),
+                        "wav32" => audio_pcm::wav_f32_bytes(&stereo),
+                        _ => audio_post::encode::flac(&stereo),
+                    }
                 })
                 .await
                 .context("the encoder stopped")??;
-                extension = if format == "mp3" { "mp3" } else { "flac" };
+                extension = match format.as_str() { "mp3" => "mp3", "wav32" => "wav", _ => "flac" };
+            }
+            if faded {
+                replay["fade_in"] = Value::from(fades.0);
+                replay["fade_out"] = Value::from(fades.1);
             }
             for record in [&mut *settings, replay.as_object_mut().context("the replay request is not a JSON object")?] {
                 record.insert("output_format".into(), Value::from(if format == "mp3" { "mp3" } else if format == "wav32" { "wav32" } else { "flac" }));
@@ -8329,12 +8749,32 @@ async fn create_transcription(
     if bytes.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "The audio is empty.".into()));
     }
+    let (bytes, name) = tokio::task::spawn_blocking(move || engine_readable(bytes, name))
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
     let remote = state
         .music_server
         .transcribe(bytes, name, melody_only)
         .await
         .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, format!("the engine refused the transcription: {error}")))?;
     Ok((StatusCode::ACCEPTED, Json(ScoreJob::running(remote.id))))
+}
+
+/// A recording as the engine's reader takes it: WAV and MP3 go as they are,
+/// any other format the library holds (FLAC, OGG, M4A) is decoded here and
+/// goes as a 24-bit WAV.
+fn engine_readable(bytes: Vec<u8>, name: String) -> anyhow::Result<(Vec<u8>, String)> {
+    // an MPEG audio frame names its layer; ADTS AAC shares the sync word with layer bits 00
+    let mp3 = bytes.starts_with(b"ID3") || (bytes.len() > 1 && bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0 && (bytes[1] >> 1) & 0x03 != 0);
+    if bytes.starts_with(b"RIFF") || mp3 {
+        return Ok((bytes, name));
+    }
+    let path = std::path::Path::new(&name);
+    let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("recording").to_owned();
+    let audio = audio_pcm::decode_stereo_bytes(bytes, &extension).with_context(|| format!("decode {name}"))?;
+    Ok((audio_pcm::wav24_bytes(&audio)?, format!("{stem}.wav")))
 }
 
 /// The score a finished job carries. A transcription answers with JSON; a
@@ -8610,7 +9050,7 @@ fn drawn_seed() -> i64 {
 /// nothing changes its loudness on the way.
 fn engine_submission(body: &Value) -> Value {
     let mut engine = body.clone();
-    if let Some(fields) = engine.as_object_mut() { fields.remove("vocals_only"); fields.remove("score_edit"); }
+    if let Some(fields) = engine.as_object_mut() { fields.remove("vocals_only"); fields.remove("score_edit"); fields.remove("fade_in"); fields.remove("fade_out"); }
     if let Some(fields) = engine.as_object_mut() {
         fields.insert("output_format".into(), Value::from("wav32"));
         fields.remove("mp3_bitrate");
@@ -8700,6 +9140,11 @@ fn yue_request_from(request: &CreateMusicJobRequest, max_batch: u32) -> Result<V
     });
     if request.vocals_only {
         body["vocals_only"] = Value::Bool(true);
+    }
+    for (key, seconds) in [("fade_in", request.fade_in), ("fade_out", request.fade_out)] {
+        if let Some(seconds) = seconds.filter(|seconds| *seconds > 0.0) {
+            body[key] = Value::from(seconds);
+        }
     }
     let step = request.transpose.unwrap_or(0);
     if let Some(source) = request.abc.as_deref() {
@@ -8958,6 +9403,24 @@ mod tests {
     }
 
     #[test]
+    fn a_cover_recording_reaches_the_engine_as_wav_or_mp3() {
+        let audio = audio_post::Stereo { left: vec![0.25; 4_800], right: vec![-0.25; 4_800], rate: 48_000 };
+        let (sent, name) = engine_readable(audio_post::encode::flac(&audio).unwrap(), "Song.flac".into()).unwrap();
+        assert!(sent.starts_with(b"RIFF") && name == "Song.wav", "{name}");
+        let heard = audio_pcm::decode_stereo_bytes(sent, "wav").unwrap();
+        assert_eq!((heard.rate, heard.left.len()), (48_000, 4_800));
+        assert!((heard.left[100] - 0.25).abs() < 1e-5 && (heard.right[100] + 0.25).abs() < 1e-5);
+        let wav = audio_pcm::wav24_bytes(&audio).unwrap();
+        assert_eq!(engine_readable(wav.clone(), "a.wav".into()).unwrap().0, wav);
+        let mp3 = b"ID3\x04\x00rest".to_vec();
+        assert_eq!(engine_readable(mp3.clone(), "a.mp3".into()).unwrap().0, mp3);
+        let frame = vec![0xFF, 0xFB, 0x90, 0x00];
+        assert_eq!(engine_readable(frame.clone(), "a.mp3".into()).unwrap().0, frame, "a bare MPEG layer III frame");
+        let adts = vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC];
+        assert!(engine_readable(adts.clone(), "a.aac".into()).map_or(true, |(sent, _)| sent != adts), "ADTS AAC is not passed on as MP3");
+    }
+
+    #[test]
     fn a_song_file_is_found_in_the_media_folder_however_its_path_is_written() {
         let root = tempfile::tempdir().unwrap();
         let media = root.path().join("media");
@@ -9023,9 +9486,6 @@ mod tests {
 
     #[test]
     fn an_engine_that_left_without_a_word_counts_as_a_lost_device() {
-        assert!(died_silently("[dit] graph: 1236 nodes, t=689, b=2"));
-        assert!(!died_silently("ggml_assert: x failed"));
-        assert!(!died_silently("cuda error: out of memory"));
     }
 
     #[test]
@@ -9160,6 +9620,20 @@ mod tests {
         let body = yue_request_from(&request, 1).unwrap();
         assert_eq!(body["vocals_only"], true);
         assert!(engine_submission(&body).get("vocals_only").is_none());
+    }
+
+    #[test]
+    fn fades_are_studio_processing_and_never_engine_flags() {
+        let request = CreateMusicJobRequest { fade_in: Some(0.0), fade_out: Some(4.5), ..sample_request() };
+        let body = yue_request_from(&request, 4).unwrap();
+        assert_eq!(body["fade_out"], 4.5);
+        assert!(body.get("fade_in").is_none(), "a zero fade is no fade");
+        let engine = engine_submission(&body);
+        assert!(engine.get("fade_in").is_none() && engine.get("fade_out").is_none());
+        let mut audio = audio_post::Stereo { left: vec![1.0; 48_000], right: vec![1.0; 48_000], rate: 48_000 };
+        audio_post::encode::fade(&mut audio, 0.0, 0.5);
+        assert_eq!((audio.left[0], audio.left[23_999]), (1.0, 1.0));
+        assert!(audio.left[47_999] < 0.001 && (audio.left[36_000] - 0.5).abs() < 0.01);
     }
 
     #[test]
@@ -9375,7 +9849,7 @@ mod tests {
     fn persisted_settings_round_trip_a_complete_custom_component_selection() {
         let settings = PersistedStudioSettings {
             engine_options: EngineOptions { keep_loaded: true, max_batch: Some(2), ..EngineOptions::default() },
-            assistant: AssistantConfig { provider: AssistantProvider::Local, local_base_url: Some("http://127.0.0.1:8080/v1".into()), local_model: Some("gemma".into()), openrouter_model: None, managed_model: None, managed_path: None, reasoning_effort: None },
+            assistant: AssistantConfig { provider: AssistantProvider::Local, local_base_url: Some("http://127.0.0.1:8080/v1".into()), local_model: Some("gemma".into()), openrouter_model: None, managed_model: None, managed_path: None, reasoning_effort: None, cli_agent: None, cli_model: None, cli_path: None },
             configuration: initial_configuration(),
             // Karaoke is off by default and has to survive a restart the same
             // way the assistant does.
@@ -9455,12 +9929,54 @@ mod tests {
     }
 
     #[test]
+    fn detected_clis_join_capabilities_as_local_writers() {
+        let detected = vec![
+            providers::cli_agent::Detected {
+                id: "claude",
+                display_name: "Claude Code",
+                path: "C:/tools/claude.exe".into(),
+                version: "2.1.0".into(),
+                default_model: Some("opus".into()),
+                features: Vec::new(),
+            },
+            providers::cli_agent::Detected {
+                id: "muse",
+                display_name: "Muse Code",
+                path: "C:/tools/muse.exe".into(),
+                version: "1.4.0".into(),
+                default_model: None,
+                features: Vec::new(),
+            },
+        ];
+        let engines = capability_engines_with(false, false, false, false, &detected);
+        assert_eq!(engines.len(), 7);
+        let claude = engines.iter().find(|engine| engine.id == "cli-claude").expect("the detected CLI is listed");
+        assert_eq!(claude.display_name, "Claude Code (agent CLI)");
+        assert_eq!(claude.capabilities, vec![Capability::PromptEnhancement]);
+        assert_eq!(claude.execution_mode, ExecutionMode::Local);
+        assert!(claude.installed);
+        assert!(engines.iter().any(|engine| engine.id == "cli-muse"));
+    }
+
+    #[test]
+    fn the_cli_provider_round_trips_through_settings() {
+        let provider: AssistantProvider = serde_json::from_value(serde_json::json!("cli")).expect("the engine id the UI sends");
+        assert_eq!(provider, AssistantProvider::Cli);
+        assert_eq!(serde_json::to_value(AssistantProvider::Cli).unwrap(), serde_json::json!("cli"));
+        let chosen = AssistantConfig { provider: AssistantProvider::Cli, cli_agent: Some("codex".into()), ..Default::default() };
+        assert!(chosen.available());
+        let unknown = AssistantConfig { provider: AssistantProvider::Cli, cli_agent: Some("nope".into()), ..Default::default() };
+        assert!(!unknown.available());
+        let auto = AssistantConfig { provider: AssistantProvider::Cli, ..Default::default() };
+        assert!(auto.available());
+    }
+
+    #[test]
     fn a_recogniser_variant_weighs_every_file_it_brings() {
-        let fp32 = karaoke_variant_bytes(lyrics_sync::PARAKEET_FP32).unwrap();
-        assert!(fp32 > 2_000_000_000, "the fp32 graph comes with its 2.4 GB of weights: {fp32}");
-        let ultra = karaoke_variant_bytes(lyrics_sync::PARAKEET_ULTRA).unwrap();
-        assert!(ultra > lyrics_sync::asset(lyrics_sync::PARAKEET_ULTRA).unwrap().bytes);
-        assert!(karaoke_variant_bytes("parakeet-decoder").is_none(), "only an encoder is a choice");
+        assert_eq!(karaoke_variant_bytes(lyrics_sync::PARAKEET_ULTRA), Some(dub_tcpp::model("parakeet-ultra").unwrap().download.size));
+        assert_eq!(karaoke_variant_bytes(lyrics_sync::PARAKEET_V3), Some(dub_tcpp::model("parakeet-v3").unwrap().download.size));
+        assert!(karaoke_variant_bytes(lyrics_sync::PARAKEET_FP32).is_none(), "fp32 is no choice of its own any more");
+        assert!(karaoke_variant_bytes("transcribe-engine").is_none());
         assert!(karaoke_variant_bytes("onnxruntime").is_none());
     }
 
