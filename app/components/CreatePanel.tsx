@@ -622,17 +622,20 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     instrumentalChange.current = null;
     setName(''); setStyle(''); setLyrics(''); setAbc(''); setCot(''); setContinueScore(false);
     setPlans([]); setSelectedPlan(0);
-    resetParameters();
+    resetParameters(true);
     setCoverPrompt('');
     setAdapters([]);
     setError(null);
   };
 
-  const resetParameters = () => {
-    chooseDuration(String(DEFAULT_DURATION_SECONDS)); setLmBatch(''); setSynthBatch(''); setSteps(''); setSolver(''); setCfgScale('');
+  /** The settings back to their defaults; `keepChoices` (a new prompt) leaves the length and the file format the
+   *  user keeps for every song. */
+  const resetParameters = (keepChoices = false) => {
+    if (!keepChoices) { chooseDuration(String(DEFAULT_DURATION_SECONDS)); chooseFormat('flac'); }
+    setLmBatch(''); setSynthBatch(''); setSteps(''); setSolver(''); setCfgScale('');
     setRandomizeSeed(true); setLmSeed(''); setSeed(''); setSemanticTokens('');
     setAbcSampling(emptySampling()); setSemanticSampling(emptySampling()); setHarmony(emptyHarmony());
-    setMp3Bitrate('320'); chooseFormat('flac');
+    setMp3Bitrate('320');
     setTranspose('0'); setVocalsOnly(false); setLyricTiming(true); setRealaudio('auto');
   };
 
@@ -1791,7 +1794,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
           <Card
             title={t('quality')}
             actions={
-              <button type="button" onClick={resetParameters} className="rounded-md px-2 py-1 text-[10px] font-semibold text-zinc-500 transition-colors hover:bg-zinc-200 hover:text-black dark:hover:bg-white/10 dark:hover:text-white">
+              <button type="button" onClick={() => resetParameters()} className="rounded-md px-2 py-1 text-[10px] font-semibold text-zinc-500 transition-colors hover:bg-zinc-200 hover:text-black dark:hover:bg-white/10 dark:hover:text-white">
                 {t('resetToDefaults')}
               </button>
             }
