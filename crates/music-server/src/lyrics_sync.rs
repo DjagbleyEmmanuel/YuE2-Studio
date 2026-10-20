@@ -1691,7 +1691,7 @@ impl LyricsSync {
             .arg("--word_timestamps")
             .arg("True")
             .arg("--compute_type")
-            .arg(if on_card { "float16" } else { "int8" })
+            .arg(if on_card { "int8_float16" } else { "int8" })
             .arg("--device")
             .arg(if on_card { "cuda" } else { "cpu" })
             .arg("--beep_off")
