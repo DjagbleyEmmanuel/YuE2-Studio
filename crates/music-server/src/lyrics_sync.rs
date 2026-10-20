@@ -1210,7 +1210,7 @@ pub fn parakeet_build(runtime: OnnxFlavour) -> Option<dub_tcpp::Build> {
     let hardware = crate::hardware::hardware();
     Some(if matches!(runtime, OnnxFlavour::Cpu) || hardware.gpu_name.is_none() {
         dub_tcpp::Build::Cpu
-    } else if hardware.cuda == Some(crate::hardware::CudaBuild::Cuda13) {
+    } else if hardware.card_cuda == Some(crate::hardware::CudaBuild::Cuda13) {
         if cfg!(target_os = "linux") && !system_library("libcublas.so.13") { dub_tcpp::Build::Vulkan } else { dub_tcpp::Build::Cuda }
     } else {
         dub_tcpp::Build::Vulkan

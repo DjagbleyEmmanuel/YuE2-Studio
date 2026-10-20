@@ -1264,7 +1264,9 @@ pub async fn serve() -> anyhow::Result<()> {
             let mut was_running = false;
             loop {
                 let ready = state.model_manager.status(effective_install_target(&state).await).await.ready;
-                let running = state.music_server.health().await;
+                // an engine inside a long step does not answer /health in time; while it is still a
+                // running process with a job on it, it is at work, not gone
+                let running = state.music_server.health().await || engine_at_work(&state).await;
                 // the card has one owner: a preparation or a training run
                 // holding it is left alone, and the engine comes back after
                 let preparing = state.prepare.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().is_some_and(|job| !job.finished);
@@ -1275,13 +1277,14 @@ pub async fn serve() -> anyhow::Result<()> {
                         // explains a log which suddenly starts again from
                         // "Listening on". Written once, not once a cycle.
                         music_engine::yue_server::note_in_log("the engine stopped answering; restarting it");
-                        // Under Auto a device that died of its own fault is
-                        // not tried again: the restart moves down the chain.
+                        // Under Auto a device is left for the session only when
+                        // the log names a device failure: a silent exit (OOM, a
+                        // kill, a slow start) is no fault of the device.
                         let auto = state.engine_options.read().await.backend == music_engine::yue_server::ComputeBackend::Auto;
                         let active = *state.active_device.read().await;
                         if let Some(device) = active.filter(|device| auto && *device != music_engine::yue_server::ComputeBackend::Cpu) {
                             let log = last_run_log().to_lowercase();
-                            if describes_device_failure(&log) || died_silently(&log) {
+                            if describes_device_failure(&log) {
                                 music_engine::yue_server::note_in_log(&format!("{} failed on this machine; leaving it for this session", device_name(device)));
                                 state.failed_devices.write().await.push(device);
                             }
@@ -3005,7 +3008,7 @@ async fn card_free_for_training(state: &AppState) -> Result<(), String> {
 /// is a CUDA 13 build and computes on the card only: on the processor one run
 /// would take days.
 fn trainer_card_refusal() -> Option<String> {
-    match hardware::hardware().cuda {
+    match hardware::hardware().card_cuda {
         Some(hardware::CudaBuild::Cuda13) => None,
         Some(hardware::CudaBuild::Cuda12) => Some(format!(
             "training needs NVIDIA driver {} or newer: the trainer is a CUDA 13 build, and this card or its driver runs CUDA 12 only",
@@ -3019,7 +3022,7 @@ fn trainer_card_refusal() -> Option<String> {
 /// "nvidia" on a machine with no CUDA card, "driver" where the card or its
 /// driver runs CUDA 12 only.
 fn trainer_card_needs() -> Option<&'static str> {
-    match hardware::hardware().cuda {
+    match hardware::hardware().card_cuda {
         Some(hardware::CudaBuild::Cuda13) => None,
         Some(hardware::CudaBuild::Cuda12) => Some("driver"),
         None => Some("nvidia"),
@@ -3029,7 +3032,8 @@ fn trainer_card_needs() -> Option<&'static str> {
 /// Whether the cuBLAS the trainer's CUDA backend loads is missing. It comes
 /// from beside the engine, which fetches it only for a CUDA 13 run of its own.
 fn trainer_cublas_missing(state: &AppState) -> bool {
-    !state.engine_runtime.missing(Some(hardware::CudaBuild::Cuda13)).is_empty()
+    // elsewhere the trainer is a local build linked against the system's CUDA
+    cfg!(windows) && !state.engine_runtime.missing(Some(hardware::CudaBuild::Cuda13)).is_empty()
 }
 
 /// Refuses a run the trainer could not compute on the card.
@@ -4454,6 +4458,12 @@ async fn pick_engine_executable() -> Result<Json<Value>, (StatusCode, Json<ApiEr
     })))
 }
 
+/// A job is running and the engine the studio started is still a running process.
+async fn engine_at_work(state: &AppState) -> bool {
+    let working = state.jobs.read().await.values().any(|job| matches!(job.status, MusicJobStatus::Running));
+    working && state.engine.lock().await.as_mut().is_some_and(|engine| engine.process_alive())
+}
+
 async fn restart_engine(state: &AppState) -> Result<(), String> {
     let mut supervisor = state.engine.lock().await;
     let owned = supervisor.is_some();
@@ -4615,14 +4625,6 @@ fn device_error_line(log: &str) -> Option<String> {
         .map(|line| line.chars().take(140).collect())
 }
 
-/// Whether the engine ended without a word about why. Its own failures -
-/// an assertion, an error, running out of memory - are written before it
-/// goes; a device lost under the driver takes the process with nothing said.
-fn died_silently(log: &str) -> bool {
-    !["error", "assert", "fatal", "exception", "abort", "failed", "out of memory"]
-        .iter()
-        .any(|marker| log.contains(marker))
-}
 
 /// Whether a lowercased engine log says the compute device itself failed -
 /// a CUDA or Vulkan error, a device lost, the engine's self-test - as opposed
@@ -9481,9 +9483,6 @@ mod tests {
 
     #[test]
     fn an_engine_that_left_without_a_word_counts_as_a_lost_device() {
-        assert!(died_silently("[dit] graph: 1236 nodes, t=689, b=2"));
-        assert!(!died_silently("ggml_assert: x failed"));
-        assert!(!died_silently("cuda error: out of memory"));
     }
 
     #[test]

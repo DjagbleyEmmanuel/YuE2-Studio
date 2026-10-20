@@ -104,6 +104,15 @@ const MAX_DURATION_SECONDS = 600;
 /** A new prompt's ceiling: 2:10. Examples and prompt files keep their own. */
 const DEFAULT_DURATION_SECONDS = 130;
 /** The file format last chosen by hand, kept between sessions like the duration. */
+/** The words of the form (name, style, lyrics), kept across restarts until Reset clears them. */
+const DRAFT_KEY = 'studio.createDraft';
+function keptDraft(): Record<string, string> {
+  try {
+    const kept: unknown = JSON.parse(window.localStorage.getItem(DRAFT_KEY) ?? '{}');
+    return kept && typeof kept === 'object' ? (kept as Record<string, string>) : {};
+  } catch { return {}; }
+}
+
 const keptFormat = (): YueOutputFormat => {
   try {
     const kept = window.localStorage.getItem('studio.createFormat');
@@ -323,9 +332,12 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   const writingText = songWritingStrings[language];
   const tt = t as unknown as (key: string) => string;
 
-  const [name, setName] = useState('');
-  const [style, setStyle] = useState('');
-  const [lyrics, setLyrics] = useState('');
+  const [name, setName] = useState(() => keptDraft().name ?? '');
+  const [style, setStyle] = useState(() => keptDraft().style ?? '');
+  const [lyrics, setLyrics] = useState(() => keptDraft().lyrics ?? '');
+  useEffect(() => {
+    try { window.localStorage.setItem(DRAFT_KEY, JSON.stringify({ name, style, lyrics })); } catch { /* kept until a reload */ }
+  }, [name, style, lyrics]);
   const [abc, setAbc] = useState('');
   const [cot, setCot] = useState<YueCot | ''>('');
   const [showNotation, setShowNotation] = useState(true);
