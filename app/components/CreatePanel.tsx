@@ -103,6 +103,13 @@ const SEMANTIC_CODES_PER_SECOND = 25;
 const MAX_DURATION_SECONDS = 600;
 /** A new prompt's ceiling: 2:10. Examples and prompt files keep their own. */
 const DEFAULT_DURATION_SECONDS = 130;
+/** The file format last chosen by hand, kept between sessions like the duration. */
+const keptFormat = (): YueOutputFormat => {
+  try {
+    const kept = window.localStorage.getItem('studio.createFormat');
+    return kept === 'mp3' || kept === 'wav32' ? kept : 'flac';
+  } catch { return 'flac'; }
+};
 const SAMPLING_KEYS: (keyof YueSampling)[] = ['temperature', 'top_p', 'top_k', 'repetition_penalty', 'penalty_window', 'min_tokens', 'max_tokens'];
 /** A quoted chord symbol in ABC: "Am", "F/C", "G7". */
 const CHORD_SYMBOL = /"[^"\n]+"/;
@@ -360,7 +367,11 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   const [realaudio, setRealaudio] = useState<'auto' | 'on' | 'off'>('auto');
   // The engine default of 128 kbps throws away what the VAE produced.
   const [mp3Bitrate, setMp3Bitrate] = useState('320');
-  const [format, setFormat] = useState<YueOutputFormat>('flac');
+  const [format, setFormat] = useState<YueOutputFormat>(keptFormat);
+  const chooseFormat = (value: YueOutputFormat) => {
+    setFormat(value);
+    try { window.localStorage.setItem('studio.createFormat', value); } catch { /* kept until a reload */ }
+  };
 
   const setupQuery = useSetupStatus<SetupStatus>();
   const setup = setupQuery.isError ? null : setupQuery.data ?? null;
@@ -617,7 +628,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     chooseDuration(String(DEFAULT_DURATION_SECONDS)); setLmBatch(''); setSynthBatch(''); setSteps(''); setSolver(''); setCfgScale('');
     setRandomizeSeed(true); setLmSeed(''); setSeed(''); setSemanticTokens('');
     setAbcSampling(emptySampling()); setSemanticSampling(emptySampling()); setHarmony(emptyHarmony());
-    setMp3Bitrate('320'); setFormat('flac');
+    setMp3Bitrate('320'); chooseFormat('flac');
     setTranspose('0'); setVocalsOnly(false); setLyricTiming(true); setRealaudio('auto');
   };
 
@@ -1924,7 +1935,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
                         </select>
                       </Field>
                       <Field label={t('outputFormat')}>
-                        <select value={format} onChange={event => setFormat(event.target.value as YueOutputFormat)} className={CONTROL}>
+                        <select value={format} onChange={event => chooseFormat(event.target.value as YueOutputFormat)} className={CONTROL}>
                           <option value="flac">FLAC</option>
                           <option value="mp3">MP3</option>
                           <option value="wav32">WAV (32-bit float)</option>
