@@ -1526,7 +1526,7 @@ fn cover_like(state: &AppState, from: &library::Song, to: &str) -> anyhow::Resul
 /// wears the original's cover. Separating the song again replaces its stems
 /// in the library instead of adding more: the new ones are in before the old
 /// ones go, so a stem file held open by a player costs nothing but itself.
-fn stems_into_library(state: &AppState, song_id: &str, stems: &[String], overlap: f64) -> anyhow::Result<(Vec<String>, Option<String>)> {
+fn stems_into_library(state: &AppState, song_id: &str, stems: &[String], overlap: f64, model: &str) -> anyhow::Result<(Vec<String>, Option<String>)> {
     let original = state.library.get_song(song_id)?.ok_or_else(|| anyhow::anyhow!("the song {song_id} is gone"))?;
     let replaced: Vec<library::Song> = state
         .library
@@ -1547,7 +1547,7 @@ fn stems_into_library(state: &AppState, song_id: &str, stems: &[String], overlap
             // the words belong to the voice, not to the drums
             lyrics: if stem == "vocals" { original.lyrics.clone() } else { String::new() },
             metadata: serde_json::json!({
-                "derived": derivation(&original, "stems", serde_json::json!({ "stem": stem, "model": "HT-Demucs", "overlap": overlap })),
+                "derived": derivation(&original, "stems", serde_json::json!({ "stem": stem, "model": model, "overlap": overlap })),
                 "duration_seconds": duration,
             }),
             generation_settings: Value::Null,
@@ -1579,9 +1579,35 @@ fn stem_path(state: &AppState, song_id: &str, stem: &str) -> PathBuf {
     state.library.media_dir().join(format!("{song_id}-{stem}.wav"))
 }
 
+/// The stems a separator leaves.
+fn engine_stems(engine: separation::Engine) -> &'static [&'static str] {
+    match engine {
+        separation::Engine::Htdemucs => &separation::STEMS,
+        separation::Engine::Roformer => &separation::ROFORMER_STEMS,
+    }
+}
+
+/// Whether Mel-Band RoFormer runs on the card: an NVIDIA card, a runtime choice other than the
+/// processor, and a cuBLAS 13 the CUDA build's loader finds - the engine's, or one on PATH.
+fn roformer_on_card(state: &AppState, runtime: lyrics_sync::OnnxFlavour) -> bool {
+    let found = |name: &str| {
+        state.engine_runtime.library_dir().join(name).is_file()
+            || std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|folder| folder.join(name).is_file()))
+    };
+    runtime != lyrics_sync::OnnxFlavour::Cpu
+        && lyrics_sync::OnnxFlavour::Auto.card() == Some(lyrics_sync::OnnxCard::Cuda)
+        && (!cfg!(windows) || engine_runtime::CUDA13_LIBRARIES.iter().all(|name| found(name)))
+}
+
+/// The separator's files to download for its engine: HT-Demucs's model, or RoFormer's model and engine build.
+fn roformer_set(gpu: bool) -> Vec<&'static downloads::Asset> {
+    std::iter::once(&separation::ROFORMER_MODEL).chain(separation::Separator::roformer_engine(gpu)).collect()
+}
+
 fn stems_on_disk(state: &AppState, song_id: &str) -> Vec<String> {
     separation::STEMS
         .iter()
+        .chain(separation::ROFORMER_STEMS.iter().filter(|stem| !separation::STEMS.contains(stem)))
         .filter(|stem| stem_path(state, song_id, stem).is_file())
         .map(|stem| (*stem).to_string())
         .collect()
@@ -1591,6 +1617,26 @@ fn stems_on_disk(state: &AppState, song_id: &str) -> Vec<String> {
 /// running. The same envelope the assistant and karaoke use, because the models
 /// page lists all three the same way.
 async fn separation_assets(State(state): State<AppState>) -> Json<Value> {
+    let config = state.separation_config.read().await.clone();
+    if config.engine == separation::Engine::Roformer {
+        let gpu = roformer_on_card(&state, config.runtime);
+        let set = roformer_set(gpu);
+        let downloader = state.separator.downloader();
+        let assets: Vec<Value> = set
+            .iter()
+            .map(|asset| serde_json::json!({ "id": asset.id, "label": asset.label, "bytes": asset.bytes, "note": asset.note, "installed": downloader.is_installed(asset) }))
+            .collect();
+        let bytes: u64 = set.iter().map(|asset| asset.bytes).sum();
+        let installed_bytes: u64 = set.iter().filter(|asset| downloader.is_installed(asset)).map(|asset| asset.bytes).sum();
+        return Json(serde_json::json!({
+            "assets": assets,
+            "settings": { "runtime": config.runtime, "engine": config.engine },
+            // a platform without a BSRoformer.cpp build has no set to install
+            "set": { "bytes": bytes, "installed_bytes": installed_bytes, "ready": set.len() > 1 && installed_bytes == bytes, "files": set.len() },
+            "active_download": downloader.active_for("separation").await,
+            "waiting_for_server": crate::chunked::waiting_for_server(),
+        }));
+    }
     let runtime_installed = state.lyrics_sync.onnxruntime_library().is_some();
     let mut assets = vec![serde_json::json!({
         "id": separation::MODEL.id,
@@ -1609,7 +1655,6 @@ async fn separation_assets(State(state): State<AppState>) -> Json<Value> {
             "installed": if shared { runtime_installed } else { state.lyrics_sync.downloader().is_installed(asset) },
         })
     }));
-    let config = state.separation_config.read().await.clone();
     let mut set: Vec<&'static lyrics_sync::Asset> = Vec::new();
     if let Some(asset) = lyrics_sync::asset("onnxruntime") { set.push(asset); }
     set.extend(separation_card_assets(config.runtime).iter().filter_map(|id| lyrics_sync::asset(id)));
@@ -1620,7 +1665,7 @@ async fn separation_assets(State(state): State<AppState>) -> Json<Value> {
         + if model_installed { separation::MODEL.bytes } else { 0 };
     Json(serde_json::json!({
         "assets": assets,
-        "settings": { "runtime": config.runtime },
+        "settings": { "runtime": config.runtime, "engine": config.engine },
         "set": {
             "bytes": bytes,
             "installed_bytes": installed_bytes,
@@ -1724,6 +1769,28 @@ async fn install_separation_asset(
     // The separator as one thing: its model, the runtime that loads it, and -
     // for the card - the CUDA provider. Six rows of file names asked the user
     // to work out which of them belong together.
+    if matches!(request.asset_id.as_str(), "auto" | "cuda" | "cpu") && state.separation_config.read().await.engine == separation::Engine::Roformer {
+        let wanted = if request.asset_id == "cpu" { lyrics_sync::OnnxFlavour::Cpu } else { lyrics_sync::OnnxFlavour::Auto };
+        let gpu = roformer_on_card(&state, wanted);
+        let set = roformer_set(gpu);
+        if set.len() < 2 {
+            return Err(api_error(StatusCode::BAD_REQUEST, "Mel-Band RoFormer has no build for this platform; HT-Demucs separates here".into()));
+        }
+        let separator = state.separator.clone();
+        let libraries = state.engine_runtime.library_dir();
+        tokio::spawn(async move {
+            match separator.downloader().install_all("separation", &set).await {
+                Ok(()) if gpu => {
+                    if let Err(error) = separator.link_cuda_libraries(&libraries) {
+                        eprintln!("[ERROR] BSRoformer.cpp has no cuBLAS beside it: {error:#}");
+                    }
+                }
+                Ok(()) => {}
+                Err(error) => eprintln!("[ERROR] Mel-Band RoFormer could not be installed: {error:#}"),
+            }
+        });
+        return Ok(Json(serde_json::json!({ "started": true })));
+    }
     if matches!(request.asset_id.as_str(), "auto" | "cuda" | "cpu") {
         let wanted = if request.asset_id == "cpu" { lyrics_sync::OnnxFlavour::Cpu } else { lyrics_sync::OnnxFlavour::Auto };
         let separator = state.separator.clone();
@@ -1791,12 +1858,10 @@ async fn write_separation_settings(
 ) -> Result<Json<separation::SeparationConfig>, (StatusCode, Json<ApiError>)> {
     // A run that writes nothing is a run nobody wanted; an empty choice means
     // everything, which is also what the studio starts with.
-    let stems: Vec<String> = if config.stems.is_empty() {
-        separation::STEMS.iter().map(|stem| (*stem).to_string()).collect()
-    } else {
-        config.stems.iter().filter(|stem| separation::STEMS.contains(&stem.as_str())).cloned().collect()
-    };
-    let stored = separation::SeparationConfig { runtime: config.runtime, stems, overlap: config.sane_overlap() };
+    let offered = engine_stems(config.engine);
+    let stems: Vec<String> = config.stems.iter().filter(|stem| offered.contains(&stem.as_str())).cloned().collect();
+    let stems = if stems.is_empty() { offered.iter().map(|stem| (*stem).to_string()).collect() } else { stems };
+    let stored = separation::SeparationConfig { runtime: config.runtime, stems, overlap: config.sane_overlap(), engine: config.engine };
     *state.separation_config.write().await = stored.clone();
     persist_studio_settings(&state)
         .await
@@ -1806,28 +1871,44 @@ async fn write_separation_settings(
 
 async fn separation_status(State(state): State<AppState>) -> Json<Value> {
     let runtime = state.lyrics_sync.onnxruntime_library();
+    let (engine, runtime_choice) = { let config = state.separation_config.read().await; (config.engine, config.runtime) };
     let card = lyrics_sync::OnnxFlavour::Auto.card().filter(|card| separates_on(*card));
+    let model = match engine {
+        separation::Engine::Roformer => &separation::ROFORMER_MODEL,
+        separation::Engine::Htdemucs => &separation::MODEL,
+    };
+    let model_installed = match engine {
+        separation::Engine::Roformer => state.separator.roformer_installed(roformer_on_card(&state, runtime_choice)),
+        separation::Engine::Htdemucs => state.separator.is_installed(),
+    };
     Json(serde_json::json!({
         "model": {
-            "id": separation::MODEL.id,
-            "label": separation::MODEL.label,
-            "bytes": separation::MODEL.bytes,
-            "note": separation::MODEL.note,
-            "installed": state.separator.is_installed(),
+            "id": model.id,
+            "label": model.label,
+            "bytes": model.bytes,
+            "note": model.note,
+            "installed": model_installed,
         },
         "runtime_installed": runtime.is_some(),
         // the card separation takes on this machine, none on any card but
         // CUDA's, and whether every library of it is installed
         "card": card,
-        "card_runtime_installed": card.is_some_and(|card| state.lyrics_sync.has_card_libraries(card)),
+        "card_runtime_installed": match engine {
+            separation::Engine::Roformer => roformer_on_card(&state, lyrics_sync::OnnxFlavour::Auto),
+            separation::Engine::Htdemucs => card.is_some_and(|card| state.lyrics_sync.has_card_libraries(card)),
+        },
         "card_missing_bytes": separation_card_assets(lyrics_sync::OnnxFlavour::Auto)
             .iter()
             .filter_map(|id| lyrics_sync::asset(id))
             .filter(|asset| !state.lyrics_sync.downloader().is_installed(asset))
             .map(|asset| asset.bytes)
             .sum::<u64>(),
-        "ready": state.separator.ready(runtime.as_deref()),
-        "stems": separation::STEMS,
+        "ready": match engine {
+            separation::Engine::Roformer => state.separator.roformer_installed(roformer_on_card(&state, runtime_choice)),
+            separation::Engine::Htdemucs => state.separator.ready(runtime.as_deref()),
+        },
+        "engine": engine,
+        "stems": engine_stems(engine),
         // Either downloader may be the busy one: the model has its own, the
         // card libraries come through karaoke's. Reporting only the first is
         // what made a running download look like a dead button.
@@ -2373,15 +2454,33 @@ impl training::VocalSeparator for StudioSeparator {
     }
 }
 
+/// Mel-Band RoFormer for the vocals training measures on, when it is the chosen separator.
+struct RoformerVocals {
+    separator: Arc<separation::Separator>,
+    gpu: bool,
+}
+
+impl training::VocalSeparator for RoformerVocals {
+    fn separate(&self, mix: &std::path::Path, out: &std::path::Path) -> anyhow::Result<()> {
+        let audio = audio_pcm::decode_stereo_44k(mix)?;
+        let (vocals, _) = self.separator.separate_roformer(&audio, self.gpu)?;
+        separation::write_wav_stereo(out, &vocals)
+    }
+}
+
 /// The separator when its model and a runtime are on disk. The training page
 /// and the models page ask this on every read, so it only looks at the files:
 /// a runtime bound here would be the processor build whenever that lands
 /// before the card's libraries, and it stays bound until the studio restarts.
 async fn vocal_separator(state: &AppState) -> Option<Arc<dyn training::VocalSeparator>> {
+    let config = state.separation_config.read().await.clone();
+    if config.engine == separation::Engine::Roformer {
+        let gpu = roformer_on_card(state, config.runtime);
+        return state.separator.roformer_installed(gpu).then(|| Arc::new(RoformerVocals { separator: state.separator.clone(), gpu }) as Arc<dyn training::VocalSeparator>);
+    }
     if !state.separator.is_installed() || state.lyrics_sync.onnxruntime_library().is_none() {
         return None;
     }
-    let config = state.separation_config.read().await.clone();
     Some(Arc::new(StudioSeparator {
         model: state.separator.model_path(),
         overlap: config.sane_overlap(),
@@ -3034,7 +3133,7 @@ async fn read_stem_audio(
     Path((id, stem)): Path<(String, String)>,
     request: Request,
 ) -> Result<axum::response::Response, (StatusCode, Json<ApiError>)> {
-    if !separation::STEMS.contains(&stem.as_str()) {
+    if !separation::STEMS.contains(&stem.as_str()) && !separation::ROFORMER_STEMS.contains(&stem.as_str()) {
         return Err(api_error(StatusCode::BAD_REQUEST, format!("unknown stem {stem}")));
     }
     let path = stem_path(&state, &id, &stem);
@@ -3071,7 +3170,12 @@ async fn start_separation(
         .onnx_card(wanted_runtime)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?
         .filter(|card| separates_on(*card));
-    if !state.separator.is_installed() {
+    let engine = state.separation_config.read().await.engine;
+    let roformer_gpu = roformer_on_card(&state, wanted_runtime);
+    if engine == separation::Engine::Roformer && !state.separator.roformer_installed(roformer_gpu) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Mel-Band RoFormer is not installed yet: Settings - Models - Stems".into()));
+    }
+    if engine == separation::Engine::Htdemucs && !state.separator.is_installed() {
         return Err(api_error(StatusCode::BAD_REQUEST, "the separation model is not installed yet".into()));
     }
     let audio_path = state
@@ -3088,9 +3192,21 @@ async fn start_separation(
     let wanted = config.stems.clone();
     let background = state.clone();
     let song_id = id.clone();
+    let separator = state.separator.clone();
     tokio::task::spawn_blocking(move || {
         let outcome = (|| -> anyhow::Result<(Vec<String>, bool)> {
             let audio = audio_pcm::decode_stereo_44k(&audio_path)?;
+            if engine == separation::Engine::Roformer {
+                let (vocals, instrumental) = separator.separate_roformer(&audio, roformer_gpu)?;
+                let mut written = Vec::new();
+                for (name, samples) in [("vocals", vocals), ("instrumental", instrumental)] {
+                    if wanted.iter().any(|stem| stem == name) {
+                        separation::write_wav_stereo(&stem_path(&background, &song_id, name), &samples)?;
+                        written.push(name.to_string());
+                    }
+                }
+                return Ok((written, roformer_gpu));
+            }
             let handle = tokio::runtime::Handle::current();
             let separated = separation::separate(&model, &audio, separation::STEMS.len(), overlap, card, |fraction| {
                 let state = background.clone();
@@ -3113,7 +3229,8 @@ async fn start_separation(
             Ok((written, ran_on_gpu))
         })();
         // still on this thread: the stems are hundreds of megabytes to copy
-        let library = outcome.as_ref().ok().map(|(stems, _)| stems_into_library(&background, &song_id, stems, overlap));
+        let model = if engine == separation::Engine::Roformer { "Mel-Band RoFormer" } else { "HT-Demucs" };
+        let library = outcome.as_ref().ok().map(|(stems, _)| stems_into_library(&background, &song_id, stems, overlap, model));
 
         let handle = tokio::runtime::Handle::current();
         handle.spawn(async move {
@@ -4040,7 +4157,7 @@ async fn delete_library_song(State(state): State<AppState>, Path(id): Path<Strin
 /// stems and its cover. Anything outside the media folder is not ours to remove.
 fn song_files(state: &AppState, song: &library::Song) -> Vec<PathBuf> {
     let media = state.library.media_dir();
-    let mut files: Vec<PathBuf> = separation::STEMS.iter().map(|stem| stem_path(state, &song.id, stem)).collect();
+    let mut files: Vec<PathBuf> = separation::STEMS.iter().chain(["instrumental"].iter()).map(|stem| stem_path(state, &song.id, stem)).collect();
     if let Some(audio) = state.library.media_path_for_song(song) {
         files.push(audio);
     }
@@ -8241,19 +8358,32 @@ async fn import_completed_result(state: &AppState, job: &MusicJob, job_id: &str)
             let card = state.lyrics_sync.onnx_card(config.runtime)?.filter(|card| separates_on(*card));
             let progress_state = state.clone();
             let progress_id = job_id.to_string();
+            let roformer = (config.engine == separation::Engine::Roformer).then(|| (state.separator.clone(), roformer_on_card(state, config.runtime)));
+            if let Some((separator, gpu)) = &roformer {
+                if !separator.roformer_installed(*gpu) {
+                    anyhow::bail!("Mel-Band RoFormer is the chosen separator and is not installed: Settings - Models - Stems");
+                }
+            }
             {
                 let mut jobs = state.jobs.write().await;
                 let active = jobs.get_mut(job_id).context("the vocals-only job no longer exists")?;
                 if matches!(active.status, MusicJobStatus::Cancelled) { anyhow::bail!("Vocals extraction cancelled"); }
                 active.status = MusicJobStatus::Running;
                 active.phase = MusicJobPhase::ExtractingVocals;
-                active.message = "Loading the vocals separator.".into();
+                active.message = if roformer.is_some() { "Extracting vocals with Mel-Band RoFormer.".into() } else { "Loading the vocals separator.".into() };
             }
             let (voice_audio, used_gpu) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, bool)> {
                 let temporary = tempfile::tempdir()?;
                 let input = temporary.path().join(format!("mix.{extension}"));
                 std::fs::write(&input, audio)?;
                 let samples = audio_pcm::decode_stereo_44k(&input)?;
+                if let Some((separator, gpu)) = roformer {
+                    let (voice, _) = separator.separate_roformer(&samples, gpu)?;
+                    let stereo = audio_post::Stereo { rate: 44_100, left: voice.iter().step_by(2).copied().collect(), right: voice.iter().skip(1).step_by(2).copied().collect() };
+                    let output = temporary.path().join("vocals.wav");
+                    audio_pcm::write_wav_f32(&output, &stereo)?;
+                    return Ok((std::fs::read(output).context("read the extracted vocals")?, gpu));
+                }
                 let mut loaded = separation::load(&model, card)?;
                 if card.is_some() && !loaded.used_gpu { anyhow::bail!("The requested GPU separator could not load its execution provider; vocals extraction was stopped instead of running on CPU"); }
                 let separated = separation::separate_with_checked(&mut loaded, &samples, separation::STEMS.len(), config.sane_overlap(), |fraction| {

@@ -171,9 +171,10 @@ export const OptionalGroup: React.FC<{
     if (response.ok) {
       const body = await response.json();
       setStatus(body);
-      if (!choiceRead.current && body.provider && engines?.some((choice) => choice.id === body.provider)) {
+      const savedEngine = body.provider ?? body.settings?.engine;
+      if (!choiceRead.current && savedEngine && engines?.some((choice) => choice.id === savedEngine)) {
         choiceRead.current = true;
-        setEngine(body.provider);
+        setEngine(savedEngine);
       }
       if (body.runtime) setDevice(body.runtime);
       if (body.whisper_model) setModel(body.whisper_model);
@@ -198,7 +199,7 @@ export const OptionalGroup: React.FC<{
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(
         settingsUrl.endsWith('/separation/settings')
-          ? { ...(status as unknown as { settings?: object })?.settings, runtime: next.device ?? device }
+          ? { ...(status as unknown as { settings?: object })?.settings, runtime: next.device ?? device, engine: next.engine ?? engine }
           : settingsUrl.endsWith('/assistant/status')
             ? { provider: next.engine ?? engine }
             : { provider: next.engine ?? engine, runtime: next.device ?? device },
@@ -1152,7 +1153,7 @@ export const SetupGate: React.FC<{ onReady?: () => void; mode?: 'first-run' | 's
               settingsUrl="/v1/separation/settings"
               removeUrl="/v1/separation/remove"
               cancelUrl="/v1/separation/runtime/cancel"
-              engines={[{ id: 'htdemucs', label: 'HT-Demucs' }]}
+              engines={[{ id: 'htdemucs', label: 'HT-Demucs' }, { id: 'roformer', label: 'Mel-Band RoFormer' }]}
             />
             <OptionalGroup
               title={t('karaokeSection')}
