@@ -3165,12 +3165,16 @@ async fn start_separation(
         return Err(api_error(StatusCode::CONFLICT, "a track is already being separated".into()));
     }
     let wanted_runtime = state.separation_config.read().await.runtime;
-    let card = state
-        .lyrics_sync
-        .onnx_card(wanted_runtime)
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?
-        .filter(|card| separates_on(*card));
     let engine = state.separation_config.read().await.engine;
+    // the ONNX Runtime and its card are HT-Demucs's; Mel-Band RoFormer runs its own engine
+    let card = match engine {
+        separation::Engine::Htdemucs => state
+            .lyrics_sync
+            .onnx_card(wanted_runtime)
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?
+            .filter(|card| separates_on(*card)),
+        separation::Engine::Roformer => None,
+    };
     let roformer_gpu = roformer_on_card(&state, wanted_runtime);
     if engine == separation::Engine::Roformer && !state.separator.roformer_installed(roformer_gpu) {
         return Err(api_error(StatusCode::BAD_REQUEST, "Mel-Band RoFormer is not installed yet: Settings - Models - Stems".into()));
@@ -8355,7 +8359,7 @@ async fn import_completed_result(state: &AppState, job: &MusicJob, job_id: &str)
         if vocals_only {
             let model = state.separator.model_path();
             let config = state.separation_config.read().await.clone();
-            let card = state.lyrics_sync.onnx_card(config.runtime)?.filter(|card| separates_on(*card));
+            let card = if config.engine == separation::Engine::Roformer { None } else { state.lyrics_sync.onnx_card(config.runtime)?.filter(|card| separates_on(*card)) };
             let progress_state = state.clone();
             let progress_id = job_id.to_string();
             let roformer = (config.engine == separation::Engine::Roformer).then(|| (state.separator.clone(), roformer_on_card(state, config.runtime)));
