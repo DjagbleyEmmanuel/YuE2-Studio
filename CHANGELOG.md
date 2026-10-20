@@ -20,6 +20,7 @@ Windows build.
 
 ### Fixed
 
+- **Karaoke on an instrumental no longer hangs on "downloading"**: the studio checked the song after fetching the recogniser and left that download's line running when it then refused the track; the song is checked first, and a finished download ends its line.
 - **LoRA training on Linux** ([#126](https://github.com/timoncool/YuE2-Studio/issues/126) by boiler): the training page read the engine's CUDA build, which the Linux package never has, and refused a CUDA 13 card; it now reads what the card and driver run, and on Linux the trainer you build (`YUE_TRAIN_BIN`, `YUE_CAPTION_BIN`) links the system's CUDA. Karaoke on Linux takes the CUDA build of transcribe.cpp the same way.
 - **A long step no longer gets the engine restarted** ([YuE2 Studio #129](https://github.com/timoncool/YuE2-Studio/issues/129)): an engine inside a long step does not answer its health check in time, and the studio took that for a crash and restarted it, losing the song; while a job is running and the engine process is alive, it is at work.
 - **Auto stays on the graphics card after a silent engine exit** ([YuE2 Studio #127](https://github.com/timoncool/YuE2-Studio/issues/127), [#128](https://github.com/timoncool/YuE2-Studio/pull/128) by ramishi): an exit with no device error in its log (out of memory, a kill, a slow start) no longer moves Auto to the processor for the rest of the session.
