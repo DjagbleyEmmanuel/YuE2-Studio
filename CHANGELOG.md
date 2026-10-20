@@ -3,6 +3,12 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## Next
+
+### Fixed
+
+- **Describe by ear for a recording from disk** ([#131](https://github.com/timoncool/YuE2-Studio/issues/131)): on the Cover page the button showed only for a track of the library, so a recording chosen from disk had no way to get its style by ear; it now shows for either, and agents describe a file with `recording_describe_style`.
+
 ## 2026-10-21 — 3.7.0
 
 ### Added

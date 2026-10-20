@@ -2252,6 +2252,20 @@ fn tools() -> &'static [Tool] {
                 call: |args| post(format!("/v1/library/songs/{}/describe-style", segment(&text(args, "song_id")?)), json!({})),
             },
             Tool {
+                name: "recording_describe_style",
+                description: "Describe the style of an audio file on this computer by ear, as library_song_describe_style does for a library song: the cover form's recording taken from disk. path: the file; lyrics: the words the style is written for (an empty one is an instrumental). Needs auto-describe installed; holds the card for a minute.",
+                schema: || object(json!({ "path": { "type": "string" }, "lyrics": { "type": "string" } }), &["path"]),
+                call: |args| {
+                    let path = PathBuf::from(text(args, "path")?.trim());
+                    let mut fields = Vec::new();
+                    if let Some(lyrics) = args.get("lyrics").and_then(Value::as_str) {
+                        fields.push(("lyrics".to_string(), lyrics.to_string()));
+                    }
+                    let files = vec![("audio".to_string(), path.clone(), file_name(&path))];
+                    Ok(Call { method: Method::POST, path: "/v1/describe-style".into(), payload: Payload::Form { fields, files } })
+                },
+            },
+            Tool {
                 name: "dataset_take_as_is",
                 description: "Without a writing assistant: keep the found lyrics as they are (no section tags) and the heard style as MOSS-Music described it, and mark those songs ready. items: song ids, all songs when left out.",
                 schema: || object(json!({ "dataset_id": { "type": "string" }, "items": { "type": "array", "items": { "type": "string" } } }), &["dataset_id"]),
@@ -3068,6 +3082,7 @@ mod tests {
             "assistant_sections",
             "assistant_request_answer",
             "library_song_describe_style",
+            "recording_describe_style",
             // the journal itself
             "journal_clear",
             "journal_remove",

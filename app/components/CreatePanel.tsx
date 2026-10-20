@@ -946,11 +946,19 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   // source and the style is written from that.
   const [describing, setDescribing] = useState(false);
   const describeByEar = async () => {
-    if (!coverSongId) return;
+    if (!coverSongId && !coverFile) return;
     setDescribing(true);
     setError(null);
     try {
-      const response = await fetch(`/v1/library/songs/${encodeURIComponent(coverSongId)}/describe-style`, { method: 'POST' });
+      let response: Response;
+      if (coverSongId) {
+        response = await fetch(`/v1/library/songs/${encodeURIComponent(coverSongId)}/describe-style`, { method: 'POST' });
+      } else {
+        const form = new FormData();
+        form.append('audio', coverFile!, coverFile!.name);
+        form.append('lyrics', lyrics);
+        response = await fetch('/v1/describe-style', { method: 'POST', body: form });
+      }
       const body = await response.json().catch(() => null);
       if (!response.ok || typeof body?.style !== 'string') throw new Error(body?.error || `HTTP ${response.status}`);
       setStyle(body.style);
@@ -1550,7 +1558,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
             />
             <p className="mt-2 text-[11px] leading-4 text-zinc-500">{tt('styleHint')}</p>
             <SongTextParts kind="style" value={style} onChange={setStyle} />
-            {mode === 'cover' && coverSongId && (
+            {mode === 'cover' && (coverSongId || coverFile) && (
               <button type="button" onClick={() => void describeByEar()} disabled={describing} className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-zinc-200 px-2 py-1 text-[11px] font-medium text-zinc-600 transition-colors hover:border-pink-400 hover:text-pink-600 disabled:opacity-50 dark:border-white/10 dark:text-zinc-300" title={tt('describeByEarHint')}>
                 {describing ? <Loader2 size={12} className="animate-spin" /> : <Ear size={12} />}{tt('describeByEar')}
               </button>

@@ -1146,6 +1146,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/training/prepare/cancel", post(prepare::cancel))
         .route("/v1/training/datasets/{id}/take-as-is", post(prepare::take_as_is))
         .route("/v1/library/songs/{id}/describe-style", post(prepare::describe_song_style))
+        .route("/v1/describe-style", post(prepare::describe_recording_style))
         .route("/v1/system/gpus", get(system_gpus))
         .route("/v1/network", get(remote::status).put(remote::change))
         .route("/v1/adapters/{id}/comfyui", get(export_adapter_comfyui).post(save_adapter_comfyui))
