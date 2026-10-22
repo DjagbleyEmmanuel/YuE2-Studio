@@ -20,6 +20,10 @@ Windows build.
 - **SheetSage2 counts as installed only with its MERT** ([#137](https://github.com/timoncool/YuE2-Studio/issues/137)): the transcriber reads MERT of its own precision, a file the models page never showed. With SheetSage2 on disk and its MERT missing, the page said "installed" while the engine ran without a transcriber and Cover said there was none. The page now shows it as not installed, and Download fetches the missing MERT.
 - **Style by ear on macOS and Linux** ([#138](https://github.com/timoncool/YuE2-Studio/issues/138)): the captioner was only published as a Windows build, so the download said "is a Windows build and is not available on this platform yet". The Mac app and the Linux packages now carry their own captioner, built with the MIDI transcriber.
 
+### Changed
+
+- **Engine updated from yue2.cpp upstream**: the latest ggml and the --device choice of the compute device; our fixes stay on top.
+
 ## 2026-10-21 — 3.7.0
 
 ### Added
