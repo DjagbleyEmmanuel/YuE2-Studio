@@ -667,14 +667,19 @@ fn preflight_space(root: &Path, selection: &ResolvedInstall) -> Result<()> {
 }
 
 fn status_snapshot(root: PathBuf, active: Option<DownloadJob>, target: Option<InstallRequest>) -> ManagerStatus {
-    let component_statuses: Vec<_> = components()
-        .into_iter()
+    let catalog = components();
+    // Final files are atomically published only after a full SHA-256
+    // verification in `download_component`. Status is polled often,
+    // therefore it must never hash multi-gigabyte weights again.
+    let on_disk = |component: &Component| published_component(&root.join(component.filename), component);
+    let component_statuses: Vec<_> = catalog
+        .iter()
         .map(|component| ComponentStatus {
             id: component.id,
-            // Final files are atomically published only after a full SHA-256
-            // verification in `download_component`. Status is polled often,
-            // therefore it must never hash multi-gigabyte weights again.
-            installed: published_component(&root.join(component.filename), &component),
+            // a transcriber head reads nothing without the MERT of its precision beside it
+            installed: on_disk(component)
+                && (component.kind != "transcriber"
+                    || catalog.iter().filter(|base| base.kind == "transcriber-base" && precision(base.filename) == precision(component.filename)).all(on_disk)),
             bytes: component.bytes,
         })
         .collect();
@@ -965,6 +970,11 @@ mod tests {
         assert!(files.transcriber.is_none());
         let status = status_snapshot(root.clone(), None, Some(InstallRequest { profile_id: Some("quality-q8".into()), component_ids: vec![] }));
         assert!(status.ready && status.download_pending > 0);
+        let head = components().into_iter().find(|component| component.id == "transcriber-q8").unwrap();
+        fs::File::create(root.join(head.filename)).unwrap().set_len(head.bytes).unwrap();
+        let status = status_snapshot(root.clone(), None, None);
+        assert!(!status.components.iter().any(|component| component.id == "transcriber-q8" && component.installed), "SheetSage2 without its MERT transcribes nothing");
+        assert!(manager.installed_profile_files("quality-q8").unwrap().transcriber.is_none());
         let _ = fs::remove_dir_all(root);
     }
 
