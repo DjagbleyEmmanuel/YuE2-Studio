@@ -23,6 +23,7 @@ Windows build.
 - **A lost song names the right last line**: after a run with LoRA songs the engine log held more lines than the studio read, so a song lost when the engine stopped was told the restarted engine's "[Server] Listening" instead of what the engine was doing when it stopped.
 - **The training warning gives advice that works** ([#144](https://github.com/timoncool/YuE2-Studio/issues/144)): when the card's own memory was full, Fast, Balanced and Thorough were told to lower the rank, a setting those recipes do not have; they are now told to close what uses the card or to choose the As before recipe and lower its rank.
 - **Training writes a step as one line**: each trained step rewrote the run's whole file with every step so far, and the training page read the whole training log twice a poll; steps now go into a file of their own a line at a time, and the log is read once.
+- **The Library shows a song's details beside the list**, as the create page does ([ACE-Step Studio #48](https://github.com/timoncool/ACE-Step-Studio/issues/48)): a click on a row chooses the song without playing it and the details open at the side on a wide window, over the page on a narrow one; the details button opens and closes them. In Russian the Library is called Медиатека.
 
 ### Changed
 
