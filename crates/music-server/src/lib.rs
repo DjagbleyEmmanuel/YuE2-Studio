@@ -4536,6 +4536,12 @@ async fn restart_engine(state: &AppState) -> Result<(), String> {
         return Err("CUDA was chosen, but this card or its driver runs neither CUDA build of the engine: it needs an NVIDIA card from the GTX 900 series on and driver 525 or newer. Update the NVIDIA driver, or choose Vulkan in Settings.".into());
     }
     let chain = options.device_chain(&state.failed_devices.read().await);
+    {
+        let hardware = hardware::hardware();
+        if cfg!(windows) && hardware.nvidia && hardware.cuda.is_none() && chain.first() == Some(&music_engine::yue_server::ComputeBackend::Vulkan) {
+            music_engine::yue_server::note_in_log(&format!("CUDA unavailable ({}) -> Vulkan", hardware::cuda_unavailable_reason(&hardware)));
+        }
+    }
     let mut last_error = String::new();
     for (index, device) in chain.iter().copied().enumerate() {
         let attempt = EngineOptions { backend: device, ..options.clone() };

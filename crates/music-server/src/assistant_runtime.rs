@@ -416,6 +416,14 @@ impl AssistantRuntime {
 ")
     }
 
+    /// What llama-server's log says about where the model went: the device it
+    /// chose, the layers offloaded to it and the weights on each buffer.
+    pub fn device_lines(&self) -> std::io::Result<Vec<String>> {
+        const MARKERS: [&str; 3] = ["using device", "offloaded", "model buffer size"];
+        let text = fs::read_to_string(self.log_path())?;
+        Ok(text.lines().filter(|line| MARKERS.iter().any(|marker| line.contains(marker))).map(|line| line.trim().to_string()).collect())
+    }
+
     /// The extracted llama-server, wherever the zip happened to put it.
     pub fn server_binary(&self) -> Option<PathBuf> {
         self.server_binary_for(None)
@@ -746,6 +754,11 @@ impl AssistantRuntime {
             // looks; without this some templates inline it into the answer.
             .arg("--reasoning-format")
             .arg("deepseek")
+            // verbosity 4 is where llama.cpp names the device and the layers it offloaded
+            .arg("--log-verbosity")
+            .arg("4")
+            .arg("--log-colors")
+            .arg("off")
             .stdin(Stdio::null())
             .stdout(Stdio::null());
         // llama-server explains its own failures - a model it cannot load, a
@@ -788,6 +801,10 @@ impl AssistantRuntime {
         let deadline = Instant::now() + Duration::from_secs(300);
         while Instant::now() < deadline {
             if self.http.get(&health).timeout(Duration::from_secs(2)).send().await.is_ok_and(|response| response.status().is_success()) {
+                match self.device_lines() {
+                    Ok(lines) => lines.iter().for_each(|line| eprintln!("[assistant] {line}")),
+                    Err(error) => eprintln!("[ERROR] the assistant's log {} could not be read: {error}", self.log_path().display()),
+                }
                 return Ok(base_url);
             }
             {

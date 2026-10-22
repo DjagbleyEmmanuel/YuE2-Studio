@@ -35,6 +35,8 @@ pub struct Hardware {
     pub card_cuda: Option<CudaBuild>,
     /// The NVIDIA card's compute capability, `[7, 5]` for Turing.
     pub compute_capability: Option<(u32, u32)>,
+    /// The major version of the NVIDIA driver, 581 for 581.29.
+    pub driver_major: Option<u32>,
     /// The model set id that fits this card, none when no set does.
     pub recommended: Option<&'static str>,
 }
@@ -85,6 +87,16 @@ pub fn cuda_build(compute: (u32, u32), driver_major: u32) -> Option<CudaBuild> {
     }
 }
 
+/// Why neither CUDA build runs on this NVIDIA card, in the words of the
+/// thresholds `cuda_build` applies.
+pub fn cuda_unavailable_reason(hardware: &Hardware) -> String {
+    match (hardware.compute_capability, hardware.driver_major) {
+        (Some(compute), _) if compute < CUDA12_OLDEST => format!("compute capability {}.{} is older than the 5.2 the CUDA 12 build starts at", compute.0, compute.1),
+        (Some(_), Some(driver)) if driver < CUDA12_DRIVER => format!("driver {driver} is older than the {CUDA12_DRIVER} CUDA 12 needs"),
+        _ => "nvidia-smi did not report the card's compute capability and driver".into(),
+    }
+}
+
 /// Tensor cores before Ampere accumulate in FP16, where the V projection can
 /// overflow to infinity and poison every later attention; the engine's clamp
 /// keeps it in range and changes nothing on a card that never overflows.
@@ -115,6 +127,7 @@ fn probe() -> &'static Hardware {
         let cuda = if cfg!(windows) { device.and_then(|(compute, driver)| cuda_build(compute, driver)) } else { None };
         let card_cuda = device.and_then(|(compute, driver)| cuda_build(compute, driver));
         let compute_capability = device.map(|(compute, _)| compute);
+        let driver_major = device.map(|(_, driver)| driver);
         Hardware {
             gpu_name,
             total_vram_gb,
@@ -124,6 +137,7 @@ fn probe() -> &'static Hardware {
             runs_cuda,
             card_cuda,
             compute_capability,
+            driver_major,
             recommended: profile_for_machine(total_vram_gb, total_ram_gb, crate::model_manager::profile_weights_bytes),
         }
     })
