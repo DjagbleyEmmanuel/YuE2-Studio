@@ -17,6 +17,7 @@ mod prepare;
 mod audio_pcm;
 mod legacy_text;
 mod downloads;
+mod install_record;
 mod engine_runtime;
 mod lyrics_db;
 mod mcp;

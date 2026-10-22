@@ -154,9 +154,64 @@ impl Downloader {
         }
     }
 
-    /// A model is installed when its file is there; a runtime when its own
-    /// marker file is present in the directory it unpacks into.
+    /// Installed when its files are there and its record names today's pin
+    /// (`install_record`); a download from before records counts as in
+    /// `take_over`.
     pub fn is_installed(&self, asset: &Asset) -> bool {
+        if !self.present(asset) {
+            return false;
+        }
+        let record = self.record_of(asset);
+        match crate::install_record::matches(&record, asset.url, &self.root) {
+            Some(current) => current,
+            None => self.take_over(asset, &record),
+        }
+    }
+
+    /// Where the record of an asset's download lies: beside its file or archive.
+    pub fn record_of(&self, asset: &Asset) -> PathBuf {
+        crate::install_record::record_path(&self.path_of(asset))
+    }
+
+    /// A download from before records existed. A model counts by its presence;
+    /// a runtime only when the file its pin names has the pinned size - a single
+    /// file its own, an archive its key file - and its record is then written.
+    fn take_over(&self, asset: &Asset, record: &Path) -> bool {
+        if asset.kind == AssetKind::Model {
+            return true;
+        }
+        let key = if asset.pick.is_empty() && asset.unzip_into.is_none() {
+            Some((self.path_of(asset), asset.bytes))
+        } else {
+            crate::install_record::key_file(asset.url).map(|(file, size)| (self.picked_into(asset).join(file), size))
+        };
+        let Some((path, _)) = key.filter(|(path, size)| fs::metadata(path).is_ok_and(|meta| meta.len() == *size)) else {
+            return false;
+        };
+        if let Err(error) = crate::install_record::write(record, asset.url, "", &[path], &self.root) {
+            eprintln!("[ERROR] {}: the record of the download already on disk was not written: {error:#}", asset.label);
+        }
+        true
+    }
+
+    /// What an earlier pin of this asset put down goes before today's is
+    /// fetched: the files its record lists, then the file or archive the pin
+    /// names. Nothing else in the folder is touched.
+    fn drop_stale(&self, asset: &Asset) -> Result<()> {
+        if self.is_installed(asset) {
+            return Ok(());
+        }
+        crate::install_record::remove_recorded(&self.record_of(asset), &self.root)?;
+        let target = self.path_of(asset);
+        match fs::remove_file(&target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("remove {}", target.display())),
+        }
+    }
+
+    /// The files of the asset are on disk, whichever pin put them there.
+    fn present(&self, asset: &Asset) -> bool {
         if !asset.pick.is_empty() {
             let destination = self.picked_into(asset);
             return asset.pick.iter().all(|name| destination.join(picked_file_name(name)).is_file());
@@ -305,6 +360,7 @@ impl Downloader {
         }
 
         freed += drop_file(self.path_of(asset).with_extension("part"))?;
+        drop_file(self.record_of(asset))?;
         Ok(freed)
     }
 
@@ -470,14 +526,19 @@ impl Downloader {
             // minute timeout. NVIDIA's cuBLAS archive is almost all the two
             // libraries anyway - nineteen megabytes of difference bought a
             // download that survives a bad line.
-            return download_and_extract_named(&self.http, asset, &self.picked_into(asset), cell, self.cancel.clone()).await;
+            self.drop_stale(asset)?;
+            let (sha256, files) = download_and_extract_named(&self.http, asset, &self.picked_into(asset), cell, self.cancel.clone()).await?;
+            return crate::install_record::write(&self.record_of(asset), asset.url, &sha256, &files, &self.root);
         }
+        self.drop_stale(asset)?;
         let target = self.path_of(asset);
         fetch(&self.http, asset, &target, cell, self.cancel.clone()).await?;
-        if let Some(flavour) = asset.unzip_into {
-            extract_archive(&target, &self.runtime_dir(flavour))?;
-        }
-        Ok(())
+        let sha256 = crate::install_record::sha256_of(&target)?;
+        let files = match asset.unzip_into {
+            Some(flavour) => extract_archive(&target, &self.runtime_dir(flavour))?,
+            None => vec![target.clone()],
+        };
+        crate::install_record::write(&self.record_of(asset), asset.url, &sha256, &files, &self.root)
     }
 
     /// Starts one download in the background. Only one runs at a time, and an
@@ -500,7 +561,15 @@ impl Downloader {
         }
 
         self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Err(error) = self.drop_stale(asset) {
+            if let Some(active) = self.progress.lock().await.as_mut() {
+                active.done = true;
+                active.error = Some(format!("{error:#}"));
+            }
+            return Err(error);
+        }
         let target = self.path_of(asset);
+        let record = self.record_of(asset);
         let root = self.root.clone();
         let runtime_root = self.runtime_root.clone();
         let http = self.http.clone();
@@ -516,7 +585,9 @@ impl Downloader {
                     Some(flavour) => runtime_root.join(flavour),
                     None => root.clone(),
                 };
-                let outcome = download_and_extract_named(&http, asset, &destination, &progress, cancel).await;
+                let outcome = download_and_extract_named(&http, asset, &destination, &progress, cancel)
+                    .await
+                    .and_then(|(sha256, files)| crate::install_record::write(&record, asset.url, &sha256, &files, &root));
                 let mut guard = progress.lock().await;
                 if let Some(active) = guard.as_mut() {
                     active.done = true;
@@ -524,15 +595,16 @@ impl Downloader {
                 }
                 return;
             }
-            let outcome = fetch(&http, asset, &target, &progress, cancel).await;
+            let outcome = fetch(&http, asset, &target, &progress, cancel).await.and_then(|()| {
+                let sha256 = crate::install_record::sha256_of(&target)?;
+                let files = match asset.unzip_into {
+                    Some(flavour) => extract_archive(&target, &runtime_root.join(flavour))?,
+                    None => vec![target.clone()],
+                };
+                crate::install_record::write(&record, asset.url, &sha256, &files, &root)
+            });
             let mut guard = progress.lock().await;
-            let error = match outcome {
-                Ok(()) => match asset.unzip_into {
-                    Some(flavour) => extract_archive(&target, &runtime_root.join(flavour)).err().map(|error| error.to_string()),
-                    None => None,
-                },
-                Err(error) => Some(error.to_string()),
-            };
+            let error = outcome.err().map(|error| error.to_string());
             if let Some(active) = guard.as_mut() {
                 active.done = true;
                 active.error = error;
@@ -662,11 +734,8 @@ async fn download_and_extract_named(
     destination: &Path,
     progress: &Arc<Mutex<Option<DownloadProgress>>>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
-) -> Result<()> {
+) -> Result<(String, Vec<PathBuf>)> {
     fs::create_dir_all(destination).with_context(|| format!("create {}", destination.display()))?;
-    if asset.pick.iter().all(|name| destination.join(picked_file_name(name)).is_file()) {
-        return Ok(());
-    }
     let archive = destination.join(format!("{}.part-archive", asset.id));
     let url = crate::net::model_url(asset.url);
     let plan = crate::chunked::probe(http, &url).await?;
@@ -687,16 +756,20 @@ async fn download_and_extract_named(
     reporter.abort();
     outcome?;
     let (archive_path, wanted, destination) = (archive.clone(), asset.pick, destination.to_path_buf());
-    let extracted = tokio::task::spawn_blocking(move || extract_named_local(&archive_path, wanted, &destination))
-        .await
-        .map_err(|error| anyhow::anyhow!("extraction task failed: {error}"))?;
+    let extracted = tokio::task::spawn_blocking(move || -> Result<(String, Vec<PathBuf>)> {
+        let sha256 = crate::install_record::sha256_of(&archive_path)?;
+        Ok((sha256, extract_named_local(&archive_path, wanted, &destination)?))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("extraction task failed: {error}"))?;
     fs::remove_file(&archive).ok();
     extracted
 }
 
-fn extract_named_local(archive: &Path, wanted: &[&str], destination: &Path) -> Result<()> {
+fn extract_named_local(archive: &Path, wanted: &[&str], destination: &Path) -> Result<Vec<PathBuf>> {
     let format = archive_format(archive)?;
     let mut found: Vec<&str> = Vec::new();
+    let mut written: Vec<PathBuf> = Vec::new();
     if format == ArchiveFormat::Zip {
         let file = fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
         let mut zip = zip::ZipArchive::new(file).with_context(|| format!("read {}", archive.display()))?;
@@ -713,6 +786,7 @@ fn extract_named_local(archive: &Path, wanted: &[&str], destination: &Path) -> R
             };
             let mode = entry.unix_mode();
             write_entry(&mut entry, &destination.join(&name), mode)?;
+            written.push(destination.join(&name));
             found.push(candidate);
         }
     } else {
@@ -735,6 +809,7 @@ fn extract_named_local(archive: &Path, wanted: &[&str], destination: &Path) -> R
             }
             let mode = entry.header().mode().ok();
             write_entry(&mut entry, &destination.join(&name), mode)?;
+            written.push(destination.join(&name));
             if name != candidate {
                 links.push((candidate, name));
             }
@@ -742,13 +817,14 @@ fn extract_named_local(archive: &Path, wanted: &[&str], destination: &Path) -> R
         }
         for (candidate, name) in links {
             link_beside(&destination.join(candidate), &name)?;
+            written.push(destination.join(candidate));
         }
     }
     let missing: Vec<&str> = wanted.iter().copied().filter(|candidate| !found.contains(candidate)).collect();
     if !missing.is_empty() {
         bail!("{} did not contain {}", archive.display(), missing.join(", "));
     }
-    Ok(())
+    Ok(written)
 }
 
 /// The file a picked archive entry lands as: its base name.
@@ -759,11 +835,12 @@ pub fn picked_file_name(entry: &str) -> &str {
 /// Unpacks a release archive, zip or tar. Entries are flattened into
 /// `destination` because the releases nest their binaries one or two
 /// directories deep.
-pub fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
+pub fn extract_archive(archive: &Path, destination: &Path) -> Result<Vec<PathBuf>> {
     // Packages ship every architecture they support; only this one belongs
     // here, and flattening the rest would overwrite it with an ARM build.
     const FOREIGN: [&str; 4] = ["arm64", "win-x86", if cfg!(windows) { "linux" } else { "win-x64" }, "osx"];
     fs::create_dir_all(destination).with_context(|| format!("create {}", destination.display()))?;
+    let mut written: Vec<PathBuf> = Vec::new();
     match archive_format(archive)? {
         ArchiveFormat::Zip => {
             let file = fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
@@ -782,7 +859,8 @@ pub fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
                     continue;
                 };
                 let mode = entry.unix_mode();
-                write_entry(&mut entry, &destination.join(name), mode)?;
+                write_entry(&mut entry, &destination.join(&name), mode)?;
+                written.push(destination.join(name));
             }
         }
         format => {
@@ -805,6 +883,7 @@ pub fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
                     links.push((name, target.rsplit('/').next().unwrap_or(&target).to_string()));
                 } else if kind.is_file() && (is_shared_library(&name) || executable) {
                     write_entry(&mut entry, &destination.join(&name), mode)?;
+                    written.push(destination.join(&name));
                 }
             }
             // A link may name another link, in whatever order the archive lists them.
@@ -815,13 +894,16 @@ pub fn extract_archive(archive: &Path, destination: &Path) -> Result<()> {
                 }
                 for (name, target) in ready {
                     link_beside(&destination.join(&name), &target)?;
+                    written.push(destination.join(&name));
                 }
                 links = waiting;
             }
         }
     }
     fs::remove_file(archive).ok();
-    Ok(())
+    written.sort();
+    written.dedup();
+    Ok(written)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -972,8 +1054,30 @@ mod tests {
         fs::write(downloader.runtime_dir("cuda").join("ggml.dll"), b"x").unwrap();
         assert!(!downloader.is_installed(&runtime));
 
-        fs::write(downloader.runtime_dir("cuda").join("whisper-cli.exe"), b"x").unwrap();
+        let program = downloader.runtime_dir("cuda").join("whisper-cli.exe");
+        fs::write(&program, b"x").unwrap();
+        assert!(!downloader.is_installed(&runtime), "no record and no key file in the pin: fetched again");
+        crate::install_record::write(&downloader.record_of(&runtime), runtime.url, "", &[program], &root).unwrap();
         assert!(downloader.is_installed(&runtime));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_runtime_of_an_earlier_pin_is_not_installed() {
+        let root = std::env::temp_dir().join(format!("downloads-{}", uuid::Uuid::now_v7()));
+        let downloader = Downloader::new(root.clone());
+        let runtime = Asset { id: "test-runtime", kind: AssetKind::Runtime, url: "https://example.invalid/engine-0.1.3.dll", relative_path: "models/engine/engine.dll", bytes: 5, ..asset() };
+        let file = downloader.path_of(&runtime);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"0.1.1-build").unwrap();
+        assert!(!downloader.is_installed(&runtime), "a file of another size than the pin's is an earlier build");
+        crate::install_record::write(&downloader.record_of(&runtime), "https://example.invalid/engine-0.1.1.dll", "", &[file.clone()], &root).unwrap();
+        assert!(!downloader.is_installed(&runtime), "recorded from the earlier pin");
+        downloader.drop_stale(&runtime).unwrap();
+        assert!(!file.exists() && !downloader.record_of(&runtime).exists());
+        fs::write(&file, b"0.1.3").unwrap();
+        assert!(downloader.is_installed(&runtime), "the pinned size is taken over without a download");
+        assert!(downloader.record_of(&runtime).exists());
         fs::remove_dir_all(&root).ok();
     }
 
@@ -988,9 +1092,14 @@ mod tests {
         let trainer = tool("music-train", "music-train.exe");
         assert_eq!(midi.runtime_dir("hotstep-tools-1"), training.runtime_dir("hotstep-tools-1"));
         fs::create_dir_all(midi.runtime_dir("hotstep-tools-1")).unwrap();
+        fs::create_dir_all(midi.root()).unwrap();
+        fs::create_dir_all(training.root()).unwrap();
         for name in ["music-midi.exe", "music-train.exe", "ggml-cuda.dll"] {
             fs::write(shared.join("hotstep-tools-1").join(name), b"x").unwrap();
         }
+        let unpacked = vec![shared.join("hotstep-tools-1").join("music-midi.exe"), shared.join("hotstep-tools-1").join("music-train.exe")];
+        crate::install_record::write(&midi.record_of(&transcriber), transcriber.url, "", &unpacked, midi.root()).unwrap();
+        crate::install_record::write(&training.record_of(&trainer), trainer.url, "", &unpacked, training.root()).unwrap();
         assert!(midi.is_installed(&transcriber) && training.is_installed(&trainer));
         assert_eq!(midi.path_of(&transcriber), root.join("midi").join("tools.zip"), "the archive downloads into the capability's own folder");
         fs::remove_dir_all(&root).ok();
@@ -1086,7 +1195,8 @@ mod tests {
         let runtime = Asset { id: "test-runtime", kind: AssetKind::Runtime, unzip_into: Some("cuda"), pick: &["libfoo.so.1"], ..asset() };
         fs::create_dir_all(downloader.picked_into(&runtime)).unwrap();
         let archive = linux_archive(&root);
-        extract_named_local(&archive, runtime.pick, &downloader.picked_into(&runtime)).unwrap();
+        let files = extract_named_local(&archive, runtime.pick, &downloader.picked_into(&runtime)).unwrap();
+        crate::install_record::write(&downloader.record_of(&runtime), runtime.url, "", &files, &root).unwrap();
         assert!(downloader.is_installed(&runtime));
         assert_eq!(downloader.remove(&runtime).unwrap(), "library".len() as u64);
         assert!(!downloader.runtime_dir("cuda").join("libfoo.so.1.2.3").exists());

@@ -460,7 +460,70 @@ impl AssistantRuntime {
             .collect()
     }
 
+    /// Installed when its files are there and its record names today's pin
+    /// (`install_record`); a download from before records counts as in
+    /// `take_over`.
     fn is_installed(&self, asset: &Asset) -> bool {
+        if !self.present(asset) {
+            return false;
+        }
+        let record = self.record_of(asset);
+        match crate::install_record::matches(&record, asset.url, &self.root) {
+            Some(current) => current,
+            None => self.take_over(asset, &record),
+        }
+    }
+
+    fn record_of(&self, asset: &Asset) -> PathBuf {
+        crate::install_record::record_path(&self.path_of(asset))
+    }
+
+    /// A download from before records existed: a model by its presence, a
+    /// runtime only when the key file its pin names has the pinned size.
+    fn take_over(&self, asset: &Asset, record: &Path) -> bool {
+        if asset.kind == AssetKind::Model {
+            return true;
+        }
+        let key = match asset.unzip_into {
+            Some(flavour) => crate::install_record::key_file(asset.url).map(|(file, size)| (self.root.join("runtime").join(flavour).join(file), size)),
+            None => Some((self.path_of(asset), asset.bytes)),
+        };
+        let Some((path, _)) = key.filter(|(path, size)| fs::metadata(path).is_ok_and(|meta| meta.len() == *size)) else {
+            return false;
+        };
+        if let Err(error) = crate::install_record::write(record, asset.url, "", &[path], &self.root) {
+            eprintln!("[ERROR] {}: the record of the download already on disk was not written: {error:#}", asset.label);
+        }
+        true
+    }
+
+    /// What an earlier pin put down - the files of its record, then the file
+    /// or archive the pin names - goes before today's is fetched.
+    fn drop_stale(&self, asset: &Asset) -> Result<()> {
+        if self.is_installed(asset) {
+            return Ok(());
+        }
+        crate::install_record::remove_recorded(&self.record_of(asset), &self.root)?;
+        let target = self.path_of(asset);
+        match fs::remove_file(&target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("remove {}", target.display())),
+        }
+    }
+
+    /// Fetched, extracted and recorded: the record makes it count as today's pin.
+    fn finish(asset: &Asset, target: &Path, root: &Path) -> Result<()> {
+        let sha256 = crate::install_record::sha256_of(target)?;
+        let files = match asset.unzip_into {
+            Some(flavour) => crate::downloads::extract_archive(target, &root.join("runtime").join(flavour))?,
+            None => vec![target.to_path_buf()],
+        };
+        crate::install_record::write(&crate::install_record::record_path(target), asset.url, &sha256, &files, root)
+    }
+
+    /// The files of the asset are on disk, whichever pin put them there.
+    fn present(&self, asset: &Asset) -> bool {
         if let Some(flavour) = asset.unzip_into {
             // A runtime counts as installed once its own directory has content:
             // the CUDA libraries carry no llama-server of their own.
@@ -554,7 +617,7 @@ impl AssistantRuntime {
                 Err(error) => return Err(error).with_context(|| format!("remove {}", directory.display())),
             }
         }
-        for path in [self.path_of(asset), self.path_of(asset).with_extension("part")] {
+        for path in [self.path_of(asset), self.path_of(asset).with_extension("part"), self.record_of(asset)] {
             if let Ok(meta) = fs::metadata(&path) {
                 freed += meta.len();
                 fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
@@ -603,10 +666,10 @@ impl AssistantRuntime {
         let mut failure = None;
         for asset in &pending {
             let target = self.path_of(asset);
-            let outcome = match download_asset(&self.http, asset, &target, &self.state, base, self.cancel.clone()).await {
-                Ok(()) => match asset.unzip_into {
-                    Some(flavour) => crate::downloads::extract_archive(&target, &self.root.join("runtime").join(flavour)),
-                    None => Ok(()),
+            let outcome = match self.drop_stale(asset) {
+                Ok(()) => match download_asset(&self.http, asset, &target, &self.state, base, self.cancel.clone()).await {
+                    Ok(()) => Self::finish(asset, &target, &self.root),
+                    Err(error) => Err(error),
                 },
                 Err(error) => Err(error),
             };
@@ -653,6 +716,13 @@ impl AssistantRuntime {
             });
         }
 
+        if let Err(error) = self.drop_stale(asset) {
+            if let Some(progress) = self.state.lock().await.download.as_mut() {
+                progress.done = true;
+                progress.error = Some(format!("{error:#}"));
+            }
+            return Err(error);
+        }
         let target = self.path_of(asset);
         let http = self.http.clone();
         let state = self.state.clone();
@@ -662,10 +732,7 @@ impl AssistantRuntime {
             let mut guard = state.lock().await;
             match outcome {
                 Ok(()) => {
-                    let extraction = match asset.unzip_into {
-                        Some(flavour) => crate::downloads::extract_archive(&target, &root.join("runtime").join(flavour)),
-                        None => Ok(()),
-                    };
+                    let extraction = Self::finish(asset, &target, &root);
                     if let Some(progress) = guard.download.as_mut() {
                         progress.done = true;
                         progress.error = extraction.err().map(|error| error.to_string());
