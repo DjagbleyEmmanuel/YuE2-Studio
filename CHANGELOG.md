@@ -34,6 +34,7 @@ Windows build.
 
 ### Changed
 
+- **Why a song failed is said in the studio's language**: a song refused before it is sent, lost with an engine that restarted, given up by the engine or not taken into the library is told in English, Russian, Chinese, Japanese or Korean, as the window is set - among them a song longer than the prompt and the score leave room for, and a score the model wrote that cannot be sung; the service keeps the English text for its log, the statistics and agents, with a code and fields beside it.
 - **Engine updated from yue2.cpp upstream**: the latest ggml and the --device choice of the compute device; our fixes stay on top.
 
 ## 2026-10-21 — 3.7.0

@@ -46,6 +46,9 @@ mod engine_result;
 mod progress;
 mod engine_log;
 mod harmony;
+mod song_errors;
+
+use song_errors::SongError;
 
 use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::Context;
@@ -372,12 +375,33 @@ struct MusicJob {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     songs: Vec<CompletedSong>,
     message: String,
+    /// What a failed job's message says, as a code and fields the window translates (`song_errors`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<serde_json::Map<String, Value>>,
     /// The playlist the made songs go into, a project the user works in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     playlist_id: Option<String>,
     /// How the lyrics were laid along a score that came without sections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     laid: Option<Value>,
+}
+
+impl MusicJob {
+    /// Ends the job as failed, for this reason.
+    fn fail(&mut self, error: SongError) {
+        self.status = MusicJobStatus::Failed;
+        self.phase = MusicJobPhase::Failed;
+        self.say(error);
+    }
+
+    /// The message and, for a reason the window translates, its code and fields.
+    fn say(&mut self, error: SongError) {
+        self.code = error.code();
+        self.params = self.code.map(|_| error.params());
+        self.message = error.to_string();
+    }
 }
 
 fn job_status_name(status: &MusicJobStatus) -> &'static str {
@@ -433,6 +457,8 @@ fn job_from_stored(stored: library::StoredJob, status: MusicJobStatus, message: 
         song: None,
         songs: vec![],
         message,
+        code: None,
+        params: None,
         playlist_id: stored.playlist_id,
         laid: None,
     }
@@ -4633,22 +4659,16 @@ fn previous_run(tail: &[String]) -> String {
 
 /// Why a song was lost with an engine that restarted during it, from the log
 /// of the run that ended.
-fn lost_job_reason(log: &str) -> String {
+fn lost_job_reason(log: &str) -> SongError {
     let lowered = log.to_lowercase();
     if describes_exhausted_memory(&lowered) {
-        "The graphics card ran out of memory on this song and the engine restarted, so the song was lost. Choose a smaller model set in the model manager or a shorter song, and close whatever else uses the card; a card below the smallest set cannot make songs.".into()
+        SongError::LostVram
     } else if describes_exhausted_ram(&lowered) {
-        "The computer ran out of memory (RAM) on this song and the engine restarted, so the song was lost. Close other programs that take memory, or choose a smaller model set in the model manager or a shorter song.".into()
+        SongError::LostRam
     } else if describes_device_failure(&lowered) {
-        match device_error_line(log) {
-            Some(error) => format!("The graphics card failed during this song ({error}) and the engine restarted, so the song was lost. The engine log is in Settings, Engine."),
-            None => "The graphics card failed during this song (a CUDA or driver error) and the engine restarted, so the song was lost. The engine log is in Settings, Engine.".into(),
-        }
+        SongError::LostDevice(device_error_line(log))
     } else {
-        match last_engine_line(log) {
-            Some(line) => format!("The engine stopped during this song and restarted, so the song was lost; its last line was {line}. The engine log is in Settings, Engine."),
-            None => "The engine stopped during this song and restarted, so the song was lost. The engine log is in Settings, Engine.".into(),
-        }
+        last_engine_line(log).map_or(SongError::Lost, SongError::LostAtLine)
     }
 }
 
@@ -7785,16 +7805,16 @@ async fn free_the_card_for_the_engine(state: &AppState) {
 /// A card that ran out of memory says so in the log and then the process is
 /// gone; the studio saw only a refused connection, and told the user to
 /// download models that were already on disk.
-fn engine_failure_reason(state: &AppState, job_id: &str) -> Option<String> {
+fn engine_failure_reason(state: &AppState, job_id: &str) -> Option<SongError> {
     let tail = music_engine::yue_server::startup_log_tail(80).join("\n").to_lowercase();
     if describes_exhausted_memory(&tail) {
-        return Some("The graphics card ran out of memory while the engine was loading the models. Choose a smaller quantisation in the model manager, or close whatever else is using the card - the writing assistant holds several gigabytes of its own.".to_string());
+        return Some(SongError::LoadVram);
     }
     if describes_exhausted_ram(&tail) {
-        return Some("The computer ran out of memory (RAM) while the engine was loading the models. Close other programs that take memory, or choose a smaller quantisation in the model manager.".to_string());
+        return Some(SongError::LoadRam);
     }
     let lines = state.engine_log.lines()?;
-    first_fatal(&lines, job_id)
+    first_fatal(&lines, job_id).map(SongError::from_fatal)
 }
 
 /// What the engine said when it gave this job up: the first FATAL line after the
@@ -7844,16 +7864,15 @@ async fn submit_music_job(state: AppState, mut request: CreateMusicJobRequest, a
     }
 
     if state.training.active_run().await.is_some() {
-        let error = "a training run has the card; songs can be made once it finishes or is stopped".to_string();
-        return (StatusCode::CONFLICT, Json(failed_request_job(request, engine_id, error)));
+        return (StatusCode::CONFLICT, Json(failed_request_job(request, engine_id, SongError::TrainingOnCard)));
     }
     if request.vocals_only {
         if !state.separator.is_installed() {
-            return (StatusCode::BAD_REQUEST, Json(failed_request_job(request, engine_id, "Install the stem separator in Tools before requesting vocals only.".into())));
+            return (StatusCode::BAD_REQUEST, Json(failed_request_job(request, engine_id, SongError::VocalsNeedSeparator)));
         }
         let runtime = state.separation_config.read().await.runtime;
         if let Err(error) = state.lyrics_sync.onnx_card(runtime) {
-            return (StatusCode::BAD_REQUEST, Json(failed_request_job(request, engine_id, format!("The stem separator runtime is unavailable: {error:#}"))));
+            return (StatusCode::BAD_REQUEST, Json(failed_request_job(request, engine_id, SongError::SeparatorUnavailable(format!("{error:#}")))));
         }
     }
     // an adapter named without strengths starts where the create page starts it
@@ -7862,8 +7881,7 @@ async fn submit_music_job(state: AppState, mut request: CreateMusicJobRequest, a
         adapter.scales = state.adapters.starting_scales(&adapter.id, &slot_ids);
     }
     if let Some(missing) = request.adapters.iter().find(|adapter| !state.adapters.exists(&adapter.id)).map(|adapter| adapter.id.clone()) {
-        let error = format!("adapter {missing} is not installed; add it again on the LoRA page");
-        return (StatusCode::BAD_REQUEST, Json(failed_request_job(request, engine_id, error)));
+        return (StatusCode::BAD_REQUEST, Json(failed_request_job(request, engine_id, SongError::AdapterMissing(missing))));
     }
     let max_batch = state.engine_options.read().await.effective_max_batch();
     let mut body = match yue_request_from(&request, max_batch) {
@@ -7911,6 +7929,8 @@ async fn submit_music_job(state: AppState, mut request: CreateMusicJobRequest, a
                 song: None,
                 songs: vec![],
                 message: "Submitted to yue-server.".into(),
+                code: None,
+                params: None,
                 playlist_id: request.playlist_id.clone(),
                 laid,
             };
@@ -7923,7 +7943,7 @@ async fn submit_music_job(state: AppState, mut request: CreateMusicJobRequest, a
             (StatusCode::ACCEPTED, Json(job))
         }
         Err(error) => {
-            let job = failed_request_job(request, engine_id, format!("the engine refused the job: {error}"));
+            let job = failed_request_job(request, engine_id, SongError::EngineRefused(error.to_string()));
             state.jobs.write().await.insert(job.id.clone(), job.clone());
             (StatusCode::SERVICE_UNAVAILABLE, Json(job))
         }
@@ -7997,6 +8017,8 @@ async fn submit_replay_job(state: AppState, request: ReplayMusicJobRequest, atte
         } else {
             "Submitted a re-render: the semantic stream is present, so the autoregressive stage is skipped.".into()
         },
+        code: None,
+        params: None,
         playlist_id: None,
         laid: None,
     };
@@ -8355,9 +8377,7 @@ async fn follow_job(state: &AppState, job_id: &str, started: &mut Option<Option<
                     unreachable += 1;
                     if forgotten || unreachable >= 60 {
                         if let Some(job) = state.jobs.write().await.get_mut(&job_id) {
-                            job.status = MusicJobStatus::Failed;
-                            job.phase = MusicJobPhase::Failed;
-                            job.message = if forgotten { lost_job_reason(&previous_run_log()) } else { format!("The engine stopped answering about this job: {error}") };
+                            job.fail(if forgotten { lost_job_reason(&previous_run_log()) } else { SongError::EngineUnreachable(error.to_string()) });
                         }
                         return;
                     }
@@ -8385,11 +8405,7 @@ async fn follow_job(state: &AppState, job_id: &str, started: &mut Option<Option<
                         }
                         job.songs = songs;
                     }
-                    Err(error) => {
-                        job.status = MusicJobStatus::Failed;
-                        job.phase = MusicJobPhase::Failed;
-                        job.message = format!("The engine finished the job, but the studio could not import its result: {error}");
-                    }
+                    Err(error) => job.fail(SongError::ImportFailed(error.to_string())),
                 }
                 return;
             }
@@ -8927,7 +8943,7 @@ async fn score_job_status(
             job.lm_seed = lm_seed;
             job.plans = plans_from_result(&result.content_type, &result.body).map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
         }
-        "failed" => job.error = Some(engine_failure_reason(&state, &job_id).unwrap_or_else(|| "The engine could not write this score.".into())),
+        "failed" => job.error = Some(engine_failure_reason(&state, &job_id).map_or_else(|| "The engine could not write this score.".into(), |reason| reason.to_string())),
         _ => {}
     }
     Ok(Json(job))
@@ -9430,12 +9446,15 @@ fn queued_not_configured_job(request: CreateMusicJobRequest, engine_id: String) 
         song: None,
         songs: vec![],
         message: "The selected local music engine is not configured; this job remains queued and no inference has started.".into(),
+        code: None,
+        params: None,
         playlist_id: None,
         laid: None,
     }
 }
 
-fn failed_request_job(request: CreateMusicJobRequest, engine_id: String, error: String) -> MusicJob {
+fn failed_request_job(request: CreateMusicJobRequest, engine_id: String, error: impl Into<SongError>) -> MusicJob {
+    let error = error.into();
     MusicJob {
         derived: None,
         cover_prompt: None,
@@ -9453,7 +9472,9 @@ fn failed_request_job(request: CreateMusicJobRequest, engine_id: String, error: 
         generation_settings: Value::Null,
         song: None,
         songs: vec![],
-        message: error,
+        message: error.to_string(),
+        code: error.code(),
+        params: error.code().map(|_| error.params()),
         playlist_id: None,
         laid: None,
     }
@@ -9465,7 +9486,7 @@ fn uuid_suffix() -> String {
 
 /// yue-server has no queued state: a job is `running` from the moment it is
 /// accepted, whether the worker has reached it or not.
-fn apply_remote_status(job: &mut MusicJob, remote_status: &str, failure: Option<String>) {
+fn apply_remote_status(job: &mut MusicJob, remote_status: &str, failure: Option<SongError>) {
     match remote_status {
         "running" => {
             job.status = MusicJobStatus::Running;
@@ -9477,11 +9498,7 @@ fn apply_remote_status(job: &mut MusicJob, remote_status: &str, failure: Option<
             job.phase = MusicJobPhase::Completed;
             job.message = "The engine finished this job.".into();
         }
-        "failed" => {
-            job.status = MusicJobStatus::Failed;
-            job.phase = MusicJobPhase::Failed;
-            job.message = failure.unwrap_or_else(|| "The engine reported a failed job; its log has the reason.".into());
-        }
+        "failed" => job.fail(failure.unwrap_or(SongError::EngineFailed)),
         "cancelled" => {
             job.status = MusicJobStatus::Cancelled;
             job.dispatch = MusicJobDispatch::Cancelled;
@@ -9506,11 +9523,11 @@ mod tests {
 
     #[test]
     fn a_lost_song_is_told_why_from_the_run_that_ended() {
-        assert!(lost_job_reason("ggml_backend_cuda_buffer_type_alloc_buffer: allocating 2048 MB on device 0: cudaMalloc failed: out of memory").contains("ran out of memory"));
-        assert!(lost_job_reason("[NAR] Step 3/16\nCUDA error: an illegal memory access was encountered\n  current device: 0").contains("(CUDA error: an illegal memory access was encountered)"));
-        assert!(lost_job_reason("ggml_cuda_compute_forward: MUL_MAT failed").contains("CUDA or driver error"));
-        assert!(lost_job_reason("[NAR] Step 2/16, 87844 ms\n[NAR] Step 3/16\n[studio] the engine stopped answering").contains("its last line was [NAR] Step 3/16."));
-        assert!(lost_job_reason("[Server] listening").contains("stopped during this song"));
+        assert!(lost_job_reason("ggml_backend_cuda_buffer_type_alloc_buffer: allocating 2048 MB on device 0: cudaMalloc failed: out of memory").to_string().contains("ran out of memory"));
+        assert!(lost_job_reason("[NAR] Step 3/16\nCUDA error: an illegal memory access was encountered\n  current device: 0").to_string().contains("(CUDA error: an illegal memory access was encountered)"));
+        assert!(lost_job_reason("ggml_cuda_compute_forward: MUL_MAT failed").to_string().contains("CUDA or driver error"));
+        assert!(lost_job_reason("[NAR] Step 2/16, 87844 ms\n[NAR] Step 3/16\n[studio] the engine stopped answering").to_string().contains("its last line was [NAR] Step 3/16."));
+        assert!(lost_job_reason("[Server] listening").to_string().contains("stopped during this song"));
     }
 
     #[test]
@@ -9518,7 +9535,7 @@ mod tests {
         let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
         let ended = lines("[NAR] Step 3/16\n[studio] ---- starting yue-server ----\n[Server] Listening on 127.0.0.1:18087");
         assert_eq!(previous_run(&ended), "[NAR] Step 3/16");
-        assert!(lost_job_reason(&previous_run(&ended)).contains("its last line was [NAR] Step 3/16."));
+        assert!(lost_job_reason(&previous_run(&ended)).to_string().contains("its last line was [NAR] Step 3/16."));
         let both = lines("[studio] ---- starting yue-server ----\n[Server] Job a: {\n[studio] ---- starting yue-server ----\n[Server] Listening on 127.0.0.1:18087");
         assert_eq!(previous_run(&both), "[studio] ---- starting yue-server ----\n[Server] Job a: {");
     }
@@ -9558,11 +9575,11 @@ mod tests {
     #[test]
     fn the_window_mark_comes_back_on_the_job() {
         let request: CreateMusicJobRequest = serde_json::from_value(serde_json::json!({ "style": "synth-pop", "lyrics": "[verse]", "client_ref": "temp_1" })).unwrap();
-        let job = failed_request_job(request, "engine".into(), "x".into());
+        let job = failed_request_job(request, "engine".into(), "x");
         assert_eq!(serde_json::to_value(&job).unwrap()["client_ref"], "temp_1");
 
         let agent: CreateMusicJobRequest = serde_json::from_value(serde_json::json!({ "style": "synth-pop", "lyrics": "[verse]" })).unwrap();
-        let job = failed_request_job(agent, "engine".into(), "x".into());
+        let job = failed_request_job(agent, "engine".into(), "x");
         assert!(serde_json::to_value(&job).unwrap().get("client_ref").is_none());
     }
 
@@ -9721,7 +9738,7 @@ mod tests {
     #[test]
     fn a_failed_host_allocation_names_the_computer_s_memory_not_the_card() {
         let log = "[AR] Frame 1200/1500\nterminate called after throwing an instance of 'std::bad_alloc'\n  what():  std::bad_alloc";
-        let reason = lost_job_reason(log);
+        let reason = lost_job_reason(log).to_string();
         assert!(reason.contains("ran out of memory (RAM)") && !reason.contains("graphics card"), "{reason}");
         assert!(!describes_device_failure(&log.to_lowercase()));
     }
