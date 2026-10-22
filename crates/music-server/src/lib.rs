@@ -89,6 +89,10 @@ struct AppState {
     library: library::Library,
     /// Owned local engine process, when this service started one.
     engine: Arc<tokio::sync::Mutex<Option<music_engine::yue_server::YueServerSupervisor>>>,
+    /// Held to read by a song being sent to the engine, to write by a restart:
+    /// a restart empties the engine's job table, so no song may be sent while
+    /// one is under way.
+    engine_use: Arc<tokio::sync::RwLock<()>>,
     engine_options: Arc<RwLock<EngineOptions>>,
     /// Devices that failed under Auto in this session - the engine did not
     /// start on them, or died with a CUDA or Vulkan error - and the one the
@@ -990,6 +994,7 @@ pub async fn serve() -> anyhow::Result<()> {
         openrouter_catalog: Arc::new(RwLock::new(OpenRouterCatalogState::default())),
         library: library::Library::open_default()?,
         engine: Arc::new(tokio::sync::Mutex::new(None)),
+        engine_use: Arc::new(tokio::sync::RwLock::new(())),
         engine_options: Arc::new(RwLock::new(persisted.as_ref().map(|settings| settings.engine_options.clone()).unwrap_or_default())),
         engine_runtime: Arc::new(engine_runtime::EngineRuntime::new(&engine_bundle_root(), &studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")))),
         failed_devices: Arc::new(RwLock::new(Vec::new())),
@@ -1272,7 +1277,9 @@ pub async fn serve() -> anyhow::Result<()> {
                 // holding it is left alone, and the engine comes back after
                 let preparing = state.prepare.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().is_some_and(|job| !job.finished);
                 let card_taken = preparing || state.training.active_run().await.is_some();
-                if ready && !running && !card_taken {
+                // a restart under way elsewhere is left alone
+                let quiet = state.engine_use.try_write().ok();
+                if ready && !running && !card_taken && quiet.is_some() && !state.music_server.health().await {
                     if was_running {
                         // It was answering and now it is not: the one line that
                         // explains a log which suddenly starts again from
@@ -1308,6 +1315,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         }
                     }
                 }
+                drop(quiet);
                 was_running = running;
                 tokio::time::sleep(std::time::Duration::from_secs(if running { 5 } else { 2 })).await;
             }
@@ -2559,11 +2567,13 @@ async fn read_training(State(state): State<AppState>) -> Json<Value> {
                     Err(reason) => value["resume_refused"] = serde_json::json!(reason),
                 }
             }
-            if active.as_deref() == Some(run.id.as_str()) || run.status == training::RunStatus::Failed {
-                value["log"] = serde_json::json!(training.log_tail(&run.id, 12));
-            }
-            if active.as_deref() == Some(run.id.as_str()) {
-                value["device"] = serde_json::json!(training.run_device(&run.id));
+            let going = active.as_deref() == Some(run.id.as_str());
+            if going || run.status == training::RunStatus::Failed {
+                let (log, device) = training.log_view(&run.id, 12);
+                value["log"] = serde_json::json!(log);
+                if going {
+                    value["device"] = serde_json::json!(device);
+                }
             }
             value
         })
@@ -4440,6 +4450,7 @@ async fn update_engine_options(
 
     let mut restarted = false;
     if changed && state.music_server.health().await {
+        let _restart = state.engine_use.write().await;
         restart_engine(&state).await.map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
         restarted = true;
     }
@@ -4451,6 +4462,7 @@ async fn update_engine_options(
 }
 
 async fn restart_local_engine(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let _restart = state.engine_use.write().await;
     restart_engine(&state).await.map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
     Ok(Json(serde_json::json!({ "engine_id": PRIMARY_MUSIC_ENGINE_ID, "restarted": true })))
 }
@@ -4595,11 +4607,18 @@ fn last_run_log() -> String {
 /// The engine log of the run before the current one: after a restart, the
 /// run that ended is where the reason is.
 fn previous_run_log() -> String {
-    let tail = music_engine::yue_server::startup_log_tail(600);
+    previous_run(&music_engine::yue_server::startup_log_tail(4000))
+}
+
+/// The lines before the current run's start: a run with LoRA songs writes
+/// hundreds of lines, so the tail may have lost where that run began, never
+/// where the current one did.
+fn previous_run(tail: &[String]) -> String {
     let starts: Vec<usize> = tail.iter().enumerate().filter(|(_, line)| line.contains("---- starting")).map(|(index, _)| index).collect();
     match starts.as_slice() {
         [.., before, last] => tail[*before..*last].join("\n"),
-        _ => tail.join("\n"),
+        [last] => tail[..*last].join("\n"),
+        [] => tail.join("\n"),
     }
 }
 
@@ -4755,9 +4774,31 @@ async fn reload_engine_if_models_changed(state: &AppState) {
     if unchanged {
         return;
     }
+    let _restart = state.engine_use.write().await;
+    wait_for_sent_songs(state).await;
     music_engine::yue_server::note_in_log("the selected model set changed; restarting the engine on it");
     if let Err(error) = restart_engine(state).await {
         eprintln!("the engine did not restart on the new model set: {error}");
+    }
+}
+
+/// Waits until the studio has taken every song it sent the engine: a restart
+/// empties the engine's job table, its queue and the results not yet fetched.
+/// An engine that is gone has nothing left to finish; one inside a long step
+/// answers late but is still at work.
+async fn wait_for_sent_songs(state: &AppState) {
+    loop {
+        let in_flight = state
+            .jobs
+            .read()
+            .await
+            .values()
+            .any(|job| matches!(job.dispatch, MusicJobDispatch::Local) && matches!(job.status, MusicJobStatus::Queued | MusicJobStatus::Running));
+        let alive = state.music_server.health().await || state.engine.lock().await.as_mut().is_some_and(|engine| engine.process_alive());
+        if !in_flight || !alive {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -7614,7 +7655,11 @@ async fn setup_select(
         *state.selected_component_ids.write().await = Some(ids);
     }
     let _ = persist_studio_settings(&state).await;
-    reload_engine_if_models_changed(&state).await;
+    // the songs already sent are finished on the set they were sent to first
+    {
+        let state = state.clone();
+        tokio::spawn(async move { reload_engine_if_models_changed(&state).await });
+    }
     let target = effective_install_target(&state).await;
     let manager_status = state.model_manager.status(target).await;
     Ok(Json(serde_json::to_value(compose_setup_status(&state, manager_status).await).unwrap_or(Value::Null)))
@@ -7825,6 +7870,7 @@ async fn submit_music_job(state: AppState, mut request: CreateMusicJobRequest, a
         None => None,
     };
     let stored_request = serde_json::to_value(&request).unwrap_or(Value::Null);
+    let _using = state.engine_use.read().await;
     match state.music_server.submit(engine_submission(&body)).await {
         Ok(remote) => {
             let job = MusicJob {
@@ -7902,6 +7948,7 @@ async fn submit_replay_job(state: AppState, request: ReplayMusicJobRequest, atte
     }
     let style = body.get("style").and_then(Value::as_str).unwrap_or_default().to_owned();
     let lyrics = body.get("lyrics").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let _using = state.engine_use.read().await;
     let remote = state
         .music_server
         .submit(engine_submission(&body))
@@ -8284,7 +8331,7 @@ async fn follow_job(state: &AppState, job_id: &str, started: &mut Option<Option<
                     // job the engine answers it does not know was lost with
                     // the process that had it, and the log of that process
                     // says why.
-                    let forgotten = error.to_string().contains("404");
+                    let forgotten = error.to_string().starts_with("yue-server returned 404");
                     unreachable += 1;
                     if forgotten || unreachable >= 60 {
                         if let Some(job) = state.jobs.write().await.get_mut(&job_id) {
@@ -9444,6 +9491,16 @@ mod tests {
         assert!(lost_job_reason("ggml_cuda_compute_forward: MUL_MAT failed").contains("CUDA or driver error"));
         assert!(lost_job_reason("[NAR] Step 2/16, 87844 ms\n[NAR] Step 3/16\n[studio] the engine stopped answering").contains("its last line was [NAR] Step 3/16."));
         assert!(lost_job_reason("[Server] listening").contains("stopped during this song"));
+    }
+
+    #[test]
+    fn the_run_that_ended_is_read_even_when_its_start_left_the_tail() {
+        let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
+        let ended = lines("[NAR] Step 3/16\n[studio] ---- starting yue-server ----\n[Server] Listening on 127.0.0.1:18087");
+        assert_eq!(previous_run(&ended), "[NAR] Step 3/16");
+        assert!(lost_job_reason(&previous_run(&ended)).contains("its last line was [NAR] Step 3/16."));
+        let both = lines("[studio] ---- starting yue-server ----\n[Server] Job a: {\n[studio] ---- starting yue-server ----\n[Server] Listening on 127.0.0.1:18087");
+        assert_eq!(previous_run(&both), "[studio] ---- starting yue-server ----\n[Server] Job a: {");
     }
 
     #[test]
