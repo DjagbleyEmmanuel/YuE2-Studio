@@ -7955,6 +7955,8 @@ fn prepare_replay_synthesis(mut replay: Value, overrides: &ReplayMusicJobRequest
     if tokens.trim().is_empty() {
         return Err("replay_request has no semantic_tokens; it cannot skip the autoregressive stage".into());
     }
+    // the stream follows the score as it is; a replay never writes it again
+    object.remove("abc_continue");
     if let Some(steps) = overrides.steps {
         if steps < 1 { return Err("steps must be at least 1".into()); }
         object.insert("steps".into(), Value::from(steps));
@@ -7984,6 +7986,20 @@ fn prepare_replay_synthesis(mut replay: Value, overrides: &ReplayMusicJobRequest
         let total = frames as f64 / SEMANTIC_FRAMES_PER_SECOND + extra;
         if total > LONGEST_SONG_SECONDS {
             return Err(format!("the song would last {total:.0} seconds; songs go up to {LONGEST_SONG_SECONDS:.0}"));
+        }
+        // A stream that stopped short of its budget was sung to the end of its
+        // score, and carried on under that score it starts the song over: the
+        // score is written on first, for the seconds added.
+        let asked = object.get("duration").and_then(Value::as_f64).unwrap_or(CHECKPOINT_SONG_SECONDS);
+        let ceiling = object.get("semantic_sampling").and_then(|sampling| sampling.get("max_tokens")).and_then(Value::as_u64).unwrap_or((CHECKPOINT_SONG_SECONDS * SEMANTIC_FRAMES_PER_SECOND) as u64);
+        let budget = ((asked * SEMANTIC_FRAMES_PER_SECOND).floor() as u64).min(ceiling);
+        let scored = object.get("abc").and_then(Value::as_str).is_some_and(|abc| !abc.trim().is_empty()) && object.get("cot").and_then(Value::as_str) != Some("off");
+        if scored && (frames as u64) < budget {
+            let abc = object.get("abc").and_then(Value::as_str).unwrap_or_default().trim_end().to_owned();
+            if let Some(label) = score::sections::reprise(&abc) {
+                object.insert("abc".into(), Value::String(format!("{abc}\n% {label}\n")));
+            }
+            object.insert("abc_continue".into(), Value::Bool(true));
         }
         object.insert("continue_semantic_tokens".into(), Value::Bool(true));
         object.insert("duration".into(), Value::from(total));
@@ -8368,6 +8384,13 @@ async fn import_completed_result(state: &AppState, job: &MusicJob, job_id: &str)
             }
         }
         settings.remove("semantic_tokens");
+        // a song carried on keeps the score it was sung from whole, not as an opening
+        if job.generation_settings.get("continue_semantic_tokens").and_then(Value::as_bool) == Some(true) {
+            settings.remove("abc_continue");
+            if let Some(object) = replay.as_object_mut() {
+                object.remove("abc_continue");
+            }
+        }
         if let Some(edit) = job.generation_settings.get("score_edit") {
             if let (Some(abc), Some(words)) = (settings.get("abc").and_then(Value::as_str), edit.get("words").and_then(Value::as_str)) {
                 let marked = score::edits::attach(abc, Some(words), edit.get("keep").and_then(Value::as_bool).unwrap_or(false));
@@ -10072,6 +10095,27 @@ mod tests {
         let long = prepare_replay_synthesis(past, &ReplayMusicJobRequest { extend_seconds: Some(60.0), ..replay_overrides() }).unwrap();
         assert_eq!(long["semantic_sampling"]["max_tokens"], 10250);
         assert!(prepare_replay_synthesis(replay, &ReplayMusicJobRequest { extend_seconds: Some(700.0), ..replay_overrides() }).is_err());
+    }
+
+    #[test]
+    fn a_longer_rerender_writes_the_score_on_when_the_song_had_sung_it_all() {
+        let codes = vec!["7"; 250].join(",");
+        let ended = serde_json::json!({"style":"lofi","lyrics":"[Intro]\n\n[Outro]","abc":"X:1\nK:C\n","semantic_tokens":codes,"duration":120.0});
+        let longer = prepare_replay_synthesis(ended, &ReplayMusicJobRequest { extend_seconds: Some(30.0), ..replay_overrides() }).unwrap();
+        assert_eq!(longer["abc_continue"], true, "a song that stopped on its own has no score left to follow");
+        let sectioned = "X:1\nT:\nM:4/4\nL:1/32\nQ:1/4=90\nV: Vocal clef=treble name=\"Vocal Melody\" snm=\"Vocal\"\nV: Ins clef=treble name=\"Ins Melody\" snm=\"Inst.\"\nK:C\n% verse\nV: Vocal\n\"C\"z32|\nV: Ins\nC32|\n% outro\nV: Vocal\n\"C\"z32|\nV: Ins\nC32|\n";
+        assert_eq!(score::sections::sections(sectioned).map(|found| found.len()), Ok(2));
+        let ended = serde_json::json!({"abc":sectioned,"semantic_tokens":codes,"duration":120.0});
+        let longer = prepare_replay_synthesis(ended, &ReplayMusicJobRequest { extend_seconds: Some(30.0), ..replay_overrides() }).unwrap();
+        assert!(longer["abc"].as_str().unwrap().ends_with("C32|\n% verse\n"), "the score goes on with the section before its close, not with rests");
+        let cut = serde_json::json!({"style":"lofi","lyrics":"[Verse] hi","abc":"X:1\nK:C\n","semantic_tokens":codes,"duration":10.0});
+        let longer = prepare_replay_synthesis(cut, &ReplayMusicJobRequest { extend_seconds: Some(30.0), ..replay_overrides() }).unwrap();
+        assert!(longer.get("abc_continue").is_none(), "a song cut by its length still has its score to follow");
+        let unscored = serde_json::json!({"semantic_tokens":codes,"cot":"off"});
+        let longer = prepare_replay_synthesis(unscored, &ReplayMusicJobRequest { extend_seconds: Some(30.0), ..replay_overrides() }).unwrap();
+        assert!(longer.get("abc_continue").is_none());
+        let opened = serde_json::json!({"abc":"X:1\nK:C\n","semantic_tokens":codes,"abc_continue":true});
+        assert!(prepare_replay_synthesis(opened, &replay_overrides()).unwrap().get("abc_continue").is_none(), "a replay renders the score it was sung from");
     }
 
     #[test]
