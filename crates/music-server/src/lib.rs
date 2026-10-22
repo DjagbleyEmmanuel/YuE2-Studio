@@ -734,7 +734,8 @@ impl EngineOptions {
             if hardware.cuda.is_some() {
                 chain.push(ComputeBackend::Cuda);
             }
-            if hardware.gpu_name.is_some() {
+            // an NVIDIA card that runs CUDA is never tried on Vulkan
+            if hardware.gpu_name.is_some() && (!hardware.nvidia || hardware.cuda.is_none()) {
                 chain.push(ComputeBackend::Vulkan);
             }
             chain.retain(|device| !failed.contains(device));

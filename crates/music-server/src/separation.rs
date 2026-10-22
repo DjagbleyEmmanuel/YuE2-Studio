@@ -252,6 +252,8 @@ impl Separator {
     /// The vocals and the rest of interleaved 44.1 kHz stereo, through Dub Studio's separator.
     pub fn separate_roformer(&self, samples: &[f32], gpu: bool) -> Result<(Vec<f32>, Vec<f32>)> {
         let cli = self.roformer_cli(gpu).context("Mel-Band RoFormer has no build for this platform")?;
+        // both builds carry one ggml-cpu built for AVX2 and FMA, the card's one too
+        dub_tcpp::cpu_floor("Mel-Band RoFormer").map_err(|reason| anyhow::anyhow!(reason))?;
         let work = tempfile::tempdir()?;
         let mix = work.path().join("mix.wav");
         let stereo = audio_post::Stereo {
