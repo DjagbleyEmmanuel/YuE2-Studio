@@ -51,6 +51,17 @@ interface CardFields {
 /** A note written on a song while it is still being made, by its card's id: the finished songs take it. */
 export const pendingNotes = new Map<string, string>();
 
+/** Hands a card's note to the songs its job made, once: the job's answer and the library's refresh may both bring them. */
+function takePendingNote(cardId: string, made: Song[], onError: (message: string) => void): string | undefined {
+  const note = pendingNotes.get(cardId)?.trim();
+  pendingNotes.delete(cardId);
+  if (!note || made.length === 0) return undefined;
+  const ids = new Set(made.map(song => song.id));
+  for (const song of made) setNativeSongNote(song.id, note).catch((error: Error) => onError(error.message));
+  updateLibrarySongs(songs => songs.map(song => (ids.has(song.id) ? { ...song, note } : song)));
+  return note;
+}
+
 function card(id: string, fields: CardFields): Song {
   return {
     id,
@@ -119,8 +130,18 @@ export function useGenerations({ enabled, notify, onFinished }: GenerationOption
   const waiting = useMemo(() => cards.filter(entry => !(entry.jobId && madeBy.has(entry.jobId))), [cards, madeBy]);
   const following = waiting.filter(entry => entry.jobId && entry.isGenerating).length;
 
+  const noteError = useEffectEvent((message: string) => notify(`${t('songNote')}: ${message}`, 'error'));
+  // The service files each take as it imports it, so the library usually
+  // shows a job's first song while the job still reads as running: its card
+  // leaves the list then, and is finished from here once the job's answer is read.
+  const leftEarly = useRef(new Map<string, Song>());
+  const finishedJobs = useRef(new Set<string>());
   useEffect(() => {
-    if (waiting.length !== cards.length) setCards(prev => prev.filter(entry => !(entry.jobId && madeBy.has(entry.jobId))));
+    if (waiting.length === cards.length) return;
+    for (const entry of cards) {
+      if (entry.jobId && entry.isGenerating && madeBy.has(entry.jobId) && !finishedJobs.current.has(entry.jobId)) leftEarly.current.set(entry.jobId, entry);
+    }
+    setCards(prev => prev.filter(entry => !(entry.jobId && madeBy.has(entry.jobId))));
   }, [waiting, cards, madeBy]);
 
   // the card takes the service's time for its job: a window on another
@@ -168,6 +189,7 @@ export function useGenerations({ enabled, notify, onFinished }: GenerationOption
   }, [ended.data, cards, t]);
 
   const finish = useEffectEvent((finished: Song, job: YueJob) => {
+    finishedJobs.current.add(job.id);
     // newest first, as the library lists them, so the first takes the row
     let made = (job.songs?.length ? job.songs : job.song ? [job.song] : [])
       .map(entry => mapNativeLibrarySong(entry.song))
@@ -178,14 +200,8 @@ export function useGenerations({ enabled, notify, onFinished }: GenerationOption
       notify(job.message || t('generationFailed'), 'error');
       return;
     }
-    const note = pendingNotes.get(finished.id)?.trim();
-    pendingNotes.delete(finished.id);
-    if (note) {
-      made = made.map(song => ({ ...song, note }));
-      for (const song of made) {
-        setNativeSongNote(song.id, note).catch((error: Error) => notify(`${t('songNote')}: ${error.message}`, 'error'));
-      }
-    }
+    const note = takePendingNote(finished.id, made, noteError);
+    if (note) made = made.map(song => ({ ...song, note }));
     updateLibrarySongs(songs => [...made.filter(song => !songs.some(entry => entry.id === song.id)), ...songs]);
     if (job.playlist_id) {
       // the songs are in their playlist at once, so a list showing it keeps their row
@@ -206,8 +222,10 @@ export function useGenerations({ enabled, notify, onFinished }: GenerationOption
     try {
       const job = await readJson<YueJob>(`/v1/music/jobs/${encodeURIComponent(jobId)}`);
       if (job.status === 'completed') {
+        leftEarly.current.delete(jobId);
         finish(running, job);
       } else if (job.status === 'failed' || job.status === 'cancelled') {
+        leftEarly.current.delete(jobId);
         // the card leaves with the running jobs and comes back from the ended ones
         remove(running.id);
         void queryClient.invalidateQueries({ queryKey: endedJobsKey });
@@ -216,6 +234,7 @@ export function useGenerations({ enabled, notify, onFinished }: GenerationOption
       }
       // still queued or running: the list was read before this job was sent
     } catch (error) {
+      leftEarly.current.delete(jobId);
       remove(running.id);
       notify(error instanceof Error ? error.message : String(error), 'error');
     } finally {
@@ -226,7 +245,7 @@ export function useGenerations({ enabled, notify, onFinished }: GenerationOption
   const reconcile = useEffectEvent((listed: YueJob[]) => {
     const running = new Set(listed.map(job => job.id));
     // an agent's jobs, and the ones sent before this window was opened
-    const shown = new Set(cards.flatMap(entry => (entry.jobId ? [entry.id, entry.jobId] : [entry.id])));
+    const shown = new Set([...cards, ...leftEarly.current.values()].flatMap(entry => (entry.jobId ? [entry.id, entry.jobId] : [entry.id])));
     const fresh = listed.filter(job => !shown.has(job.id) && !(job.client_ref && shown.has(job.client_ref)) && !stopped.current.has(job.id));
     if (fresh.length > 0) {
       setCards(prev => [
@@ -247,7 +266,7 @@ export function useGenerations({ enabled, notify, onFinished }: GenerationOption
       });
     }
     // a job that left the list finished, failed or was stopped elsewhere
-    for (const entry of waiting) {
+    for (const entry of [...waiting, ...leftEarly.current.values()]) {
       if (entry.jobId && entry.isGenerating && !running.has(entry.jobId)) void settle(entry);
     }
   });
