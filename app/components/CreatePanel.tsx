@@ -113,6 +113,27 @@ function keptDraft(): Record<string, string> {
   } catch { return {}; }
 }
 
+/** The generation settings (steps, solver, sampling, harmony, the output's bitrate and fades...), kept across restarts
+ *  like the words until Reset puts the defaults back. */
+const SETTINGS_KEY = 'studio.createSettings';
+function keptSettings(): Record<string, unknown> {
+  try {
+    const kept: unknown = JSON.parse(window.localStorage.getItem(SETTINGS_KEY) ?? '{}');
+    return kept && typeof kept === 'object' ? (kept as Record<string, unknown>) : {};
+  } catch { return {}; }
+}
+const keptText = (kept: Record<string, unknown>, key: string, fallback = '') => (typeof kept[key] === 'string' ? (kept[key] as string) : fallback);
+const keptFlag = (kept: Record<string, unknown>, key: string, fallback: boolean) => (typeof kept[key] === 'boolean' ? (kept[key] as boolean) : fallback);
+const keptFields = <T extends Record<string, unknown>>(kept: unknown, empty: T): T => {
+  if (!kept || typeof kept !== 'object') return empty;
+  const out = { ...empty } as Record<string, unknown>;
+  for (const key of Object.keys(empty)) {
+    const value = (kept as Record<string, unknown>)[key];
+    if (typeof value === typeof out[key]) out[key] = value;
+  }
+  return out as T;
+};
+
 const keptFormat = (): YueOutputFormat => {
   try {
     const kept = window.localStorage.getItem('studio.createFormat');
@@ -355,30 +376,38 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     setDuration(value);
     try { window.localStorage.setItem('studio.createDuration', value); } catch { /* kept until a reload */ }
   };
-  const [lmBatch, setLmBatch] = useState('');
-  const [synthBatch, setSynthBatch] = useState('');
-  const [steps, setSteps] = useState('');
-  const [solver, setSolver] = useState<'' | 'midpoint' | 'ab2'>('');
-  const [cfgScale, setCfgScale] = useState('');
-  const [randomizeSeed, setRandomizeSeed] = useState(true);
-  const [lmSeed, setLmSeed] = useState('');
-  const [seed, setSeed] = useState('');
+  const [kept] = useState(keptSettings);
+  const [lmBatch, setLmBatch] = useState(() => keptText(kept, 'lmBatch'));
+  const [synthBatch, setSynthBatch] = useState(() => keptText(kept, 'synthBatch'));
+  const [steps, setSteps] = useState(() => keptText(kept, 'steps'));
+  const [solver, setSolver] = useState<'' | 'midpoint' | 'ab2'>(() => (kept.solver === 'ab2' || kept.solver === 'midpoint' ? kept.solver : ''));
+  const [cfgScale, setCfgScale] = useState(() => keptText(kept, 'cfgScale'));
+  const [randomizeSeed, setRandomizeSeed] = useState(() => keptFlag(kept, 'randomizeSeed', true));
+  const [lmSeed, setLmSeed] = useState(() => keptText(kept, 'lmSeed'));
+  const [seed, setSeed] = useState(() => keptText(kept, 'seed'));
   const [semanticTokens, setSemanticTokens] = useState('');
   const [saveMenuOpen, setSaveMenuOpen] = useState(false);
   const [takeChoiceOpen, setTakeChoiceOpen] = useState(false);
-  const [abcSampling, setAbcSampling] = useState<SamplingText>(emptySampling);
-  const [semanticSampling, setSemanticSampling] = useState<SamplingText>(emptySampling);
-  const [harmony, setHarmony] = useState<HarmonyText>(emptyHarmony);
+  const [abcSampling, setAbcSampling] = useState<SamplingText>(() => keptFields(kept.abcSampling, emptySampling()));
+  const [semanticSampling, setSemanticSampling] = useState<SamplingText>(() => keptFields(kept.semanticSampling, emptySampling()));
+  const [harmony, setHarmony] = useState<HarmonyText>(() => {
+    const value = keptFields(kept.harmony, emptyHarmony());
+    return value.identity === '' || value.identity === 'root' || value.identity === 'spelling' ? value : { ...value, identity: '' };
+  });
   const harmonyField = (key: keyof HarmonyText) => (value: string) => setHarmony(current => ({ ...current, [key]: key === 'follow_lyrics' ? value === 'true' : value }));
   const [transpose, setTranspose] = useState('0');
   const [vocalsOnly, setVocalsOnly] = useState(false);
-  const [fadeIn, setFadeIn] = useState('');
-  const [fadeOut, setFadeOut] = useState('');
-  const [lyricTiming, setLyricTiming] = useState(true);
+  const [fadeIn, setFadeIn] = useState(() => keptText(kept, 'fadeIn'));
+  const [fadeOut, setFadeOut] = useState(() => keptText(kept, 'fadeOut'));
+  const [lyricTiming, setLyricTiming] = useState(() => keptFlag(kept, 'lyricTiming', true));
   // the decoder companion: auto leaves it to the service (on only under a LoRA trained in the studio)
-  const [realaudio, setRealaudio] = useState<'auto' | 'on' | 'off'>('auto');
+  const [realaudio, setRealaudio] = useState<'auto' | 'on' | 'off'>(() => (kept.realaudio === 'on' || kept.realaudio === 'off' ? kept.realaudio : 'auto'));
   // The engine default of 128 kbps throws away what the VAE produced.
-  const [mp3Bitrate, setMp3Bitrate] = useState('320');
+  const [mp3Bitrate, setMp3Bitrate] = useState(() => keptText(kept, 'mp3Bitrate', '320'));
+  useEffect(() => {
+    const settings = { lmBatch, synthBatch, steps, solver, cfgScale, randomizeSeed, lmSeed, seed, abcSampling, semanticSampling, harmony, fadeIn, fadeOut, lyricTiming, realaudio, mp3Bitrate };
+    try { window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* kept until a reload */ }
+  }, [lmBatch, synthBatch, steps, solver, cfgScale, randomizeSeed, lmSeed, seed, abcSampling, semanticSampling, harmony, fadeIn, fadeOut, lyricTiming, realaudio, mp3Bitrate]);
   const [format, setFormat] = useState<YueOutputFormat>(keptFormat);
   const chooseFormat = (value: YueOutputFormat) => {
     setFormat(value);
