@@ -7,6 +7,7 @@ Windows build.
 
 ### Fixed
 
+- **Variations no longer stop the engine** ([#134](https://github.com/timoncool/YuE2-Studio/issues/134)): with Variations at 2 or more the graphics card failed with "CUDA error: an illegal memory access" and the song was lost - the most frequent failure of 3.7.0. The flash attention kernel that skips masked keys read past its mask for the second variation; it now reads the one mask every variation shares, and both variations render.
 - **A note written while the song is being made stays** ([ACE-Step Studio #25](https://github.com/timoncool/ACE-Step-Studio/issues/25)): the note of a song still in the making was cleared when the song was done; it now goes into the finished songs and is saved with them.
 - **Show JSON stays open** from song to song in the song's details, to compare their settings ([ACE-Step Studio #48](https://github.com/timoncool/ACE-Step-Studio/issues/48)).
 - **The create form keeps its settings** ([YuE2 Studio #134](https://github.com/timoncool/YuE2-Studio/issues/134)): the steps, the solver, guidance, sampling and the other generation settings went back to their defaults at every start and every F5; they now stay, as the words, the length and the file format do, until "Reset to reference" puts the defaults back.
