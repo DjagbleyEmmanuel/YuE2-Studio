@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useI18n } from '../context/I18nContext';
 import type { Song, YueJob, YueProgress, YueRequest } from '../types';
 import { followEngineProgress, stageDetail, type StageClock } from './engineProgress';
-import { mapNativeLibrarySong } from './nativeLibrary';
+import { mapNativeLibrarySong, setNativeSongNote } from './nativeLibrary';
 import { playlistsChanged, queryClient, readJson, updateLibraryPlaylists, updateLibrarySongs, useLibrarySongs } from './studioQueries';
 
 /**
@@ -47,6 +47,9 @@ interface CardFields {
   /** The playlist the songs go into. */
   playlistId?: string;
 }
+
+/** A note written on a song while it is still being made, by its card's id: the finished songs take it. */
+export const pendingNotes = new Map<string, string>();
 
 function card(id: string, fields: CardFields): Song {
   return {
@@ -166,7 +169,7 @@ export function useGenerations({ enabled, notify, onFinished }: GenerationOption
 
   const finish = useEffectEvent((finished: Song, job: YueJob) => {
     // newest first, as the library lists them, so the first takes the row
-    const made = (job.songs?.length ? job.songs : job.song ? [job.song] : [])
+    let made = (job.songs?.length ? job.songs : job.song ? [job.song] : [])
       .map(entry => mapNativeLibrarySong(entry.song))
       .sort((a, b) => (a.id < b.id ? 1 : -1));
     if (made.length === 0) {
@@ -174,6 +177,14 @@ export function useGenerations({ enabled, notify, onFinished }: GenerationOption
       generationFailed();
       notify(job.message || t('generationFailed'), 'error');
       return;
+    }
+    const note = pendingNotes.get(finished.id)?.trim();
+    pendingNotes.delete(finished.id);
+    if (note) {
+      made = made.map(song => ({ ...song, note }));
+      for (const song of made) {
+        setNativeSongNote(song.id, note).catch((error: Error) => notify(`${t('songNote')}: ${error.message}`, 'error'));
+      }
     }
     updateLibrarySongs(songs => [...made.filter(song => !songs.some(entry => entry.id === song.id)), ...songs]);
     if (job.playlist_id) {
