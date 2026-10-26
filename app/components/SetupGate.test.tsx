@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OptionalGroup } from './SetupGate';
 
 vi.mock('../context/I18nContext', () => ({ useI18n: () => ({ t: (key: string) => key }) }));
-vi.mock('../services/studioQueries', () => ({ openRouterSettingsChanged: vi.fn() }));
+vi.mock('../services/studioQueries', () => ({ openRouterSettingsChanged: vi.fn(), SELF_READ: { 'x-hub-skip': '1' } }));
 vi.mock('./AssistantSettings', () => ({ AssistantExtras: () => null }));
 vi.mock('./KaraokeSettings', () => ({ KaraokeExtras: () => null }));
 vi.mock('./HubTelemetryPreview', () => ({ HubTelemetryPreview: () => null }));

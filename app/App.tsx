@@ -124,8 +124,8 @@ import { createNativePlaylist, deleteNativeSong, moveStoredLikes, setNativeSongL
 import { foldStems } from './services/songStems';
 import { noteStudioMessage } from './services/journal';
 import { JournalPanel } from './components/JournalPanel';
-import { hubStateChanged, useHubState } from './services/studioQueries';
-import { setTelemetry, showsNow, type HubButton } from './services/studioHub';
+import { hubStateChanged, useActivity, useHubState } from './services/studioQueries';
+import { hubView, setTelemetry, showsNow, type HubButton } from './services/studioHub';
 import { HubBars } from './components/HubBars';
 import { ShellPrompts } from './components/ShellPrompts';
 import { HubPopup } from './components/HubPopup';
@@ -400,8 +400,12 @@ function AppContent() {
   // Anonymous statistics are on by default: the start screen's checkbox decides on a first run, and an install that
   // updated past that screen keeps the default until it is unchecked in Settings.
   const hub = useHubState(language);
-  // Strips from the hub show to everyone; popups stay in its test channel (STUDIO_HUB_TEST=1) until they are released.
-  const hubItems = nativeSetupReady && hub.data ? hub.data.items.filter(item => item.kind === 'bar' || hub.data?.test) : [];
+  // every kind of the hub's notices shows to everyone; the service decides which fit this launch
+  const hubItems = nativeSetupReady && hub.data ? hub.data.items : [];
+  const activity = useActivity();
+  // a popup waits until nothing is being made: no song or re-render, no cover or timings in progress
+  const making = generations.isGenerating || generations.activeJobCount > 0 || (activity.data ?? []).some(entry => entry.state === 'running');
+  const hubSection = hubView(currentView, showSettingsModal);
   const [hubClosed, setHubClosed] = useState<Set<string>>(() => new Set());
   const hubStart = useRef(Date.now());
   const [hubElapsed, setHubElapsed] = useState(0);
@@ -421,7 +425,7 @@ function AppContent() {
     setHubClosed(previous => new Set(previous).add(id));
     hubStateChanged();
   };
-  const hubPopup = hubItems.find(item => item.kind === 'popup' && !hubClosed.has(item.id) && showsNow(item, hubElapsed, currentView));
+  const hubPopup = making ? undefined : hubItems.find(item => item.kind === 'popup' && !hubClosed.has(item.id) && showsNow(item, hubElapsed, hubSection));
   const openHubTarget = (target: NonNullable<HubButton['target']>) => {
     if (target === 'news') {
       setCurrentView('news');
@@ -1397,7 +1401,7 @@ function AppContent() {
         );
 
       case 'news':
-        return <NewsPage />;
+        return <NewsPage onOpen={openHubTarget} />;
 
       case 'create':
       default:
@@ -1515,7 +1519,7 @@ function AppContent() {
   return (
     <SongActionsProvider value={songActions}>
     <div className="flex h-dvh min-h-0 min-w-0 flex-col overflow-hidden bg-white dark:bg-suno text-zinc-900 dark:text-white font-sans antialiased selection:bg-pink-500/30 transition-colors duration-300">
-      <HubBars items={hubItems} elapsed={hubElapsed} view={currentView} closed={hubClosed} onClosed={closeHubNotice} />
+      <HubBars items={hubItems} elapsed={hubElapsed} view={hubSection} closed={hubClosed} onClosed={closeHubNotice} />
       {hubPopup && <HubPopup item={hubPopup} onClose={() => closeHubNotice(hubPopup.id)} onOpen={openHubTarget} />}
       <ShellPrompts />
       <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">

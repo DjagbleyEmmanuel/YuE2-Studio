@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { SELF_READ } from '../services/studioQueries';
 import { Check, Copy, Download, FileAudio, KeyboardMusic, Loader2, Music, Play, RefreshCw, Scissors, Search, SlidersHorizontal, Wand2 } from 'lucide-react';
 import { useI18n } from '../context/I18nContext';
 import { saveFile } from '../services/saveFile';
@@ -115,10 +116,10 @@ export function StudioToolsPanel({ initialSongId }: { initialSongId?: string | n
 
   // The separation state, and which stems the chosen track already has.
   const refresh = useCallback(async () => {
-    const separation: SeparationStatus = await fetch('/v1/separation/status').then(response => response.json());
+    const separation: SeparationStatus = await fetch('/v1/separation/status', { headers: SELF_READ }).then(response => response.json());
     setStatus(separation);
     if (songId) {
-      const body = await fetch(`/v1/library/songs/${encodeURIComponent(songId)}/stems`).then(response => response.json());
+      const body = await fetch(`/v1/library/songs/${encodeURIComponent(songId)}/stems`, { headers: SELF_READ }).then(response => response.json());
       setStems(body.stems ?? []);
     }
   }, [songId]);
