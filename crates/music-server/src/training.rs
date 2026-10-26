@@ -343,14 +343,17 @@ pub const TOOLS_FOLDER_PREFIX: &str = "hotstep-tools";
 
 /// Removes the tools folders of earlier releases from the shared root, and
 /// the folders of before the tools were one build (`legacy_prefix` under the
-/// capability's own `runtime`): nothing runs them any more.
+/// capability's own `runtime`): nothing runs them any more. The folders of
+/// today's release (`current_folder`, and the transcriber's other builds named
+/// `<current_folder>-...`) stay.
 pub fn remove_older_tool_folders(downloader: &Downloader, current_folder: &str, legacy_prefix: &str) {
     let current = downloader.runtime_dir(current_folder);
+    let today = |name: &str| name == current_folder || name.starts_with(&format!("{current_folder}-"));
     let sweep = |directory: &Path, prefix: &str| {
         let Ok(entries) = std::fs::read_dir(directory) else { return };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(prefix) && entry.path() != current && entry.path().is_dir() {
+            if name.starts_with(prefix) && !today(&name) && entry.path().is_dir() {
                 if let Err(error) = std::fs::remove_dir_all(entry.path()) {
                     eprintln!("[ERROR] could not remove the older {} {}: {error}", prefix, entry.path().display());
                 }
@@ -1650,6 +1653,23 @@ mod tests {
         assert_eq!(trainer_device("x\n[Load] YuE2 backend: CUDA0 (shared)\nstep 1"), Some("CUDA0".into()));
         assert_eq!(trainer_device("[Load] DiT backend: CPU (CPU threads: 16)"), Some("CPU".into()));
         assert_eq!(trainer_device("nothing yet"), None);
+    }
+
+    /// The trainer's cleanup keeps the transcriber's CUDA 12.9 and processor
+    /// builds of today's release, and takes every folder of an earlier one.
+    #[test]
+    fn todays_tool_folders_stay_and_earlier_releases_go() {
+        let root = std::env::temp_dir().join(format!("yue-tool-folders-{}", uuid::Uuid::now_v7()));
+        let shared = root.join("hotstep");
+        let downloader = Downloader::with_runtimes(root.join("training"), shared.clone());
+        for name in ["hotstep-tools-new", "hotstep-tools-new-midi-cuda12", "hotstep-tools-new-midi-cpu", "hotstep-tools-old", "hotstep-tools-old-midi-cpu"] {
+            std::fs::create_dir_all(shared.join(name)).unwrap();
+        }
+        remove_older_tool_folders(&downloader, "hotstep-tools-new", "music-train");
+        let mut left: Vec<String> = std::fs::read_dir(&shared).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["hotstep-tools-new", "hotstep-tools-new-midi-cpu", "hotstep-tools-new-midi-cuda12"]);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

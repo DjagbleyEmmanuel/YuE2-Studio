@@ -21,8 +21,14 @@ struct Source {
     commit: String,
     shipped_as: String,
     release_tag: String,
+    /// The tools package on CUDA 13, shared with the trainer.
     asset: String,
     bytes: u64,
+    /// The transcriber alone on CUDA 12.9, and alone without CUDA.
+    cuda12_asset: String,
+    cuda12_bytes: u64,
+    cpu_asset: String,
+    cpu_bytes: u64,
 }
 
 fn source() -> &'static Source {
@@ -35,9 +41,25 @@ const TOOL_FOLDER: &str = "music-midi";
 
 /// The folder a release's archive unpacks into, its tag: a newer release is a
 /// folder of its own, so an older transcriber on disk is never taken for it.
+/// The CUDA 13 build is the tools package the trainer shares; the CUDA 12.9
+/// and processor builds have folders of their own, `<tag>-midi-cuda12` and
+/// `<tag>-midi-cpu`, so their ggml never mixes with the package's.
 fn tool_folder() -> &'static str {
     static FOLDER: OnceLock<&'static str> = OnceLock::new();
-    FOLDER.get_or_init(|| leak(source().release_tag.clone()))
+    FOLDER.get_or_init(|| {
+        let tag = &source().release_tag;
+        leak(match tool_build() {
+            Some(crate::hardware::CudaBuild::Cuda13) => tag.clone(),
+            Some(crate::hardware::CudaBuild::Cuda12) => format!("{tag}-midi-cuda12"),
+            None => format!("{tag}-midi-cpu"),
+        })
+    })
+}
+
+/// The CUDA build this machine's card and driver run, none without one: the
+/// transcriber build it downloads.
+fn tool_build() -> Option<crate::hardware::CudaBuild> {
+    crate::hardware::hardware().card_cuda
 }
 
 /// The transcriber that ships inside the macOS app bundle and the Linux
@@ -82,18 +104,23 @@ fn leak(text: String) -> &'static str {
     Box::leak(text.into_boxed_str())
 }
 
-/// The transcriber's archive.
+/// The transcriber's archive for this machine (`tool_build`).
 pub fn tool_asset() -> &'static Asset {
     static ASSET: OnceLock<Asset> = OnceLock::new();
     ASSET.get_or_init(|| {
         let source = source();
+        let (asset, bytes, build) = match tool_build() {
+            Some(crate::hardware::CudaBuild::Cuda13) => (&source.asset, source.bytes, "CUDA 13"),
+            Some(crate::hardware::CudaBuild::Cuda12) => (&source.cuda12_asset, source.cuda12_bytes, "CUDA 12"),
+            None => (&source.cpu_asset, source.cpu_bytes, "processor"),
+        };
         Asset {
             id: "music-midi",
-            label: leak(format!("Audio to MIDI (HOT-Step {})", &source.commit[..8])),
+            label: leak(format!("Audio to MIDI (HOT-Step {}, {build})", &source.commit[..8])),
             kind: AssetKind::Runtime,
-            url: leak(format!("https://github.com/timoncool/YuE2-Studio/releases/download/{}/{}", source.release_tag, source.asset)),
-            relative_path: leak(source.asset.clone()),
-            bytes: source.bytes,
+            url: leak(format!("https://github.com/timoncool/YuE2-Studio/releases/download/{}/{}", source.release_tag, asset)),
+            relative_path: leak(asset.clone()),
+            bytes,
             unzip_into: Some(tool_folder()),
             marker: leak(source.shipped_as.clone()),
             pick: &[],
@@ -154,7 +181,7 @@ impl Transcriber {
 
     /// The transcribers of earlier releases; nothing runs them any more.
     pub fn remove_older_tools(&self) {
-        crate::training::remove_older_tool_folders(&self.downloader, tool_folder(), TOOL_FOLDER);
+        crate::training::remove_older_tool_folders(&self.downloader, &source().release_tag, TOOL_FOLDER);
     }
 
     pub fn tool_installed(&self) -> bool {
