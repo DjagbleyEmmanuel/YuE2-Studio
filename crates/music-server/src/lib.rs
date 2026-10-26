@@ -4656,9 +4656,12 @@ async fn restart_engine(state: &AppState) -> Result<(), String> {
             }
             Err(error) => {
                 let run = last_run_log();
+                // why a CUDA backend that loaded has no device: an old driver, mostly
+                let cuda = run.lines().find_map(|line| line.split_once("failed to initialize CUDA: ").map(|(_, why)| format!(" CUDA said: {}.", why.trim())));
                 last_error = match absent_device(&run) {
                     Some((name, available)) => format!(
-                        "The engine has no device {name} on this computer; it sees {available}. Choose Auto in Settings, Engine, or one of those devices."
+                        "The engine has no device {name} on this computer; it sees {available}.{} Choose Auto in Settings, Engine, or one of those devices.",
+                        cuda.unwrap_or_default()
                     ),
                     None => format!("the local engine did not start: {error}"),
                 };
@@ -4739,7 +4742,12 @@ fn lost_job_reason(log: &str) -> SongError {
     } else if describes_exhausted_ram(&lowered) {
         SongError::LostRam
     } else if describes_device_failure(&lowered) {
-        SongError::LostDevice(device_error_line(log))
+        // the card, its compute capability, the driver and the build tell a missing architecture from an old driver
+        let card = if lowered.contains("cuda error") { hardware::describe_card(&hardware::hardware()) } else { None };
+        SongError::LostDevice(device_error_line(log).map(|error| match card {
+            Some(card) => format!("{error} on {card}"),
+            None => error,
+        }))
     } else if let Some(exit) = engine_exit(log) {
         SongError::LostExited { exit, line: last_engine_line(log) }
     } else {
@@ -9674,7 +9682,7 @@ mod tests {
     #[test]
     fn a_lost_song_is_told_why_from_the_run_that_ended() {
         assert!(lost_job_reason("ggml_backend_cuda_buffer_type_alloc_buffer: allocating 2048 MB on device 0: cudaMalloc failed: out of memory").to_string().contains("ran out of memory"));
-        assert!(lost_job_reason("[NAR] Step 3/16\nCUDA error: an illegal memory access was encountered\n  current device: 0").to_string().contains("(CUDA error: an illegal memory access was encountered)"));
+        assert!(lost_job_reason("[NAR] Step 3/16\nCUDA error: an illegal memory access was encountered\n  current device: 0").to_string().contains("(CUDA error: an illegal memory access was encountered"));
         assert!(lost_job_reason("ggml_cuda_compute_forward: MUL_MAT failed").to_string().contains("CUDA or driver error"));
         assert!(lost_job_reason("[NAR] Step 2/16, 87844 ms\n[NAR] Step 3/16\n[studio] the engine stopped answering").to_string().contains("its last line was [NAR] Step 3/16."));
         assert!(lost_job_reason("[Server] listening").to_string().contains("stopped during this song"));

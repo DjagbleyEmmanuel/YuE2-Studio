@@ -97,6 +97,20 @@ pub fn cuda_unavailable_reason(hardware: &Hardware) -> String {
     }
 }
 
+/// The NVIDIA card a CUDA failure happened on, in the words a report needs to
+/// tell a missing architecture from an old driver:
+/// `NVIDIA GeForce GTX 1050, compute 6.1, driver 581, cuda12 build`.
+pub fn describe_card(hardware: &Hardware) -> Option<String> {
+    if !hardware.nvidia {
+        return None;
+    }
+    let name = hardware.gpu_name.as_deref()?;
+    let compute = hardware.compute_capability.map_or("unknown".to_string(), |(major, minor)| format!("{major}.{minor}"));
+    let driver = hardware.driver_major.map_or("unknown".to_string(), |major| major.to_string());
+    let build = hardware.cuda.map_or("no CUDA", CudaBuild::folder);
+    Some(format!("{name}, compute {compute}, driver {driver}, {build} build"))
+}
+
 /// Tensor cores before Ampere accumulate in FP16, where the V projection can
 /// overflow to infinity and poison every later attention; the engine's clamp
 /// keeps it in range and changes nothing on a card that never overflows.
