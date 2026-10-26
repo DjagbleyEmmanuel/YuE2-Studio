@@ -37,6 +37,7 @@ Windows build.
 
 ### Changed
 
+- **An Analyzer look for the spectrum**, as in ACE-Step Studio ([ACE-Step Studio #58](https://github.com/timoncool/ACE-Step-Studio/issues/58)): one continuous curve over every point of the FFT, 20 Hz to 22 kHz, with a frequency scale in Hz and a level scale in dB; the Hi-Fi look now reaches 22 kHz instead of stopping at about 16.7 kHz.
 - **Why a song failed is said in the studio's language**: a song refused before it is sent, lost with an engine that restarted, given up by the engine or not taken into the library is told in English, Russian, Chinese, Japanese or Korean, as the window is set - among them a song longer than the prompt and the score leave room for, and a score the model wrote that cannot be sung; the service keeps the English text for its log, the statistics and agents, with a code and fields beside it.
 - **Engine updated from yue2.cpp upstream**: the latest ggml and the --device choice of the compute device; our fixes stay on top.
 

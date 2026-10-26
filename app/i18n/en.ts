@@ -276,6 +276,7 @@ export const en = {
     vizLook_stereo: "Stereo",
     vizLook_lumi: "Luminance",
     vizLook_discrete: "Discrete",
+    vizLook_analyzer: "Analyzer",
     winampTitle: "Winamp mode",
     winampStart: "Switch to Winamp",
     winampSkin: "Skin",
