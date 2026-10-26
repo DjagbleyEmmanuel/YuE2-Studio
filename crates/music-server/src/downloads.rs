@@ -531,10 +531,12 @@ impl Downloader {
             // libraries anyway - nineteen megabytes of difference bought a
             // download that survives a bad line.
             self.drop_stale(asset)?;
+            crate::install_record::begin(&self.record_of(asset))?;
             let (sha256, files) = download_and_extract_named(&self.http, asset, &self.picked_into(asset), cell, self.cancel.clone()).await?;
             return crate::install_record::write(&self.record_of(asset), asset.url, &sha256, &files, &self.root);
         }
         self.drop_stale(asset)?;
+        crate::install_record::begin(&self.record_of(asset))?;
         let target = self.path_of(asset);
         fetch(&self.http, asset, &target, cell, self.cancel.clone()).await?;
         let sha256 = crate::install_record::sha256_of(&target)?;
@@ -565,7 +567,7 @@ impl Downloader {
         }
 
         self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-        if let Err(error) = self.drop_stale(asset) {
+        if let Err(error) = self.drop_stale(asset).and_then(|()| crate::install_record::begin(&self.record_of(asset))) {
             if let Some(active) = self.progress.lock().await.as_mut() {
                 active.done = true;
                 active.error = Some(format!("{error:#}"));
@@ -1082,6 +1084,40 @@ mod tests {
         fs::write(&file, b"0.1.3").unwrap();
         assert!(downloader.is_installed(&runtime), "the pinned size is taken over without a download");
         assert!(downloader.record_of(&runtime).exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An install cut off after the archive's key file was unpacked and before
+    /// its record was written: the status poll in between must not take the
+    /// half-unpacked folder over as a download from before records.
+    #[test]
+    fn an_install_cut_off_before_its_record_is_not_installed() {
+        let root = std::env::temp_dir().join(format!("downloads-{}", uuid::Uuid::now_v7()));
+        let downloader = Downloader::new(root.clone());
+        let url = "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-win-x64-1.31.0.zip";
+        let runtime = Asset { id: "test-runtime", kind: AssetKind::Runtime, url, relative_path: "runtime/onnxruntime.zip", unzip_into: Some("onnx"), marker: "onnxruntime.dll", ..asset() };
+        let (key, size) = crate::install_record::key_file(url).unwrap();
+        let record = downloader.record_of(&runtime);
+        downloader.drop_stale(&runtime).unwrap();
+        crate::install_record::begin(&record).unwrap();
+        fs::create_dir_all(downloader.runtime_dir("onnx")).unwrap();
+        let unpacked = downloader.runtime_dir("onnx").join(key);
+        fs::File::create(&unpacked).unwrap().set_len(size).unwrap();
+        assert!(!downloader.is_installed(&runtime), "half unpacked, counted as installed");
+        assert!(!record.exists(), "half unpacked, recorded as installed");
+
+        // the studio closed here; at the next start the folder is still not taken over
+        let reopened = Downloader::new(root.clone());
+        assert!(!reopened.is_installed(&runtime) && !record.exists());
+
+        // the next install drops the mark with the stale files and ends with the record alone
+        reopened.drop_stale(&runtime).unwrap();
+        crate::install_record::begin(&record).unwrap();
+        fs::File::create(&unpacked).unwrap().set_len(size).unwrap();
+        crate::install_record::write(&record, url, "abc", &[unpacked], &root).unwrap();
+        assert!(reopened.is_installed(&runtime));
+        let marks: Vec<_> = fs::read_dir(record.parent().unwrap()).unwrap().flatten().filter(|entry| entry.path().is_file()).map(|entry| entry.file_name()).collect();
+        assert_eq!(marks, vec![record.file_name().unwrap().to_owned()], "only the record is left beside the archive");
         fs::remove_dir_all(&root).ok();
     }
 

@@ -79,8 +79,12 @@ pub fn read(record: &Path) -> Option<InstallRecord> {
 }
 
 /// Whether the record at `record` says `url` was installed and every file it
-/// put under `root` is there at its size. None when there is no record.
+/// put under `root` is there at its size. None when there is no record; false
+/// while an install is under way or was cut off (`begin`), record or not.
 pub fn matches(record: &Path, url: &str, root: &Path) -> Option<bool> {
+    if installing_mark(record).exists() {
+        return Some(false);
+    }
     let parsed = read(record)?;
     Some(
         parsed.url == url
@@ -89,13 +93,31 @@ pub fn matches(record: &Path, url: &str, root: &Path) -> Option<bool> {
     )
 }
 
+/// The mark beside a record that its download is being installed.
+fn installing_mark(record: &Path) -> PathBuf {
+    record.with_extension("json.installing")
+}
+
+/// Marks the download recorded at `record` as being installed, before any of
+/// its files is put down: until `write` replaces the mark with the record, it
+/// counts as not installed, and a download from before records is not taken
+/// over from the files unpacked so far - also after a crash in between.
+pub fn begin(record: &Path) -> Result<()> {
+    let mark = installing_mark(record);
+    if let Some(directory) = mark.parent() {
+        fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
+    }
+    fs::write(&mark, b"").with_context(|| format!("write {}", mark.display()))
+}
+
 /// The key file of a pinned runtime archive and its size, when the pin names one.
 pub fn key_file(url: &str) -> Option<(&'static str, u64)> {
     KEY_FILES.iter().find(|(pinned, _, _)| *pinned == url).map(|(_, file, size)| (*file, *size))
 }
 
 /// Writes the record of `url` at `record`: the archive's hash and the files it
-/// put down, relative to `root`.
+/// put down, relative to `root`. The record lands whole (a temporary file
+/// renamed over it), and then the mark of the install under way goes.
 pub fn write(record: &Path, url: &str, sha256: &str, files: &[PathBuf], root: &Path) -> Result<()> {
     let files = files
         .iter()
@@ -109,27 +131,28 @@ pub fn write(record: &Path, url: &str, sha256: &str, files: &[PathBuf], root: &P
     let partial = record.with_extension("json.tmp");
     fs::write(&partial, body).with_context(|| format!("write {}", partial.display()))?;
     fs::rename(&partial, record).with_context(|| format!("write {}", record.display()))?;
-    Ok(())
+    remove_if_there(&installing_mark(record))
 }
 
-/// Deletes the files a record lists under `root`, and the record: what an
-/// earlier pin put down goes before the new one is fetched.
+fn remove_if_there(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+/// Deletes the files a record lists under `root`, the record and the mark of
+/// an install cut off: what an earlier pin put down goes before the new one is
+/// fetched.
 pub fn remove_recorded(record: &Path, root: &Path) -> Result<()> {
     if let Some(parsed) = read(record) {
         for file in &parsed.files {
-            let path = root.join(&file.path);
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).with_context(|| format!("remove {}", path.display())),
-            }
+            remove_if_there(&root.join(&file.path))?;
         }
     }
-    match fs::remove_file(record) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("remove {}", record.display())),
-    }
+    remove_if_there(record)?;
+    remove_if_there(&installing_mark(record))
 }
 
 /// The SHA-256 of a file, as lower-case hex.
@@ -175,6 +198,27 @@ mod tests {
         remove_recorded(&record, &root).unwrap();
         assert!(!library.exists() && !record.exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A matching record does not count while the mark of an install under way
+    /// is beside it, and writing the record takes the mark away.
+    #[test]
+    fn an_install_under_way_does_not_match_until_its_record_is_written() {
+        let root = scratch("under-way");
+        let file = root.join("tool.dll");
+        fs::write(&file, b"tool").unwrap();
+        let record = record_path(&root.join("tool.zip"));
+        write(&record, "https://example.invalid/tool.zip", "", &[file.clone()], &root).unwrap();
+        assert_eq!(matches(&record, "https://example.invalid/tool.zip", &root), Some(true));
+        begin(&record).unwrap();
+        assert_eq!(matches(&record, "https://example.invalid/tool.zip", &root), Some(false));
+        write(&record, "https://example.invalid/tool.zip", "abc", &[file], &root).unwrap();
+        assert_eq!(matches(&record, "https://example.invalid/tool.zip", &root), Some(true));
+        assert!(!installing_mark(&record).exists() && !record.with_extension("json.tmp").exists());
+        begin(&record).unwrap();
+        remove_recorded(&record, &root).unwrap();
+        assert!(!installing_mark(&record).exists() && !record.exists() && !root.join("tool.dll").exists());
+        fs::remove_dir_all(&root).ok();
     }
 
     /// Every unpacked runtime the Windows studio pins names the file that tells
