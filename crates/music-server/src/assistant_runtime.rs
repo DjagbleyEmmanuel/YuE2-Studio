@@ -462,14 +462,15 @@ impl AssistantRuntime {
 
     /// Installed when its files are there and, for a runtime, its record names
     /// today's pin (`install_record`); a runtime from before records counts as
-    /// in `take_over`. A model counts by its file: its address can move to
-    /// another revision of the same weights without them being fetched again.
+    /// in `take_over`. A model counts by its file at the pinned size: its address
+    /// can move to another commit of the same weights without them being fetched again.
     fn is_installed(&self, asset: &Asset) -> bool {
         if !self.present(asset) {
             return false;
         }
         if asset.kind == AssetKind::Model {
-            return true;
+            // the pin names a commit, so its size is exact: a file of another size is another build
+            return fs::metadata(self.path_of(asset)).is_ok_and(|meta| meta.len() == asset.bytes);
         }
         let record = self.record_of(asset);
         match crate::install_record::matches(&record, asset.url, &self.root) {
@@ -1017,6 +1018,28 @@ mod tests {
         for entry in ASSETS.iter().filter(|entry| entry.kind == AssetKind::Model) {
             assert!(entry.url.contains("/resolve/") && !entry.url.contains("/resolve/main/"), "{} is not pinned", entry.url);
         }
+    }
+
+    /// A 3.7.0 install keeps llama.cpp b11236 without a record: it is not taken for today's pin and is fetched
+    /// again; the same folder with today's build is taken and its record written.
+    #[cfg(windows)]
+    #[test]
+    fn a_3_7_0_llama_without_a_record_is_fetched_again() {
+        let temp = std::env::temp_dir().join(format!("assistant-runtime-{}", uuid::Uuid::now_v7()));
+        let runtime = AssistantRuntime::new(&temp);
+        let server = asset("llama-cpu").expect("the processor build");
+        let directory = runtime.root.join("runtime").join(server.unzip_into.unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("llama-server.exe"), b"server").unwrap();
+        let impl_dll = fs::File::create(directory.join("llama-server-impl.dll")).unwrap();
+        impl_dll.set_len(8_917_504).unwrap();
+        assert!(!runtime.is_installed(server), "b11236's library is another build");
+        let (_, pinned) = crate::install_record::key_file(server.url).expect("the pin names its key file");
+        impl_dll.set_len(pinned).unwrap();
+        drop(impl_dll);
+        assert!(runtime.is_installed(server), "today's build without a record is taken");
+        assert!(runtime.record_of(server).is_file(), "and its record is written");
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

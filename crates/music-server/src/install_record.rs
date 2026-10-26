@@ -37,6 +37,12 @@ pub struct RecordedFile {
 /// archive that tells its version apart, relative to where the archive
 /// unpacks or picks into, and that file's size in the archive of the pin.
 const KEY_FILES: &[(&str, &str, u64)] = &[
+    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cuda-13.4-x64.zip", "llama-server-impl.dll", 9_684_992),
+    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cuda-12.4-x64.zip", "llama-server-impl.dll", 9_684_992),
+    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-vulkan-x64.zip", "llama-server-impl.dll", 9_684_992),
+    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cpu-x64.zip", "llama-server-impl.dll", 9_684_992),
+    ("https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-win-x64-1.31.0.zip", "onnxruntime.dll", 17_253_176),
+    ("https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-win-x64-gpu_cuda12-1.31.0.zip", "onnxruntime_providers_cuda.dll", 366_181_728),
     ("https://github.com/ggml-org/llama.cpp/releases/download/b11236/cudart-llama-bin-win-cuda-13.4-x64.zip", "cudart64_13.dll", 551_024),
     ("https://github.com/ggml-org/llama.cpp/releases/download/b11236/cudart-llama-bin-win-cuda-12.4-x64.zip", "cudart64_12.dll", 553_984),
     ("https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-13.5.1.27-archive.zip", "cublasLt64_13.dll", 460_301_424),
@@ -169,5 +175,40 @@ mod tests {
         remove_recorded(&record, &root).unwrap();
         assert!(!library.exists() && !record.exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Every unpacked runtime the Windows studio pins names the file that tells
+    /// its version apart: without it a runtime downloaded before records - every
+    /// install of 3.7.0 - would be fetched again even at today's pin.
+    #[cfg(windows)]
+    #[test]
+    fn every_pinned_windows_archive_names_its_key_file() {
+        let archive = |url: &str| url.ends_with(".zip") || url.ends_with(".nupkg");
+        let mut missing: Vec<&str> = Vec::new();
+        let downloads = crate::lyrics_sync::ASSETS
+            .iter()
+            .chain(crate::engine_runtime::ASSETS)
+            .chain([&crate::separation::ROFORMER_ENGINE, &crate::separation::ROFORMER_ENGINE_CPU]);
+        for asset in downloads.filter(|asset| asset.kind == crate::downloads::AssetKind::Runtime && archive(asset.url)) {
+            if key_file(asset.url).is_none() {
+                missing.push(asset.url);
+            }
+        }
+        for asset in crate::assistant_runtime::ASSETS.iter().filter(|asset| asset.kind == crate::assistant_runtime::AssetKind::Runtime && archive(asset.url)) {
+            if key_file(asset.url).is_none() {
+                missing.push(asset.url);
+            }
+        }
+        assert!(missing.is_empty(), "pinned archives without a key file: {missing:#?}");
+    }
+
+    /// The key files of the pins that replace 3.7.0's: llama.cpp b11236 and ONNX Runtime 1.30.0 left on disk
+    /// without a record are not taken for b11900 and 1.31.0.
+    #[test]
+    fn a_3_7_0_runtime_without_a_record_is_not_taken_for_todays_pin() {
+        let (_, llama) = key_file("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cuda-13.4-x64.zip").unwrap();
+        assert_ne!(llama, 8_917_504, "b11236's llama-server-impl.dll");
+        let (_, onnx) = key_file("https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-win-x64-1.31.0.zip").unwrap();
+        assert_ne!(onnx, 16_462_648, "1.30.0's onnxruntime.dll");
     }
 }
