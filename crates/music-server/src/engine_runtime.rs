@@ -30,10 +30,11 @@ use crate::hardware::CudaBuild;
 pub const CUDA13_LIBRARIES: [&str; 2] = ["cublas64_13.dll", "cublasLt64_13.dll"];
 pub const CUDA12_LIBRARIES: [&str; 2] = ["cublas64_12.dll", "cublasLt64_12.dll"];
 
-/// The Visual C++ runtime the engine and ggml are compiled against, by the
-/// names in their import tables.
-pub const VC_RUNTIME_LIBRARIES: [&str; 4] =
-    ["vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "vcomp140.dll"];
+/// The Visual C++ runtime the engine, ggml and the ONNX Runtime the studio
+/// loads are compiled against, by the names in their import tables:
+/// onnxruntime.dll imports msvcp140_1.dll.
+pub const VC_RUNTIME_LIBRARIES: [&str; 5] =
+    ["vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll", "vcomp140.dll"];
 
 
 #[cfg(test)]
