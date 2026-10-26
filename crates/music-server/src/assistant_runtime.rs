@@ -927,7 +927,8 @@ async fn download_asset(
         return Ok(());
     }
 
-    let plan = crate::chunked::probe(http, asset.url).await?;
+    let url = crate::net::model_url(asset.url);
+    let plan = crate::chunked::probe(http, &url).await?;
     if plan.total > 0 {
         crate::sizes::learn(asset.url, plan.total);
     }
@@ -946,7 +947,7 @@ async fn download_asset(
             }
         })
     };
-    let outcome = crate::chunked::fetch(http, asset.url, &part, plan, written.clone(), cancel).await;
+    let outcome = crate::chunked::fetch(http, &url, &part, plan, written.clone(), cancel).await;
     reporter.abort();
     outcome?;
     if let Some(progress) = state.lock().await.download.as_mut() {
