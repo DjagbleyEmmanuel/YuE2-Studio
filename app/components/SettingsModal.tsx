@@ -44,6 +44,9 @@ interface SettingsModalProps {
   onToggleTheme: () => void;
 }
 
+/** Each window language by its own name, whatever language the window is in: a reader looks for the name they read. */
+export const WINDOW_LANGUAGES: [Language, string][] = [['ru', 'Русский'], ['en', 'English'], ['zh', '简体中文'], ['ja', '日本語'], ['ko', '한국어']];
+
 export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, initialSection, onClose, theme, onToggleTheme }) => {
   const { user, setDisplayName } = useAuth();
   const { t, language, setLanguage } = useI18n();
@@ -187,11 +190,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, initialSec
                     </div>
                   </div>
                   <select value={language} onChange={(event) => setLanguage(event.target.value as Language)} className={INPUT}>
-                    <option value="ru">{t('russianLanguage')}</option>
-                    <option value="en">{t('english')}</option>
-                    <option value="zh">{t('chinese')}</option>
-                    <option value="ja">{t('japaneseLanguage')}</option>
-                    <option value="ko">{t('koreanLanguage')}</option>
+                    {WINDOW_LANGUAGES.map(([code, name]) => <option key={code} value={code} lang={code}>{name}</option>)}
                   </select>
                 </div>
 
