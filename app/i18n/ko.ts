@@ -1702,6 +1702,8 @@ export const ko = {
     scoreVoiceDownDone: '목소리를 한 옥타브 내렸습니다. 중심은 이제 {note}입니다. 스타일의 보컬 태그를 맞추세요(낮은 목소리는 보통 남성).',
     scoreVoiceUpDone: '목소리를 한 옥타브 올렸습니다. 중심은 이제 {note}입니다. 스타일의 보컬 태그를 맞추세요.',
     scoreVoiceOutside: '보컬 라인의 중심은 {note}로, 모델이 스스로 목소리를 쓰는 C4–A#5 밖입니다. 노래가 깨질 수 있으니 목소리를 한 옥타브 옮기세요.',
+    uiScale: '인터페이스 배율',
+    uiScaleHint: '스튜디오 전체를 크게 또는 작게 표시하며 다음 실행까지 유지됩니다. Ctrl + 더하기, Ctrl + 빼기 또는 Ctrl을 누른 채 마우스 휠로도 바꿀 수 있고, Ctrl + 0은 100 %로 되돌립니다.',
     sidebarExtras: '왼쪽 패널의 버튼',
     sidebarExtrasHint: '플레이어 바에는 세 가지가 항상 있습니다. 여기서는 왼쪽 패널에도 둘 버튼을 고릅니다.',
     repeatMode_none: '반복 없음: 목록 끝까지 재생',

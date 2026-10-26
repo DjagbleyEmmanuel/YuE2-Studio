@@ -1702,6 +1702,8 @@ export const zh = {
     scoreVoiceDownDone: '人声降低了一个八度，中间音现在是 {note}。请在风格中调整人声标签（低声通常是男声）。',
     scoreVoiceUpDone: '人声升高了一个八度，中间音现在是 {note}。请在风格中调整人声标签。',
     scoreVoiceOutside: '人声旋律的中间音是 {note}，超出模型自写人声的 C4–A#5 范围：演唱可能失真。请将人声移动一个八度。',
+    uiScale: '界面缩放',
+    uiScaleHint: '放大或缩小整个工作室界面，并保留到下次启动。Ctrl + 加号、Ctrl + 减号或按住 Ctrl 滚动鼠标滚轮也可以调整；Ctrl + 0 恢复为 100 %。',
     sidebarExtras: '左侧面板中的按钮',
     sidebarExtrasHint: '播放器栏始终有这三个按钮；这里选择左侧面板也保留哪些。',
     repeatMode_none: '不重复：播放到列表末尾',

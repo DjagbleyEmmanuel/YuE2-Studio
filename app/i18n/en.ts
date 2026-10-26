@@ -1707,6 +1707,8 @@ export const en = {
     scoreVoiceDownDone: 'The voice is an octave lower; its middle is now {note}. Match the vocal tags in the style (a lower voice is usually a man).',
     scoreVoiceUpDone: 'The voice is an octave higher; its middle is now {note}. Match the vocal tags in the style.',
     scoreVoiceOutside: 'The middle of the vocal line is {note}, outside C4–A#5 where the model writes the voice itself: the singing may break. Move the voice by an octave.',
+    uiScale: 'Interface scale',
+    uiScaleHint: 'Draws the whole studio larger or smaller and is kept for the next start. Ctrl + plus and Ctrl + minus, or Ctrl with the mouse wheel, change it too; Ctrl + 0 returns to 100 %.',
     sidebarExtras: 'Buttons in the left panel',
     sidebarExtrasHint: 'The player bar always has all three; here you choose which of them the left panel keeps too.',
     repeatMode_none: 'Repeat off: play on to the end of the list',
