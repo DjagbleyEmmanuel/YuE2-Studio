@@ -5,6 +5,7 @@ import { Song } from '../types';
 import { useI18n } from '../context/I18nContext';
 import { AUDIO_ACCEPT } from '../services/audioFiles';
 import { apiUrl } from '../services/apiBase';
+import { SELF_READ } from '../services/studioQueries';
 import { activeVersionLabel } from '../services/songDownload';
 import { NumberField } from './NumberField';
 
@@ -189,7 +190,7 @@ export const ProcessingModal: React.FC<ProcessingModalProps> = ({ song, onClose,
   useEffect(() => {
     if (!running) return;
     const timer = window.setInterval(() => {
-      void fetch('/v1/processing')
+      void fetch('/v1/processing', { headers: SELF_READ })
         .then(async response => {
           if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
           return response.json() as Promise<{ run: Run | null }>;

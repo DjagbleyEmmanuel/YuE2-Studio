@@ -176,7 +176,7 @@ export const EngineSettings: React.FC = () => {
   // With two cards or more, which one the studio computes on
   const [cards, setCards] = useState<{ cards: { index: number; name: string; memory_gb: number }[]; running: number | null } | null>(null);
   useEffect(() => {
-    void fetch('/v1/system/gpus').then(response => (response.ok ? response.json() : null)).then(setCards).catch(() => undefined);
+    void fetch('/v1/system/gpus', { headers: SELF_READ }).then(response => (response.ok ? response.json() : null)).then(setCards).catch(() => undefined);
   }, []);
   const runningCard = cards?.running ?? null;
   const chosenCard = options.gpu ?? null;

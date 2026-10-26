@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { libraryChanged, useActivity, useAssistantStatus, useSetupStatus, type ActivityEntry } from '../services/studioQueries';
+import { libraryChanged, SELF_READ, useActivity, useAssistantStatus, useSetupStatus, type ActivityEntry } from '../services/studioQueries';
 import { hasSungLines, karaokeReason } from '../services/karaoke';
 import {
   AlertTriangle, AudioLines, ChevronDown, CircleAlert, Dices, Ear, Eye, EyeOff, FileMusic, FolderOpen, Loader2,
@@ -546,7 +546,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
 
 
   useEffect(() => {
-    void fetch('/v1/local-models/music')
+    void fetch('/v1/local-models/music', { headers: SELF_READ })
       .then(response => (response.ok ? response.json() : Promise.reject(new Error())))
       .then((body: { catalog?: EngineCatalog }) => setCatalog(body.catalog ?? null))
       .catch(() => setCatalog(null));
