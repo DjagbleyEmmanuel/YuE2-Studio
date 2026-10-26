@@ -448,6 +448,14 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   const [writerExtra, setWriterExtra] = useState('');
   const [scoreInstruction, setScoreInstruction] = useState('');
   const [error, setError] = useState<string | null>(null);
+  // the form scrolls above the Create button: a refusal at its foot is brought into view, or a click seems to do nothing
+  const errorBox = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!error) return undefined;
+    // after the frame the assistant's card leaves: a scroll started before it shrinks the form stops short
+    const frame = window.requestAnimationFrame(() => errorBox.current?.scrollIntoView({ block: 'nearest' }));
+    return () => window.cancelAnimationFrame(frame);
+  }, [error]);
   const [examplesOpen, setExamplesOpen] = useState(false);
   const [transcribing, setTranscribing] = useState<string | null>(null);
   const [composing, setComposing] = useState(false);
@@ -2047,7 +2055,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
               {setLabel(t, { id: setup.hardware.recommended, label: PROFILE_LABEL[setup.hardware.recommended] ?? setup.hardware.recommended })}
             </p>
           )}
-          {error && <div role="alert" className="rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs leading-5 text-red-700 dark:text-red-200">{error}</div>}
+          {error && <div ref={errorBox} role="alert" className="rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs leading-5 text-red-700 dark:text-red-200">{error}</div>}
         </div>
       </div>
 
