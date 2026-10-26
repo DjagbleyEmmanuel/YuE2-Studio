@@ -86,6 +86,17 @@ type OptionalStatus = {
 
 const bytes = (value: number) => (value < 1024 ** 3 ? `${Math.round(value / 1024 ** 2)} MB` : `${(value / 1024 ** 3).toFixed(1)} GB`);
 
+/** A model file "use models I already have" left in the chosen folder, and why. */
+interface AdoptRefusal {
+  file: string;
+  kind: 'size' | 'unknown' | 'copy';
+  size?: number;
+  needs?: number;
+  repository?: string;
+  revision?: string;
+  error?: string;
+}
+
 const errorMessage = async (response: Response) => {
   const body = await response.json().catch(() => null);
   return body?.error || `Request failed (${response.status})`;
@@ -728,6 +739,7 @@ export const SetupGate: React.FC<{ onReady?: () => void; mode?: 'first-run' | 's
   const [error, setError] = useState<string | null>(null);
   // what taking the user's own model folder did: files taken, copies made, what is still missing
   const [adoptNote, setAdoptNote] = useState<string | null>(null);
+  const [adoptRefused, setAdoptRefused] = useState<AdoptRefusal[]>([]);
   // the training page's packs are listed here too, with everything else the studio downloads
   const [trainingInfo, setTrainingInfo] = useState<{ min_vram_gb: number; card_trains: boolean } | null>(null);
   useEffect(() => {
@@ -1069,8 +1081,9 @@ export const SetupGate: React.FC<{ onReady?: () => void; mode?: 'first-run' | 's
                   onClick={() => {
                     void fetch('/setup/adopt', { method: 'POST' })
                       .then(async (response) => (response.ok ? response.json() : Promise.reject(new Error(await errorMessage(response)))))
-                      .then(async (body: { picked?: boolean; adopted?: string[]; copied?: { id: string; bytes: number }[] } | null) => {
+                      .then(async (body: { picked?: boolean; adopted?: string[]; copied?: { id: string; bytes: number }[]; refused?: AdoptRefusal[] } | null) => {
                         if (!body?.picked) return;
+                        setAdoptRefused(body.refused ?? []);
                         const next = await refresh();
                         const wanted = chosenIds ?? chosenValues;
                         const missing = (catalog?.components ?? []).filter((component) => wanted.includes(component.id) && !next.installed_components.includes(component.id));
@@ -1089,6 +1102,18 @@ export const SetupGate: React.FC<{ onReady?: () => void; mode?: 'first-run' | 's
                   {t('useExistingModels')}
                 </button>
                 {adoptNote && <p className="mt-2 text-[11px] leading-4 text-zinc-600 dark:text-zinc-300">{adoptNote}</p>}
+                {adoptRefused.map((refusal) => (
+                  <p key={refusal.file} className="mt-1 break-all text-[11px] leading-4 text-amber-600 dark:text-amber-300">
+                    <span className="font-mono">{refusal.file}</span> — {refusal.kind === 'size'
+                      ? t('adoptRefusedSize')
+                          .replace('{size}', (refusal.size ?? 0).toLocaleString())
+                          .replace('{needs}', (refusal.needs ?? 0).toLocaleString())
+                          .replace('{source}', `huggingface.co/${refusal.repository ?? ''} @ ${(refusal.revision ?? '').slice(0, 7)}`)
+                      : refusal.kind === 'copy'
+                        ? t('adoptRefusedCopy').replace('{error}', refusal.error ?? '')
+                        : t('adoptRefusedUnknown')}
+                  </p>
+                ))}
               </div>
             )}
           </div>

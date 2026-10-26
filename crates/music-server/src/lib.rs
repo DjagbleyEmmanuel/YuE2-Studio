@@ -7614,6 +7614,31 @@ fn adoptable_sources(components: &[model_manager::Component], root: &std::path::
         .collect()
 }
 
+/// The model files in `entries` the studio did not take, and why: one with a
+/// catalogue name but another size is another build of that file, and a GGUF
+/// the catalogue does not name is no part of the studio's sets. Files already
+/// installed and the ones taken are left out.
+fn adopt_refusals(components: &[model_manager::Component], root: &std::path::Path, entries: &[std::path::PathBuf], taken: &[std::path::PathBuf]) -> Vec<Value> {
+    entries
+        .iter()
+        .filter(|path| !taken.contains(path))
+        .filter(|path| path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf")))
+        .filter_map(|path| {
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let size = std::fs::metadata(path).ok()?.len();
+            match components.iter().find(|component| component.filename == name) {
+                Some(component) => {
+                    let installed = std::fs::metadata(root.join(component.filename)).is_ok_and(|meta| meta.len() == component.bytes);
+                    (!installed && size != component.bytes).then(|| {
+                        serde_json::json!({ "file": name, "kind": "size", "size": size, "needs": component.bytes, "repository": component.repository, "revision": component.revision })
+                    })
+                }
+                None => Some(serde_json::json!({ "file": name, "kind": "unknown", "size": size })),
+            }
+        })
+        .collect()
+}
+
 /// Takes models the user already has instead of downloading them again.
 ///
 /// Anyone who has run yue2.cpp by hand already has these weights on disk, and
@@ -7654,9 +7679,14 @@ async fn setup_adopt(State(state): State<AppState>, body: axum::body::Bytes) -> 
 
     let components = catalog.components.clone();
     let root = models_root.clone();
-    let found = tokio::task::spawn_blocking(move || adoptable_sources(&components, &root, &entries))
-        .await
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let (found, mut refused) = tokio::task::spawn_blocking(move || {
+        let found = adoptable_sources(&components, &root, &entries);
+        let taken: Vec<std::path::PathBuf> = found.iter().map(|(_, source)| source.clone()).collect();
+        let refused = adopt_refusals(&components, &root, &entries, &taken);
+        (found, refused)
+    })
+    .await
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     for (component, source) in &found {
         let target = models_root.join(component.filename);
         // a file of the earlier release under this name gives way to the one found
@@ -7666,7 +7696,10 @@ async fn setup_adopt(State(state): State<AppState>, body: axum::body::Bytes) -> 
         if std::fs::hard_link(source, &target).is_err() {
             match std::fs::copy(source, &target) {
                 Ok(bytes) => copied.push(serde_json::json!({ "id": component.id, "bytes": bytes })),
-                Err(_) => continue,
+                Err(error) => {
+                    refused.push(serde_json::json!({ "file": component.filename, "kind": "copy", "error": error.to_string() }));
+                    continue;
+                }
             }
         }
         adopted.push(component.id.to_string());
@@ -7679,6 +7712,7 @@ async fn setup_adopt(State(state): State<AppState>, body: axum::body::Bytes) -> 
         "folder": folder.display().to_string(),
         "adopted": adopted,
         "copied": copied,
+        "refused": refused,
         "status": compose_setup_status(&state, status).await,
     })))
 }
@@ -9775,6 +9809,30 @@ mod tests {
         assert_eq!(access.code(), Some("lost_exited"));
         assert_eq!(access.params()["exit"], "0xc0000005");
         assert_eq!(lost_job_reason("[NAR] Step 3/16").code(), Some("lost_at_line"));
+    }
+
+    /// A file named as the catalogue's but of another build, and a GGUF of no
+    /// set, are said with the reason; the one taken and other files are not.
+    #[test]
+    fn a_model_file_not_taken_is_named_with_why() {
+        let folder = std::env::temp_dir().join(format!("adopt-{}", uuid::Uuid::now_v7()));
+        let models = folder.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let component = model_manager::Component { id: "lm", kind: "lm", filename: "model.gguf", bytes: 4, sha256: "", repository: "org/repo", revision: "abcdef123", };
+        let wrong = folder.join("model.gguf");
+        std::fs::write(&wrong, b"other build").unwrap();
+        let stray = folder.join("someone-else.gguf");
+        std::fs::write(&stray, b"x").unwrap();
+        let taken = folder.join("taken.gguf");
+        std::fs::write(&taken, b"took").unwrap();
+        let notes = folder.join("notes.txt");
+        std::fs::write(&notes, b"x").unwrap();
+        let refused = adopt_refusals(&[component], &models, &[wrong, stray, taken.clone(), notes], &[taken]);
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert_eq!(refused[0]["kind"], "size");
+        assert_eq!(refused[0]["needs"], 4);
+        assert_eq!(refused[1]["kind"], "unknown");
+        std::fs::remove_dir_all(&folder).ok();
     }
 
     #[test]
