@@ -5389,6 +5389,8 @@ async fn compose_setup_status(state: &AppState, manager_status: model_manager::M
         );
         fields.insert("engine_error".into(), serde_json::to_value(state.engine_start_error.read().await.clone()).unwrap_or(Value::Null));
         fields.insert("engine_id".into(), Value::String(PRIMARY_MUSIC_ENGINE_ID.into()));
+        // whether the files a person downloads by hand are better taken from the mirror, as the studio's are
+        fields.insert("huggingface_mirror".into(), Value::Bool(net::current().huggingface_mirror));
         fields.insert("selected_profile_id".into(), serde_json::to_value(selected_profile_id).unwrap_or(Value::Null));
         fields.insert("selected_component_ids".into(), serde_json::to_value(selected_component_ids).unwrap_or(Value::Null));
         fields.insert("hardware".into(), serde_json::to_value(hardware::hardware()).unwrap_or(Value::Null));
@@ -7736,8 +7738,20 @@ async fn open_data_directory() -> Result<Json<Value>, (StatusCode, Json<ApiError
     Ok(Json(serde_json::json!({ "opened": root.display().to_string() })))
 }
 
-async fn setup_catalog(State(state): State<AppState>) -> Json<model_manager::Catalog> {
-    Json(state.model_manager.catalog())
+async fn setup_catalog(State(state): State<AppState>) -> Json<Value> {
+    let catalog = state.model_manager.catalog();
+    // each file at its pinned revision, on Hugging Face and on the mirror, for a download by hand
+    let sources: Vec<(String, String)> = catalog.components.iter().map(|component| (component.url(), net::mirror_url(&component.url()))).collect();
+    let mut value = serde_json::to_value(catalog).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(components) = value.get_mut("components").and_then(Value::as_array_mut) {
+        for (component, (url, mirror_url)) in components.iter_mut().zip(sources) {
+            if let Value::Object(fields) = component {
+                fields.insert("url".into(), Value::String(url));
+                fields.insert("mirror_url".into(), Value::String(mirror_url));
+            }
+        }
+    }
+    Json(value)
 }
 
 async fn setup_download(

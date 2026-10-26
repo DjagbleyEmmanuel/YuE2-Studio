@@ -78,6 +78,14 @@ pub struct Component {
     pub revision: &'static str,
 }
 
+impl Component {
+    /// The file at its pinned revision on Hugging Face: what the studio downloads, and what a person
+    /// downloading by hand needs, since the repository's latest files may be other builds.
+    pub fn url(&self) -> String {
+        format!("https://huggingface.co/{}/resolve/{}/{}?download=true", self.repository, self.revision, self.filename)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstallRequest {
     pub profile_id: Option<String>,
@@ -414,10 +422,7 @@ impl ModelManager {
     async fn download_component(&self, component: &Component) -> Result<()> {
         let target = self.root.join(component.filename);
         let part = part_path(&target);
-        let url = crate::net::model_url(&format!(
-            "https://huggingface.co/{}/resolve/{}/{}?download=true",
-            component.repository, component.revision, component.filename
-        ));
+        let url = crate::net::model_url(&component.url());
 
         // another program of timoncool's has this file: taken through the same checksum a download passes
         let name = Path::new(component.filename).file_name().unwrap_or_default();
@@ -913,6 +918,18 @@ mod tests {
         let selected = resolve_install(InstallRequest { profile_id: Some(recommended_profile().into()), component_ids: vec![] }).unwrap();
         assert_eq!(selected.profile_id.as_deref(), Some(recommended_profile()));
         validate_complete_set(&selected.components).unwrap();
+    }
+
+    /// A file downloaded by hand is the pinned one: its address names the revision, not the branch, on Hugging
+    /// Face and on the mirror alike.
+    #[test]
+    fn a_manual_address_names_the_pinned_revision() {
+        for component in components() {
+            let url = component.url();
+            assert_eq!(url, format!("https://huggingface.co/{}/resolve/{}/{}?download=true", component.repository, component.revision, component.filename));
+            assert!(!url.contains("/resolve/main/"), "{} is not pinned", component.id);
+            assert!(crate::net::mirror_url(&url).starts_with("https://hf-mirror.com/"), "{}", component.id);
+        }
     }
 
     #[test]

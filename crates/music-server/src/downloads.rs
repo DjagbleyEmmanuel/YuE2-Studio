@@ -154,12 +154,16 @@ impl Downloader {
         }
     }
 
-    /// Installed when its files are there and its record names today's pin
-    /// (`install_record`); a download from before records counts as in
-    /// `take_over`.
+    /// Installed when its files are there and, for a runtime, its record names
+    /// today's pin (`install_record`); a runtime from before records counts as
+    /// in `take_over`. A model counts by its file: its address can move to
+    /// another revision of the same weights without them being fetched again.
     pub fn is_installed(&self, asset: &Asset) -> bool {
         if !self.present(asset) {
             return false;
+        }
+        if asset.kind == AssetKind::Model {
+            return true;
         }
         let record = self.record_of(asset);
         match crate::install_record::matches(&record, asset.url, &self.root) {
