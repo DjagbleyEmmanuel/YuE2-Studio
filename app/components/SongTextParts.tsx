@@ -4,6 +4,7 @@ import { useI18n } from '../context/I18nContext';
 import { songDetailStrings, songTokenStrings, songWritingStrings } from '../i18n/songWriting';
 import { cycleSection, editLyricLine, lyricSections, SECTION_PRESETS, sectionText, setStyleRole, STYLE_LANGUAGES, styleRole, toggleLetterCase, type LyricSection } from '../services/songWriting';
 import { styleSuggestions } from '../services/styleSuggestions';
+import { MAIN_STYLES } from '../data/genres';
 import { lyricLineOffsets, songTokens, tokensOnLine, type SongTokens } from '../services/songTokens';
 
 const control = 'w-full rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-xs outline-hidden focus:border-pink-500 dark:border-white/10 dark:bg-black/25';
@@ -13,7 +14,7 @@ export function SongTextParts({ value, onChange, kind, style = '', cot = 'full' 
   const { language } = useI18n();
   const s = { ...songWritingStrings[language], ...songDetailStrings[language], ...songTokenStrings[language] };
   const suggestionId = useId();
-  const suggestions = useMemo(() => styleSuggestions(language), [language]);
+  const suggestions = useMemo(() => styleSuggestions(language, MAIN_STYLES), [language]);
   const [newSound, setNewSound] = useState('');
   const [tokens, setTokens] = useState<SongTokens | null>(null);
   const [tokenProblem, setTokenProblem] = useState('');
