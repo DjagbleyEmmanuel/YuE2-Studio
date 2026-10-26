@@ -10,6 +10,10 @@ pub const RETIRED: &[&str] = &[
     "karaoke/models/parakeet",
     "karaoke/models/parakeet-fp32",
     "karaoke/models/parakeet-ultra",
+    // the ONNX HT-Demucs of 3.7 and earlier; stems separate on audio.cpp's server
+    "separation/models/htdemucs/htdemucs_6s_fp16.onnx",
+    // HOT-Step's MIDI transcriber of 3.6 and earlier; MuScriptor runs on audio.cpp's server
+    "midi/runtime",
 ];
 
 /// Removes the retired paths under `data_root`. A link (another program's folder linked in) loses only the link; a
@@ -41,15 +45,26 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         for relative in RETIRED {
             let path = root.path().join(relative);
-            fs::create_dir_all(&path).unwrap();
-            fs::write(path.join("encoder-model.int8.onnx"), b"x").unwrap();
+            if relative.ends_with(".onnx") {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, b"x").unwrap();
+            } else {
+                fs::create_dir_all(&path).unwrap();
+                fs::write(path.join("encoder-model.int8.onnx"), b"x").unwrap();
+            }
         }
-        let kept = root.path().join("karaoke/models/asr-gguf-parakeet-v3/parakeet-tdt-0.6b-v3-Q8_0.gguf");
-        fs::create_dir_all(kept.parent().unwrap()).unwrap();
-        fs::write(&kept, b"x").unwrap();
+        let kept = [
+            root.path().join("karaoke/models/asr-gguf-parakeet-v3/parakeet-tdt-0.6b-v3-Q8_0.gguf"),
+            root.path().join("separation/models/htdemucs/htdemucs-6stems-f16.gguf"),
+            root.path().join("midi/models/muscriptor-medium/model.safetensors"),
+        ];
+        for file in &kept {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, b"x").unwrap();
+        }
         remove_retired(root.path());
         assert!(RETIRED.iter().all(|relative| !root.path().join(relative).exists()));
-        assert!(kept.is_file());
+        assert!(kept.iter().all(|file| file.is_file()));
         remove_retired(root.path());
     }
 }

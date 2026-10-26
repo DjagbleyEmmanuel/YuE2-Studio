@@ -48,6 +48,7 @@ mod engine_log;
 mod harmony;
 mod song_errors;
 mod retired;
+mod acpp;
 
 use song_errors::SongError;
 
@@ -122,6 +123,8 @@ struct AppState {
     cover_template_default: Arc<RwLock<Option<String>>>,
     separator: Arc<separation::Separator>,
     separation_config: Arc<RwLock<separation::SeparationConfig>>,
+    /// audio.cpp's server: HT-Demucs, MuScriptor and SheetSage2.
+    acpp: Arc<acpp::Acpp>,
     /// Draw a cover as soon as a track is finished.
     cover_auto: Arc<RwLock<bool>>,
     /// Write a track's note, style and generation settings into its file.
@@ -965,6 +968,7 @@ pub async fn serve() -> anyhow::Result<()> {
     };
     let music_server = EngineClient::from_environment();
     let engine_log = engine_log::EngineLog::follow(music_server.http.clone(), music_server.url("/logs"));
+    let acpp = Arc::new(acpp::Acpp::new(&studio_data_root().unwrap_or_else(|| std::path::PathBuf::from("."))));
     let state = AppState {
         configuration: Arc::new(RwLock::new(sanitize_persisted_configuration(
             persisted.as_ref().map(|settings| settings.configuration.clone()).unwrap_or_else(initial_configuration),
@@ -1001,8 +1005,9 @@ pub async fn serve() -> anyhow::Result<()> {
         separator: Arc::new(separation::Separator::new(
             &studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")),
         )),
+        acpp: acpp.clone(),
         separation_run: Arc::new(RwLock::new(None)),
-        midi: Arc::new(midi::Transcriber::new(&studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")))),
+        midi: Arc::new(midi::Transcriber::new(&studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")), acpp.clone())),
         midi_run: Arc::new(RwLock::new(None)),
         midi_notes: Arc::new(RwLock::new(Vec::new())),
         midi_stop: Arc::new((std::sync::atomic::AtomicBool::new(false), tokio::sync::Notify::new())),
@@ -1050,6 +1055,11 @@ pub async fn serve() -> anyhow::Result<()> {
         }
     }
     state.lyrics_sync.set_cuda_libraries(state.engine_runtime.library_dir());
+    state.acpp.set_cuda13_libraries(state.engine_runtime.library_dir());
+    state.acpp.register(acpp_server::ModelEntry::htdemucs(acpp::HTDEMUCS, &state.separator.model_path()));
+    for size in &midi::SIZES {
+        state.acpp.register(acpp_server::ModelEntry::muscriptor(&acpp::muscriptor_id(size.id), &state.midi.model_dir(size)));
+    }
     if let Some(data_root) = studio_data_root() {
         tokio::task::spawn_blocking(move || retired::remove_retired(&data_root));
     }
@@ -1591,7 +1601,7 @@ fn cover_like(state: &AppState, from: &library::Song, to: &str) -> anyhow::Resul
 /// wears the original's cover. Separating the song again replaces its stems
 /// in the library instead of adding more: the new ones are in before the old
 /// ones go, so a stem file held open by a player costs nothing but itself.
-fn stems_into_library(state: &AppState, song_id: &str, stems: &[String], overlap: f64, model: &str) -> anyhow::Result<(Vec<String>, Option<String>)> {
+fn stems_into_library(state: &AppState, song_id: &str, stems: &[String], model: &str) -> anyhow::Result<(Vec<String>, Option<String>)> {
     let original = state.library.get_song(song_id)?.ok_or_else(|| anyhow::anyhow!("the song {song_id} is gone"))?;
     let replaced: Vec<library::Song> = state
         .library
@@ -1612,7 +1622,7 @@ fn stems_into_library(state: &AppState, song_id: &str, stems: &[String], overlap
             // the words belong to the voice, not to the drums
             lyrics: if stem == "vocals" { original.lyrics.clone() } else { String::new() },
             metadata: serde_json::json!({
-                "derived": derivation(&original, "stems", serde_json::json!({ "stem": stem, "model": model, "overlap": overlap })),
+                "derived": derivation(&original, "stems", serde_json::json!({ "stem": stem, "model": model })),
                 "duration_seconds": duration,
             }),
             generation_settings: Value::Null,
@@ -1702,47 +1712,36 @@ async fn separation_assets(State(state): State<AppState>) -> Json<Value> {
             "waiting_for_server": crate::chunked::waiting_for_server(),
         }));
     }
-    let runtime_installed = state.lyrics_sync.onnxruntime_library().is_some();
+    let build = separation_build(config.runtime);
+    let server: Vec<&'static downloads::Asset> = build.as_ref().map(|build| acpp::assets(*build)).unwrap_or_default();
+    let model_installed = state.separator.is_installed();
     let mut assets = vec![serde_json::json!({
         "id": separation::MODEL.id,
         "label": separation::MODEL.label,
         "bytes": separation::MODEL.bytes,
         "note": separation::MODEL.note,
-        "installed": state.separator.is_installed(),
+        "installed": model_installed,
     })];
-    assets.extend(lyrics_sync::CUDA_ASSETS.iter().chain(["onnxruntime"].iter()).filter_map(|id| lyrics_sync::asset(id)).map(|asset| {
-        let shared = asset.id == "onnxruntime";
-        serde_json::json!({
-            "id": asset.id,
-            "label": asset.label,
-            "bytes": asset.bytes,
-            "note": if shared { "Runs the separator and the karaoke recogniser; shared between them." } else { asset.note },
-            "installed": if shared { runtime_installed } else { state.lyrics_sync.downloader().is_installed(asset) },
-        })
+    assets.extend(server.iter().map(|asset| {
+        serde_json::json!({ "id": asset.id, "label": asset.label, "bytes": asset.bytes, "note": asset.note, "installed": state.acpp.downloader().is_installed(asset) })
     }));
-    let mut set: Vec<&'static lyrics_sync::Asset> = Vec::new();
-    if let Some(asset) = lyrics_sync::asset("onnxruntime") { set.push(asset); }
-    set.extend(separation_card_assets(config.runtime).iter().filter_map(|id| lyrics_sync::asset(id)));
-    let runtime_progress = set_progress(state.lyrics_sync.downloader(), &set);
-    let model_installed = state.separator.is_installed();
-    let bytes = runtime_progress["bytes"].as_u64().unwrap_or(0) + separation::MODEL.bytes;
-    let installed_bytes = runtime_progress["installed_bytes"].as_u64().unwrap_or(0)
-        + if model_installed { separation::MODEL.bytes } else { 0 };
-    // the model comes first and its finished record stays; the runtime downloading after it is the one to show
+    let server_progress = set_progress(state.acpp.downloader(), &server);
+    let bytes = server_progress["bytes"].as_u64().unwrap_or(0) + separation::MODEL.bytes;
+    let installed_bytes = server_progress["installed_bytes"].as_u64().unwrap_or(0) + if model_installed { separation::MODEL.bytes } else { 0 };
+    // the model comes first and its finished record stays; the server downloading after it is the one to show
     Json(serde_json::json!({
         "assets": assets,
         "settings": { "runtime": config.runtime, "engine": config.engine },
         "set": {
             "bytes": bytes,
             "installed_bytes": installed_bytes,
-            "ready": installed_bytes == bytes,
-            "files": set.len() + 1,
+            "ready": build.is_ok() && installed_bytes == bytes,
+            "files": server.len() + 1,
         },
-        // Only this panel's own download. The recogniser shares this
-        // downloader, and its gigabytes are not the separator's business.
+        "error": build.err().map(|error| error.to_string()),
         "active_download": separation_download_progress(
             state.separator.downloader().active_for("separation").await,
-            state.lyrics_sync.downloader().active_for("separation").await,
+            state.acpp.downloader().active_for("separation").await,
         ),
         // Not an error and not a stall: the file server is asking us to wait.
         "waiting_for_server": crate::chunked::waiting_for_server(),
@@ -1781,17 +1780,36 @@ fn separation_download_progress(
     runtime.or(model)
 }
 
-/// Whether separation runs on this card: CUDA only. HT-Demucs's ONNX export
-/// does not run through DirectML - out of memory on a 2 GB card, over twenty
-/// gigabytes and minutes for 30 seconds on a 24 GB one - so every other card
-/// separates on the processor.
-fn separates_on(card: lyrics_sync::OnnxCard) -> bool {
-    card == lyrics_sync::OnnxCard::Cuda
+/// The audio.cpp build HT-Demucs separates on for the separation settings' device: the processor, the card (CUDA, or
+/// Vulkan on a card of another make) or Auto.
+fn separation_build(runtime: lyrics_sync::OnnxFlavour) -> anyhow::Result<acpp_server::asset::Build> {
+    acpp::build_for(match runtime {
+        lyrics_sync::OnnxFlavour::Cpu => "cpu",
+        lyrics_sync::OnnxFlavour::Cuda => "gpu",
+        lyrics_sync::OnnxFlavour::Auto => "auto",
+    })
 }
 
-/// The runtime parts separation needs on this machine's card.
-fn separation_card_assets(runtime: lyrics_sync::OnnxFlavour) -> &'static [&'static str] {
-    if runtime.card().is_some_and(separates_on) { lyrics_sync::CUDA_ASSETS } else { &[] }
+/// Downloads what audio.cpp's server of `build` still lacks: the program and its libraries, and for the CUDA 13 build
+/// the cuBLAS 13 it shares with the music engine, through the engine runtime that downloads it.
+async fn install_acpp(state: &AppState, build: acpp_server::asset::Build, scope: &str) -> anyhow::Result<()> {
+    state.acpp.downloader().install_all(scope, &state.acpp.missing(build)).await?;
+    if build == acpp_server::asset::Build::Cuda13 {
+        state.engine_runtime.install_missing(Some(hardware::CudaBuild::Cuda13)).await?;
+    }
+    Ok(())
+}
+
+/// The bytes audio.cpp's server of `build` still needs, the engine's cuBLAS 13 among them for the CUDA 13 build.
+fn acpp_missing_bytes(state: &AppState, build: acpp_server::asset::Build) -> u64 {
+    let server: u64 = state.acpp.missing(build).iter().map(|asset| asset.bytes).sum();
+    let cublas: u64 = if build == acpp_server::asset::Build::Cuda13 { state.engine_runtime.missing(Some(hardware::CudaBuild::Cuda13)).iter().map(|asset| asset.bytes).sum() } else { 0 };
+    server + cublas
+}
+
+/// HT-Demucs can run on this device choice: its model and audio.cpp's server of that build.
+fn htdemucs_installed(state: &AppState, runtime: lyrics_sync::OnnxFlavour) -> bool {
+    state.separator.is_installed() && separation_build(runtime).is_ok_and(|build| state.acpp.installed(build))
 }
 
 /// Stops a download. What arrived stays on disk: pressing this again later
@@ -1801,7 +1819,7 @@ fn separation_card_assets(runtime: lyrics_sync::OnnxFlavour) -> &'static [&'stat
 /// to stop one of them was to close the studio.
 async fn cancel_separation_download(State(state): State<AppState>) -> Json<Value> {
     state.separator.downloader().cancel();
-    state.lyrics_sync.downloader().cancel();
+    state.acpp.downloader().cancel();
     Json(serde_json::json!({ "cancelled": true }))
 }
 
@@ -1878,29 +1896,22 @@ async fn install_separation_asset(
         });
         return Ok(Json(serde_json::json!({ "started": true })));
     }
-    if let Some((separation::Engine::Htdemucs, wanted)) = choice {
-        let separator = state.separator.clone();
-        let sync = state.lyrics_sync.clone();
-        let mut runtime: Vec<&'static lyrics_sync::Asset> = Vec::new();
-        if let Some(asset) = lyrics_sync::asset("onnxruntime") { runtime.push(asset); }
-        runtime.extend(separation_card_assets(wanted).iter().filter_map(|id| lyrics_sync::asset(id)));
+    let htdemucs = match (choice, request.asset_id.as_str()) {
+        (Some((separation::Engine::Htdemucs, wanted)), _) => Some(wanted),
+        (_, "card") => Some(lyrics_sync::OnnxFlavour::Cuda),
+        _ => None,
+    };
+    if let Some(wanted) = htdemucs {
+        let build = separation_build(wanted).map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+        let background = state.clone();
         tokio::spawn(async move {
-            if let Err(error) = separator.downloader().install_all("separation", &[&separation::MODEL]).await {
-                eprintln!("the separator model could not be installed: {error}");
+            if let Err(error) = background.separator.downloader().install_all("separation", &[&separation::MODEL]).await {
+                eprintln!("[ERROR] the separator model could not be installed: {error:#}");
                 return;
             }
-            if let Err(error) = sync.downloader().install_all("separation", &runtime).await {
-                eprintln!("the separator runtime could not be installed: {error}");
-            }
-        });
-        return Ok(Json(serde_json::json!({ "started": true })));
-    }
-    if request.asset_id == "card" {
-        let sync = state.lyrics_sync.clone();
-        let card: Vec<&'static lyrics_sync::Asset> = separation_card_assets(lyrics_sync::OnnxFlavour::Auto).iter().filter_map(|id| lyrics_sync::asset(id)).collect();
-        tokio::spawn(async move {
-            if let Err(error) = sync.downloader().install_all("separation", &card).await {
-                eprintln!("the card path could not be installed: {error}");
+            if let Err(error) = install_acpp(&background, build, "separation").await {
+                eprintln!("[ERROR] audio.cpp's server could not be installed for the separator: {error:#}");
+                background.acpp.downloader().fail("separation", format!("{error:#}")).await;
             }
         });
         return Ok(Json(serde_json::json!({ "started": true })));
@@ -1921,13 +1932,12 @@ async fn install_separation_asset(
             .install(&separation::MODEL)
             .await
             .map_err(|error| api_error(StatusCode::CONFLICT, error.to_string()))?;
-    } else if let Some(asset) = lyrics_sync::asset(&request.asset_id) {
-        state
-            .lyrics_sync
-            .downloader()
-            .install(asset)
-            .await
-            .map_err(|error| api_error(StatusCode::CONFLICT, error.to_string()))?;
+    } else if let Some(asset) = [acpp_server::asset::Build::Cuda13, acpp_server::asset::Build::Cuda12, acpp_server::asset::Build::Vulkan, acpp_server::asset::Build::Cpu, acpp_server::asset::Build::Metal]
+        .into_iter()
+        .flat_map(acpp::assets)
+        .find(|asset| asset.id == request.asset_id)
+    {
+        state.acpp.downloader().install(asset).await.map_err(|error| api_error(StatusCode::CONFLICT, error.to_string()))?;
     } else {
         return Err(api_error(StatusCode::BAD_REQUEST, format!("unknown asset {}", request.asset_id)));
     }
@@ -1947,7 +1957,7 @@ async fn write_separation_settings(
     let offered = engine_stems(config.engine);
     let stems: Vec<String> = config.stems.iter().filter(|stem| offered.contains(&stem.as_str())).cloned().collect();
     let stems = if stems.is_empty() { offered.iter().map(|stem| (*stem).to_string()).collect() } else { stems };
-    let stored = separation::SeparationConfig { runtime: config.runtime, stems, overlap: config.sane_overlap(), engine: config.engine };
+    let stored = separation::SeparationConfig { runtime: config.runtime, stems, engine: config.engine };
     *state.separation_config.write().await = stored.clone();
     persist_studio_settings(&state)
         .await
@@ -1956,9 +1966,15 @@ async fn write_separation_settings(
 }
 
 async fn separation_status(State(state): State<AppState>) -> Json<Value> {
-    let runtime = state.lyrics_sync.onnxruntime_library();
     let (engine, runtime_choice) = { let config = state.separation_config.read().await; (config.engine, config.runtime) };
-    let card = lyrics_sync::OnnxFlavour::Auto.card().filter(|card| separates_on(*card));
+    // the card HT-Demucs takes on this machine (audio.cpp's CUDA build, Vulkan on a card of another make, Metal on a
+    // Mac), none without one, and whether its server is installed
+    let card_build = separation_build(lyrics_sync::OnnxFlavour::Cuda).ok().filter(|build| acpp::on_card(*build));
+    let card = card_build.map(|build| match build.backend() {
+        acpp_server::Backend::Cuda => "cuda",
+        acpp_server::Backend::Vulkan => "vulkan",
+        _ => "metal",
+    });
     let model = match engine {
         separation::Engine::Roformer => &separation::ROFORMER_MODEL,
         separation::Engine::Htdemucs => &separation::MODEL,
@@ -1967,6 +1983,7 @@ async fn separation_status(State(state): State<AppState>) -> Json<Value> {
         separation::Engine::Roformer => state.separator.roformer_installed(roformer_on_card(&state, runtime_choice)),
         separation::Engine::Htdemucs => state.separator.is_installed(),
     };
+    let server_installed = separation_build(runtime_choice).is_ok_and(|build| state.acpp.installed(build));
     Json(serde_json::json!({
         "model": {
             "id": model.id,
@@ -1975,32 +1992,23 @@ async fn separation_status(State(state): State<AppState>) -> Json<Value> {
             "note": model.note,
             "installed": model_installed,
         },
-        "runtime_installed": runtime.is_some(),
-        // the card separation takes on this machine, none on any card but
-        // CUDA's, and whether every library of it is installed
+        "runtime_installed": server_installed,
         "card": card,
         "card_runtime_installed": match engine {
             separation::Engine::Roformer => roformer_on_card(&state, lyrics_sync::OnnxFlavour::Auto),
-            separation::Engine::Htdemucs => card.is_some_and(|card| state.lyrics_sync.has_card_libraries(card)),
+            separation::Engine::Htdemucs => card_build.is_some_and(|build| state.acpp.installed(build)),
         },
-        "card_missing_bytes": separation_card_assets(lyrics_sync::OnnxFlavour::Auto)
-            .iter()
-            .filter_map(|id| lyrics_sync::asset(id))
-            .filter(|asset| !state.lyrics_sync.downloader().is_installed(asset))
-            .map(|asset| asset.bytes)
-            .sum::<u64>(),
+        "card_missing_bytes": card_build.map(|build| acpp_missing_bytes(&state, build)).unwrap_or(0),
         "ready": match engine {
             separation::Engine::Roformer => state.separator.roformer_installed(roformer_on_card(&state, runtime_choice)),
-            separation::Engine::Htdemucs => state.separator.ready(runtime.as_deref()),
+            separation::Engine::Htdemucs => htdemucs_installed(&state, runtime_choice),
         },
         "engine": engine,
         "stems": engine_stems(engine),
-        // Either downloader may be the busy one: the model has its own, the
-        // card libraries come through karaoke's. Reporting only the first is
-        // what made a running download look like a dead button.
+        // Either downloader may be the busy one: the model has its own, audio.cpp's server comes through its own.
         "download": separation_download_progress(
             state.separator.downloader().active().await,
-            state.lyrics_sync.downloader().active().await,
+            state.acpp.downloader().active().await,
         ),
         "settings": state.separation_config.read().await.clone(),
         "run": state.separation_run.read().await.clone(),
@@ -2515,27 +2523,15 @@ async fn remove_song_version(
 /// and lyric recognition are measured on.
 struct StudioSeparator {
     model: PathBuf,
-    overlap: f64,
-    /// The runtime the separation settings chose. The card it reaches is
-    /// settled when the first song is separated: that binds the process's
-    /// ONNX Runtime, which a status read must never do.
-    runtime: lyrics_sync::OnnxFlavour,
-    sync: Arc<lyrics_sync::LyricsSync>,
-    /// Loaded on the first song and kept for the rest: one separator is made
-    /// per run of songs and dropped with it, taking the card's memory along.
-    loaded: std::sync::Mutex<Option<separation::Loaded>>,
+    acpp: Arc<acpp::Acpp>,
+    /// audio.cpp's build the separation settings chose.
+    build: acpp_server::asset::Build,
 }
 
 impl training::VocalSeparator for StudioSeparator {
     fn separate(&self, mix: &std::path::Path, out: &std::path::Path) -> anyhow::Result<()> {
         let audio = audio_pcm::decode_stereo_44k(mix)?;
-        let mut loaded = self.loaded.lock().map_err(|_| anyhow::anyhow!("the separator failed on an earlier song"))?;
-        if loaded.is_none() {
-            let card = self.sync.onnx_card(self.runtime)?.filter(|card| separates_on(*card));
-            *loaded = Some(separation::load(&self.model, card)?);
-        }
-        let model = loaded.as_mut().expect("loaded above");
-        let separated = separation::separate_with(model, &audio, separation::STEMS.len(), self.overlap, |_| {})?;
+        let separated = separation::separate_htdemucs(&self.acpp, &self.model, &audio, self.build, &|| false)?;
         let vocals = separated.stems.into_iter().find(|stem| stem.name == "vocals").context("the separator returned no vocals")?;
         separation::write_wav_stereo(out, &vocals.samples)
     }
@@ -2565,40 +2561,33 @@ async fn vocal_separator(state: &AppState) -> Option<Arc<dyn training::VocalSepa
         let gpu = roformer_on_card(state, config.runtime);
         return state.separator.roformer_installed(gpu).then(|| Arc::new(RoformerVocals { separator: state.separator.clone(), gpu }) as Arc<dyn training::VocalSeparator>);
     }
-    if !state.separator.is_installed() || state.lyrics_sync.onnxruntime_library().is_none() {
+    if !htdemucs_installed(state, config.runtime) {
         return None;
     }
-    Some(Arc::new(StudioSeparator {
-        model: state.separator.model_path(),
-        overlap: config.sane_overlap(),
-        runtime: config.runtime,
-        sync: state.lyrics_sync.clone(),
-        loaded: std::sync::Mutex::new(None),
-    }))
+    let build = separation_build(config.runtime).ok()?;
+    Some(Arc::new(StudioSeparator { model: state.separator.model_path(), acpp: state.acpp.clone(), build }))
 }
 
 /// Everything the separator still lacks, through the same downloaders the
-/// separator's own panel uses; the card path unless the processor was chosen.
+/// separator's own panel uses: HT-Demucs's model and audio.cpp's server of the build its device setting runs.
 async fn install_separator(state: &AppState) {
     let wanted = state.separation_config.read().await.runtime;
+    let build = match separation_build(wanted) {
+        Ok(build) => build,
+        Err(error) => {
+            eprintln!("[ERROR] the separator cannot be installed: {error:#}");
+            return;
+        }
+    };
     let separator = state.separator.clone();
-    let sync = state.lyrics_sync.clone();
-    let mut runtime: Vec<&'static lyrics_sync::Asset> = Vec::new();
-    if let Some(asset) = lyrics_sync::asset("onnxruntime") {
-        runtime.push(asset);
-    }
-    runtime.extend(separation_card_assets(wanted).iter().filter_map(|id| lyrics_sync::asset(id)));
-    runtime.retain(|asset| !sync.downloader().is_installed(asset));
     if !separator.is_installed() {
         if let Err(error) = separator.downloader().install_all("separation", &[&separation::MODEL]).await {
             eprintln!("[ERROR] the separator model could not be installed: {error:#}");
             return;
         }
     }
-    if !runtime.is_empty() {
-        if let Err(error) = sync.downloader().install_all("separation", &runtime).await {
-            eprintln!("[ERROR] the separator runtime could not be installed: {error:#}");
-        }
+    if let Err(error) = install_acpp(state, build, "separation").await {
+        eprintln!("[ERROR] audio.cpp's server could not be installed for the separator: {error:#}");
     }
 }
 
@@ -2764,12 +2753,13 @@ async fn listen_download(state: &AppState) -> Option<downloads::DownloadProgress
     }
 }
 
-/// Audio to MIDI on the models page: the transcriber, and its sizes as one
-/// model's variants - one is chosen and downloaded.
 async fn midi_runtime(State(state): State<AppState>) -> Json<Value> {
-    let tool = midi::tool_asset();
-    let tool_installed = state.midi.tool_installed();
-    let mut assets = vec![serde_json::json!({ "id": tool.id, "label": tool.label, "bytes": tool.bytes, "note": "", "installed": tool_installed, "kind": "runtime" })];
+    let build = midi_build(&*state.engine_options.read().await);
+    let server: Vec<&'static downloads::Asset> = build.as_ref().map(|build| acpp::assets(*build)).unwrap_or_default();
+    let mut assets: Vec<Value> = server
+        .iter()
+        .map(|asset| serde_json::json!({ "id": asset.id, "label": asset.label, "bytes": asset.bytes, "note": asset.note, "installed": state.acpp.downloader().is_installed(asset), "kind": "runtime" }))
+        .collect();
     assets.extend(midi::SIZES.iter().map(|size| {
         serde_json::json!({
             "id": size.id,
@@ -2781,12 +2771,26 @@ async fn midi_runtime(State(state): State<AppState>) -> Json<Value> {
         })
     }));
     let installed_size = midi::SIZES.iter().rev().find(|size| state.midi.model_installed(size));
+    let server_progress = set_progress(state.acpp.downloader(), &server);
+    let server_installed = build.as_ref().is_ok_and(|build| state.midi.server_installed(*build));
     Json(serde_json::json!({
         "assets": assets,
-        "set": { "bytes": tool.bytes, "installed_bytes": if tool_installed { tool.bytes } else { 0 }, "ready": tool_installed && installed_size.is_some(), "files": 1 },
-        "active_download": state.midi.downloader().active().await,
+        "set": {
+            "bytes": server_progress["bytes"],
+            "installed_bytes": server_progress["installed_bytes"],
+            "ready": server_installed && installed_size.is_some(),
+            "files": server.len(),
+        },
+        "error": build.err().map(|error| error.to_string()),
+        "active_download": separation_download_progress(state.midi.downloader().active().await, state.acpp.downloader().active_for("midi").await),
         "chosen_model": preferred_midi_size(&state),
     }))
+}
+
+/// The audio.cpp build MuScriptor transcribes on: the processor when the engine is set to it, else the card when there
+/// is one.
+fn midi_build(options: &EngineOptions) -> anyhow::Result<acpp_server::asset::Build> {
+    acpp::build_for(if options.backend == music_engine::yue_server::ComputeBackend::Cpu { "cpu" } else { "auto" })
 }
 
 async fn install_training_pack(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
@@ -2834,6 +2838,7 @@ async fn install_listen_pack(State(state): State<AppState>) -> Json<Value> {
 async fn cancel_training_pack(State(state): State<AppState>) -> Json<Value> {
     state.training.downloader().cancel();
     state.separator.downloader().cancel();
+    state.acpp.downloader().cancel();
     state.lyrics_sync.downloader().cancel();
     Json(serde_json::json!({ "cancelled": true }))
 }
@@ -3281,21 +3286,14 @@ async fn start_separation(
     }
     let wanted_runtime = state.separation_config.read().await.runtime;
     let engine = state.separation_config.read().await.engine;
-    // the ONNX Runtime and its card are HT-Demucs's; Mel-Band RoFormer runs its own engine
-    let card = match engine {
-        separation::Engine::Htdemucs => state
-            .lyrics_sync
-            .onnx_card(wanted_runtime)
-            .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?
-            .filter(|card| separates_on(*card)),
-        separation::Engine::Roformer => None,
-    };
+    // audio.cpp's server of the chosen device is HT-Demucs's; Mel-Band RoFormer runs its own engine
+    let build = separation_build(wanted_runtime).map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
     let roformer_gpu = roformer_on_card(&state, wanted_runtime);
     if engine == separation::Engine::Roformer && !state.separator.roformer_installed(roformer_gpu) {
         return Err(api_error(StatusCode::BAD_REQUEST, "Mel-Band RoFormer is not installed yet: Settings - Models - Stems".into()));
     }
-    if engine == separation::Engine::Htdemucs && !state.separator.is_installed() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "the separation model is not installed yet".into()));
+    if engine == separation::Engine::Htdemucs && !htdemucs_installed(&state, wanted_runtime) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "HT-Demucs is not installed yet: Settings - Models - Stems".into()));
     }
     let audio_path = state
         .library
@@ -3307,11 +3305,11 @@ async fn start_separation(
 
     let model = state.separator.model_path();
     let config = state.separation_config.read().await.clone();
-    let overlap = config.sane_overlap();
     let wanted = config.stems.clone();
     let background = state.clone();
     let song_id = id.clone();
     let separator = state.separator.clone();
+    let acpp = state.acpp.clone();
     tokio::task::spawn_blocking(move || {
         let outcome = (|| -> anyhow::Result<(Vec<String>, bool)> {
             let audio = audio_pcm::decode_stereo_44k(&audio_path)?;
@@ -3326,15 +3324,7 @@ async fn start_separation(
                 }
                 return Ok((written, roformer_gpu));
             }
-            let handle = tokio::runtime::Handle::current();
-            let separated = separation::separate(&model, &audio, separation::STEMS.len(), overlap, card, |fraction| {
-                let state = background.clone();
-                handle.spawn(async move {
-                    if let Some(run) = state.separation_run.write().await.as_mut() {
-                        run.progress = fraction;
-                    }
-                });
-            })?;
+            let separated = separation::separate_htdemucs(&acpp, &model, &audio, build, &|| false)?;
             let mut written = Vec::new();
             let ran_on_gpu = separated.used_gpu;
             for stem in separated.stems {
@@ -3349,7 +3339,7 @@ async fn start_separation(
         })();
         // still on this thread: the stems are hundreds of megabytes to copy
         let model = if engine == separation::Engine::Roformer { "Mel-Band RoFormer" } else { "HT-Demucs" };
-        let library = outcome.as_ref().ok().map(|(stems, _)| stems_into_library(&background, &song_id, stems, overlap, model));
+        let library = outcome.as_ref().ok().map(|(stems, _)| stems_into_library(&background, &song_id, stems, model));
 
         let handle = tokio::runtime::Handle::current();
         handle.spawn(async move {
@@ -7008,9 +6998,13 @@ fn midi_size(asked: Option<&str>) -> Result<&'static midi::Size, (StatusCode, Js
 
 /// The transcriber, its model sizes, the download and the run.
 async fn midi_status(State(state): State<AppState>) -> Json<Value> {
+    let build = midi_build(&*state.engine_options.read().await);
     let sizes: Vec<Value> = midi::SIZES
         .iter()
-        .map(|size| serde_json::json!({ "id": size.id, "params": size.params, "bytes": size.bytes, "installed": state.midi.model_installed(size), "missing_bytes": state.midi.missing_bytes(size) }))
+        .map(|size| {
+            let missing = state.midi.missing_bytes(size) + build.as_ref().map(|build| acpp_missing_bytes(&state, *build)).unwrap_or(0);
+            serde_json::json!({ "id": size.id, "params": size.params, "bytes": size.bytes, "installed": state.midi.model_installed(size), "missing_bytes": missing })
+        })
         .collect();
     let run = state.midi_run.read().await.clone().map(|run| {
         let progress = run.progress();
@@ -7019,12 +7013,13 @@ async fn midi_status(State(state): State<AppState>) -> Json<Value> {
         value
     });
     Json(serde_json::json!({
-        "tool_installed": state.midi.tool_installed(),
+        "tool_installed": build.as_ref().is_ok_and(|build| state.midi.server_installed(*build)),
         "sizes": sizes,
         "default_size": preferred_midi_size(&state),
-        "download": state.midi.downloader().active().await,
+        "download": separation_download_progress(state.midi.downloader().active().await, state.acpp.downloader().active_for("midi").await),
         "run": run,
-        "license": "MuScriptor by Kyutai & Mirelo (arXiv:2607.08168): code MIT, weights CC BY-NC 4.0 - non-commercial use. Native port: HOT-Step-CPP ace-midi.",
+        "error": build.err().map(|error| error.to_string()),
+        "license": "MuScriptor by Kyutai & Mirelo (arXiv:2607.08168): code MIT, weights CC BY-NC 4.0 - non-commercial use. Run by audio.cpp.",
     }))
 }
 
@@ -7040,19 +7035,23 @@ struct MidiSizeRequest {
     size: Option<String>,
 }
 
-/// Downloads the transcriber and a model size ahead of the first use.
+/// Downloads audio.cpp's server and a model size ahead of the first use.
 async fn install_midi(State(state): State<AppState>, Json(input): Json<MidiSizeRequest>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let size = midi_size(input.size.as_deref())?;
+    let build = midi_build(&*state.engine_options.read().await).map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
     let missing = state.midi.missing(size);
-    if missing.is_empty() {
+    if missing.is_empty() && state.acpp.installed(build) {
         return Ok(Json(serde_json::json!({ "installed": true, "size": size.id })));
     }
-    let transcriber = state.midi.clone();
+    let background = state.clone();
     tokio::spawn(async move {
-        match transcriber.downloader().install_all("midi", &missing).await {
-            Ok(_) if transcriber.tool_installed() => transcriber.remove_older_tools(),
-            Ok(_) => {}
-            Err(error) => eprintln!("[ERROR] midi: download failed: {error:#}"),
+        if let Err(error) = background.midi.downloader().install_all("midi", &missing).await {
+            eprintln!("[ERROR] midi: download failed: {error:#}");
+            return;
+        }
+        if let Err(error) = install_acpp(&background, build, "midi").await {
+            eprintln!("[ERROR] midi: audio.cpp's server: {error:#}");
+            background.acpp.downloader().fail("midi", format!("{error:#}")).await;
         }
     });
     Ok(Json(serde_json::json!({ "started": true, "size": size.id })))
@@ -7069,6 +7068,7 @@ async fn cancel_midi(State(state): State<AppState>) -> Json<Value> {
     state.midi_stop.0.store(true, std::sync::atomic::Ordering::Relaxed);
     state.midi_stop.1.notify_waiters();
     state.midi.downloader().cancel();
+    state.acpp.downloader().cancel();
     Json(serde_json::json!({ "cancelled": true }))
 }
 
@@ -7213,162 +7213,71 @@ fn midi_stopped(state: &AppState) -> bool {
     state.midi_stop.0.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The device the transcriber computes on, as its `--device` names it: left to it (CUDA) where
-/// the engine runs the CUDA 13 build, else the processor - Pascal and Maxwell have no CUDA 13 code,
-/// AMD and Intel no CUDA, and its Vulkan path writes wrong notes.
-fn midi_device(options: &EngineOptions) -> &'static str {
-    use music_engine::yue_server::ComputeBackend;
-    // the macOS build carries Metal alone, which its own choice finds
-    if cfg!(target_os = "macos") {
-        return if options.backend == ComputeBackend::Cpu { "cpu" } else { "auto" };
-    }
-    match options.backend {
-        ComputeBackend::Cpu => "cpu",
-        _ if options.cuda_build() == Some(hardware::CudaBuild::Cuda13) => "auto",
-        _ => "cpu",
-    }
-}
-
 /// Fetches what is missing, reads the audio as the transcriber wants it and
-/// runs it, following its notes as they come. Returns how many it heard.
+/// runs it on audio.cpp's server. Returns how many notes it heard.
 async fn transcribe_to_midi(state: &AppState, size: &'static midi::Size, audio: &std::path::Path, output: &std::path::Path) -> anyhow::Result<usize> {
-    use tokio::io::AsyncBufReadExt;
+    let build = midi_build(&*state.engine_options.read().await)?;
     let missing = state.midi.missing(size);
-    if !missing.is_empty() {
+    if !missing.is_empty() || !state.acpp.installed(build) {
         // the first use fetches what the tool needs, as the karaoke recogniser does
         set_midi_stage(state, "downloading").await;
-        state.midi.downloader().install_all("midi", &missing).await.context("download the MIDI transcriber")?;
-        if midi_stopped(state) || !state.midi.missing(size).is_empty() {
+        state.midi.downloader().install_all("midi", &missing).await.context("download MuScriptor")?;
+        install_acpp(state, build, "midi").await.context("download audio.cpp's server")?;
+        if midi_stopped(state) || !state.midi.missing(size).is_empty() || !state.acpp.installed(build) {
             anyhow::bail!("stopped before everything the transcriber needs had arrived");
         }
-        state.midi.remove_older_tools();
     }
 
-    // WAV and MP3 go to the transcriber as they are: its own decoder is the
-    // one its port was checked against, and the model hears the difference.
-    // Anything else is decoded here to the 16 kHz mono it reads raw.
-    let native = audio.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| ["wav", "mp3"].contains(&extension.to_ascii_lowercase().as_str()));
-    let raw = if native {
+    // a WAV goes to the transcriber as it is; anything else is decoded here to a 16 kHz WAV
+    let native = audio.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
+    let work = state.midi.work_dir();
+    std::fs::create_dir_all(&work).with_context(|| format!("create {}", work.display()))?;
+    let decoded = if native {
         None
     } else {
         set_midi_stage(state, "reading").await;
-        let work = state.midi.work_dir();
-        std::fs::create_dir_all(&work).with_context(|| format!("create {}", work.display()))?;
-        let raw = work.join(format!("{}.f32", uuid::Uuid::now_v7().simple()));
-        let (from, to) = (audio.to_path_buf(), raw.clone());
+        let wav = work.join(format!("{}.wav", uuid::Uuid::now_v7().simple()));
+        let (from, to) = (audio.to_path_buf(), wav.clone());
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let samples = audio_pcm::decode_mono_16k(&from)?;
-            let bytes: Vec<u8> = samples.iter().flat_map(|sample| sample.to_le_bytes()).collect();
-            std::fs::write(&to, bytes).with_context(|| format!("write {}", to.display()))
+            audio_pcm::write_wav_f32(&to, &audio_post::Stereo { rate: 16_000, left: samples.clone(), right: samples })
         })
         .await??;
-        Some(raw)
+        Some(wav)
     };
 
     set_midi_stage(state, "transcribing").await;
-    let partial = PathBuf::from(format!("{}.part", output.display()));
     if let Some(folder) = output.parent() {
         std::fs::create_dir_all(folder).with_context(|| format!("create {}", folder.display()))?;
     }
-    let tool = state.midi.tool();
-    let device = midi_device(&*state.engine_options.read().await);
-    let mut command = tokio::process::Command::new(&tool);
-    if let Some(path) = music_core::process::own_libraries_first(&tool) {
-        command.env("LD_LIBRARY_PATH", path);
+    let input = decoded.clone().unwrap_or_else(|| audio.to_path_buf());
+    let model = state.midi.model_dir(size);
+    let id = acpp::muscriptor_id(size.id);
+    let background = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let server = background.acpp.server(build, acpp_server::ModelEntry::muscriptor(&id, &model))?;
+        acpp::run(&background.acpp, &server, &id, serde_json::json!({ "audio": input }), &|| midi_stopped(&background))
+    })
+    .await
+    .context("the transcriber stopped")?;
+    if let Some(wav) = &decoded {
+        let _ = std::fs::remove_file(wav);
     }
-    command
-        .arg("--device")
-        .arg(device)
-        .arg("--model")
-        .arg(state.midi.model_dir(size))
-        .arg(if raw.is_some() { "--transcribe-raw" } else { "--transcribe" })
-        .arg(raw.as_deref().unwrap_or(audio))
-        .arg("--out")
-        .arg(&partial)
-        .arg("--jsonl")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    // the CUDA runtime it imports lives beside the engine, as for the trainer
-    let mut paths = vec![engine_bundle_root()];
-    paths.extend(std::env::var_os("PATH").iter().flat_map(std::env::split_paths));
-    if let Ok(path) = std::env::join_paths(paths) {
-        command.env("PATH", path);
-    }
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-    let mut child = command.spawn().with_context(|| format!("start {}", tool.display()))?;
-    let stdout = child.stdout.take().context("the transcriber's output")?;
-    let stderr = child.stderr.take().context("the transcriber's errors")?;
-    let said = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<String>::new()));
-    let listener = {
-        let said = said.clone();
-        tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let mut said = said.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                said.push_back(line);
-                if said.len() > 20 {
-                    said.pop_front();
-                }
-            }
-        })
-    };
-
+    let result = result?;
+    let midi = acpp_server::task_artifact(&result, "midi")
+        .map_err(|error| anyhow::anyhow!("MuScriptor: {}", acpp::describe(&error)))?
+        .context("MuScriptor returned no MIDI")?;
     let mut events = midi::Events::default();
-    let mut lines = tokio::io::BufReader::new(stdout).lines();
-    let outcome: anyhow::Result<()> = loop {
-        if midi_stopped(state) {
-            break Err(anyhow::anyhow!("stopped"));
-        }
-        tokio::select! {
-            line = lines.next_line() => match line {
-                Ok(Some(line)) => {
-                    let chunks = events.chunks_done;
-                    events.take(&line);
-                    // the notes are handed on a piece at a time: every note of
-                    // a piece is closed by the time the next one starts
-                    if events.chunks_done != chunks || events.finished {
-                        *state.midi_notes.write().await = events.notes.clone();
-                        if let Some(run) = state.midi_run.write().await.as_mut() {
-                            run.chunks_done = events.chunks_done;
-                            run.chunks_total = events.chunks_total;
-                            run.notes = events.notes.len();
-                        }
-                    }
-                }
-                Ok(None) => break Ok(()),
-                Err(error) => break Err(error.into()),
-            },
-            _ = state.midi_stop.1.notified() => break Err(anyhow::anyhow!("stopped")),
-        }
-    };
-    if outcome.is_err() {
-        let _ = child.kill().await;
-    }
-    let status = child.wait().await.context("wait for the transcriber")?;
-    let _ = listener.await;
-    if let Some(raw) = &raw {
-        let _ = std::fs::remove_file(raw);
-    }
-    if let Err(error) = outcome {
-        let _ = std::fs::remove_file(&partial);
-        return Err(error);
-    }
-    if !status.success() || !events.finished {
-        let _ = std::fs::remove_file(&partial);
-        let said = said.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().cloned().collect::<Vec<_>>().join("\n");
-        // Windows' "a DLL was not found": a transcriber from before its backends were libraries
-        if status.code() == Some(-1073741515) {
-            anyhow::bail!("the transcriber could not load a library it needs; remove Audio to MIDI in Settings - Models and download it again: {said}");
-        }
-        anyhow::bail!("the transcriber stopped with {status} on {device}: {said}");
-    }
+    events.take_all(result.get("text").and_then(Value::as_str).unwrap_or_default()).map_err(|error| anyhow::anyhow!(error))?;
+    let partial = PathBuf::from(format!("{}.part", output.display()));
+    std::fs::write(&partial, &midi.payload).with_context(|| format!("write {}", partial.display()))?;
     std::fs::rename(&partial, output).with_context(|| format!("keep {}", output.display()))?;
     let sidecar = midi::Sidecar { size: size.id.to_string(), made_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|since| since.as_secs().to_string()).unwrap_or_default(), instruments: events.instruments(), notes: events.notes.clone() };
     std::fs::write(midi_sidecar(output), serde_json::to_vec(&sidecar)?).with_context(|| format!("write {}", midi_sidecar(output).display()))?;
     let heard = events.notes.len();
+    if let Some(run) = state.midi_run.write().await.as_mut() {
+        run.notes = heard;
+    }
     *state.midi_notes.write().await = events.notes;
     Ok(heard)
 }
@@ -8687,7 +8596,11 @@ async fn import_completed_result(state: &AppState, job: &MusicJob, job_id: &str)
         if vocals_only {
             let model = state.separator.model_path();
             let config = state.separation_config.read().await.clone();
-            let card = if config.engine == separation::Engine::Roformer { None } else { state.lyrics_sync.onnx_card(config.runtime)?.filter(|card| separates_on(*card)) };
+            let build = separation_build(config.runtime)?;
+            if config.engine == separation::Engine::Htdemucs && !htdemucs_installed(state, config.runtime) {
+                anyhow::bail!("HT-Demucs is the chosen separator and is not installed: Settings - Models - Stems");
+            }
+            let acpp = state.acpp.clone();
             let progress_state = state.clone();
             let progress_id = job_id.to_string();
             let roformer = (config.engine == separation::Engine::Roformer).then(|| (state.separator.clone(), roformer_on_card(state, config.runtime)));
@@ -8716,17 +8629,15 @@ async fn import_completed_result(state: &AppState, job: &MusicJob, job_id: &str)
                     audio_pcm::write_wav_f32(&output, &stereo)?;
                     return Ok((std::fs::read(output).context("read the extracted vocals")?, gpu));
                 }
-                let mut loaded = separation::load(&model, card)?;
-                if card.is_some() && !loaded.used_gpu { anyhow::bail!("The requested GPU separator could not load its execution provider; vocals extraction was stopped instead of running on CPU"); }
-                let separated = separation::separate_with_checked(&mut loaded, &samples, separation::STEMS.len(), config.sane_overlap(), |fraction| {
+                {
                     let mut jobs = progress_state.jobs.blocking_write();
-                    let active = jobs.get_mut(&progress_id).context("the vocals-only job no longer exists")?;
-                    if matches!(active.status, MusicJobStatus::Cancelled) { anyhow::bail!("Vocals extraction cancelled"); }
-                    active.status = MusicJobStatus::Running;
-                    active.phase = MusicJobPhase::ExtractingVocals;
-                    active.message = format!("Extracting vocals: {:.0}%", fraction * 100.0);
-                    Ok(())
-                })?;
+                    if let Some(active) = jobs.get_mut(&progress_id) {
+                        active.message = "Extracting vocals with HT-Demucs.".into();
+                    }
+                }
+                let cancelled = || progress_state.jobs.blocking_read().get(&progress_id).is_none_or(|active| matches!(active.status, MusicJobStatus::Cancelled));
+                let separated = separation::separate_htdemucs(&acpp, &model, &samples, build, &cancelled)
+                    .map_err(|error| if cancelled() { anyhow::anyhow!("Vocals extraction cancelled") } else { error })?;
                 let voice = separated.stems.into_iter().find(|stem| stem.name == "vocals").context("the separator returned no vocals")?;
                 let stereo = audio_post::Stereo {
                     rate: 44_100,
