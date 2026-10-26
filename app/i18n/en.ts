@@ -1219,7 +1219,7 @@ export const en = {
     studioTools: 'Studio tools',
     importAudioTab: 'Import',
     importAudioTitle: 'Import audio into the library',
-    importAudioHint: 'MP3, WAV, FLAC or OGG. Drop files here, or choose them.',
+    importAudioHint: 'MP3, WAV, FLAC, Ogg, M4A, AAC, AIFF, CAF, MKA. Drop files here, or choose them.',
     chooseFiles: 'Choose files',
     allSongs: 'All songs',
     maxBatchHint: 'Rendering more than one song per request needs a higher --max-batch in Settings → Local engine; the engine rejects requests above it.',

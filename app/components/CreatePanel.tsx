@@ -8,6 +8,7 @@ import {
 import { AudioWaveform } from './AudioWaveform';
 import type { Playlist, Song, YueCot, YueHarmony, YueOutputFormat, YueRequest, YueSampling } from '../types';
 import { useI18n } from '../context/I18nContext';
+import { AUDIO_ACCEPT } from '../services/audioFiles';
 import { saveFile } from '../services/saveFile';
 import { useBridgeCommand } from '../services/mcpBridge';
 import { EXAMPLES, randomExample } from '../services/examples';
@@ -1353,7 +1354,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
               <input
                 ref={audioFile}
                 type="file"
-                accept="audio/*,.mp3,.wav,.flac,.ogg,.m4a,.aiff,.aif"
+                accept={AUDIO_ACCEPT}
                 className="hidden"
                 onChange={event => {
                   const file = event.target.files?.[0];

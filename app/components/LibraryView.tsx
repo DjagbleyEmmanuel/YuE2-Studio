@@ -2,6 +2,7 @@ import React, { useRef, useState } from 'react';
 import { Song, Playlist } from '../types';
 import { Heart, Plus, Play, Upload, Loader2, MoreHorizontal, ListMusic } from 'lucide-react';
 import { useI18n } from '../context/I18nContext';
+import { AUDIO_ACCEPT } from '../services/audioFiles';
 import { useSongActions } from '../context/SongActionsContext';
 import { deleteNativePlaylist } from '../services/nativeLibrary';
 import { updateLibraryPlaylists } from '../services/studioQueries';
@@ -339,7 +340,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                      <input
                          ref={importInput}
                          type="file"
-                         accept="audio/mpeg,audio/wav,audio/flac,audio/ogg,.mp3,.wav,.flac,.ogg"
+                         accept={AUDIO_ACCEPT}
                          multiple
                          className="hidden"
                          onChange={(event) => { void importAudio(event.target.files); event.target.value = ''; }}
