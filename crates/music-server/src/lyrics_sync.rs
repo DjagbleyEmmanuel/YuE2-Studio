@@ -1166,9 +1166,6 @@ pub const PARAKEET_V3: &str = "parakeet-tdt-int8";
 pub const PARAKEET_ULTRA: &str = "parakeet-ultra-int8";
 pub const PARAKEET_FP32: &str = "parakeet-tdt-fp32";
 
-/// The folders of the ONNX Parakeet of 3.6 and earlier, under the karaoke folder.
-const RETIRED_PARAKEET: [&str; 3] = ["models/parakeet", "models/parakeet-fp32", "models/parakeet-ultra"];
-
 /// Where each transcribe.cpp build lands in the karaoke folder: `dub_tcpp::engine_dir` and its library.
 #[cfg(windows)]
 const TCPP_CUDA: &str = "models/transcribe-engine/transcribe_engine.dll";
@@ -1265,21 +1262,6 @@ pub struct LyricsSync {
 impl LyricsSync {
     pub fn new(data_root: &Path) -> Self {
         Self { downloader: Downloader::new(data_root.join("karaoke")), cuda_libraries: std::sync::OnceLock::new() }
-    }
-
-    /// Removes the Parakeet models of before transcribe.cpp (ONNX: v3 int8, fp32, Ultra), which nothing reads any
-    /// more, so they keep no gigabytes that no row of the models page shows - as Dub Studio does. A link (another
-    /// program's folder linked in) loses only the link; a hard-linked file stays with the program that shares it.
-    pub fn remove_retired_parakeet(&self) {
-        for folder in RETIRED_PARAKEET {
-            let path = self.downloader.root().join(folder);
-            let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-            let removed = if meta.file_type().is_symlink() { fs::remove_dir(&path).or_else(|_| fs::remove_file(&path)) } else { fs::remove_dir_all(&path) };
-            match removed {
-                Ok(()) => eprintln!("removed the retired Parakeet {}", path.display()),
-                Err(error) => eprintln!("[ERROR] could not remove the retired Parakeet {}: {error}", path.display()),
-            }
-        }
     }
 
     /// The folder of the cuBLAS 13 the music engine runs on: transcribe.cpp's CUDA build takes links to it.
@@ -2489,24 +2471,6 @@ mod live_recognition {
         assert!(at(3) > at(2) && at(3) < at(4), "an unheard line sits between its neighbours: {lines:?}");
         assert!((at(4) - 20.0).abs() < 0.6, "the second verse is where it was sung: {lines:?}");
         assert!((at(6) - 33.0).abs() < 0.6 && (at(7) - 36.0).abs() < 0.6, "the second chorus is its own: {lines:?}");
-    }
-
-    #[test]
-    fn the_onnx_parakeet_goes_and_transcribe_cpp_stays() {
-        let root = tempfile::tempdir().unwrap();
-        let sync = LyricsSync::new(root.path());
-        let karaoke = root.path().join("karaoke");
-        for folder in RETIRED_PARAKEET {
-            fs::create_dir_all(karaoke.join(folder)).unwrap();
-            fs::write(karaoke.join(folder).join("encoder-model.int8.onnx"), b"x").unwrap();
-        }
-        let kept = karaoke.join("models/asr-gguf-parakeet-v3/parakeet-tdt-0.6b-v3-Q8_0.gguf");
-        fs::create_dir_all(kept.parent().unwrap()).unwrap();
-        fs::write(&kept, b"x").unwrap();
-        sync.remove_retired_parakeet();
-        assert!(RETIRED_PARAKEET.iter().all(|folder| !karaoke.join(folder).exists()));
-        assert!(kept.is_file());
-        sync.remove_retired_parakeet();
     }
 
     #[test]
