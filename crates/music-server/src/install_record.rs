@@ -37,10 +37,10 @@ pub struct RecordedFile {
 /// archive that tells its version apart, relative to where the archive
 /// unpacks or picks into, and that file's size in the archive of the pin.
 const KEY_FILES: &[(&str, &str, u64)] = &[
-    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cuda-13.4-x64.zip", "llama-server-impl.dll", 9_684_992),
-    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cuda-12.4-x64.zip", "llama-server-impl.dll", 9_684_992),
-    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-vulkan-x64.zip", "llama-server-impl.dll", 9_684_992),
-    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cpu-x64.zip", "llama-server-impl.dll", 9_684_992),
+    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cuda-13.4-x64.zip", "ggml-cuda.dll", 154_890_752),
+    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cuda-12.4-x64.zip", "ggml-cuda.dll", 593_773_568),
+    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-vulkan-x64.zip", "ggml-vulkan.dll", 41_590_784),
+    ("https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cpu-x64.zip", "ggml-cpu-haswell.dll", 1_426_944),
     ("https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-win-x64-1.31.0.zip", "onnxruntime.dll", 17_253_176),
     ("https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-win-x64-gpu_cuda12-1.31.0.zip", "onnxruntime_providers_cuda.dll", 366_181_728),
     ("https://github.com/ggml-org/llama.cpp/releases/download/b11236/cudart-llama-bin-win-cuda-13.4-x64.zip", "cudart64_13.dll", 551_024),
@@ -210,5 +210,17 @@ mod tests {
         assert_ne!(llama, 8_917_504, "b11236's llama-server-impl.dll");
         let (_, onnx) = key_file("https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-win-x64-1.31.0.zip").unwrap();
         assert_ne!(onnx, 16_462_648, "1.30.0's onnxruntime.dll");
+    }
+
+    /// No two pinned archives share a key: a key file at its size names one build, so another build unpacked in its
+    /// place is not taken for it.
+    #[test]
+    fn the_keys_of_different_archives_differ() {
+        for (index, (url, file, size)) in KEY_FILES.iter().enumerate() {
+            for (other, other_file, other_size) in &KEY_FILES[index + 1..] {
+                assert!(url != other, "{url} is listed twice");
+                assert!((file, size) != (other_file, other_size), "{url} and {other} share the key {file} of {size} bytes");
+            }
+        }
     }
 }

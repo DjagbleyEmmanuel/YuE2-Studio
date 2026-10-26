@@ -1020,7 +1020,7 @@ mod tests {
         }
     }
 
-    /// A 3.7.0 install keeps llama.cpp b11236 without a record: it is not taken for today's pin and is fetched
+    /// A 3.7.0 install keeps an earlier llama.cpp without a record: it is not taken for today's pin and is fetched
     /// again; the same folder with today's build is taken and its record written.
     #[cfg(windows)]
     #[test]
@@ -1028,15 +1028,15 @@ mod tests {
         let temp = std::env::temp_dir().join(format!("assistant-runtime-{}", uuid::Uuid::now_v7()));
         let runtime = AssistantRuntime::new(&temp);
         let server = asset("llama-cpu").expect("the processor build");
+        let (key, pinned) = crate::install_record::key_file(server.url).expect("the pin names its key file");
         let directory = runtime.root.join("runtime").join(server.unzip_into.unwrap());
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("llama-server.exe"), b"server").unwrap();
-        let impl_dll = fs::File::create(directory.join("llama-server-impl.dll")).unwrap();
-        impl_dll.set_len(8_917_504).unwrap();
-        assert!(!runtime.is_installed(server), "b11236's library is another build");
-        let (_, pinned) = crate::install_record::key_file(server.url).expect("the pin names its key file");
-        impl_dll.set_len(pinned).unwrap();
-        drop(impl_dll);
+        let library = fs::File::create(directory.join(key)).unwrap();
+        library.set_len(pinned + 4096).unwrap();
+        assert!(!runtime.is_installed(server), "an earlier build's library is another size");
+        library.set_len(pinned).unwrap();
+        drop(library);
         assert!(runtime.is_installed(server), "today's build without a record is taken");
         assert!(runtime.record_of(server).is_file(), "and its record is written");
         fs::remove_dir_all(temp).unwrap();
