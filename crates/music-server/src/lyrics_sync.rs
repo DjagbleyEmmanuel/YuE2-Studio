@@ -1391,6 +1391,7 @@ impl LyricsSync {
     /// binds one build on first use, so it is chosen by the machine, not by a
     /// setting: the build for this machine's card when every file of it is
     /// there - it carries the processor provider too - else the processor build.
+    /// Only a build at today's pin counts: an earlier one left on disk is not loaded.
     pub fn machine_runtime(&self) -> Option<(PathBuf, Option<OnnxCard>)> {
         let cuda = self.downloader.runtime_dir("onnx-cuda").join(libraries::ORT);
         let directml = self.downloader.runtime_dir("onnx-dml").join(libraries::ORT);
@@ -1400,13 +1401,21 @@ impl LyricsSync {
             Some(OnnxCard::DirectMl) if self.has_directml_libraries() => return Some((directml, Some(OnnxCard::DirectMl))),
             _ => {}
         }
-        [cpu, cuda, directml].into_iter().find(|library| library.is_file()).map(|library| (library, None))
+        [(cpu, "onnxruntime"), (cuda, "onnxruntime-cuda"), (directml, "onnxruntime-directml")]
+            .into_iter()
+            .find(|(library, id)| library.is_file() && self.pinned(&[id]))
+            .map(|(library, _)| (library, None))
     }
 
-    /// The DirectML build and the DirectML it is built for, side by side.
+    /// Whether every one of these downloads is installed at today's pin.
+    fn pinned(&self, ids: &[&str]) -> bool {
+        ids.iter().all(|id| asset(id).is_some_and(|asset| self.downloader.is_installed(asset)))
+    }
+
+    /// The DirectML build and the DirectML it is built for, side by side, at today's pins.
     pub fn has_directml_libraries(&self) -> bool {
         let dir = self.downloader.runtime_dir("onnx-dml");
-        [libraries::ORT, libraries::ORT_SHARED, "DirectML.dll"].iter().all(|name| dir.join(name).is_file())
+        [libraries::ORT, libraries::ORT_SHARED, "DirectML.dll"].iter().all(|name| dir.join(name).is_file()) && self.pinned(&DIRECTML_ASSETS)
     }
 
     /// Whether every library the card's provider needs is installed.
@@ -1449,10 +1458,10 @@ impl LyricsSync {
 
     /// The CUDA provider is a separate library, and it in turn needs cuBLAS and
     /// cuDNN beside it. Without all of them the provider refuses to load and the
-    /// run silently lands on the processor.
+    /// run silently lands on the processor. All of them at today's pins.
     pub fn has_cuda_libraries(&self) -> bool {
         let dir = self.downloader.runtime_dir("onnx-cuda");
-        libraries::CUDA.iter().all(|name| dir.join(name).is_file())
+        libraries::CUDA.iter().all(|name| dir.join(name).is_file()) && self.pinned(CUDA_ASSETS)
     }
 
     /// A model counts as present only with every one of its files: a directory
