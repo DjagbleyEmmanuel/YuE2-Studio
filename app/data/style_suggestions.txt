@@ -1,42 +1,18 @@
-16-bit
-2-step
 808
 accelerating
-acid house
-acid techno
-acid trance
-acoustic chicago blues
 acoustic guitar
 acoustic piano
-acoustic rock
-acoustic texas blues
 active electric bass
-african folk
-afrikaner folk
-afro house
-afro trap
-afro-cuban jazz
-afro-funk
-afro-jazz
-afro-rock
-afrobeat
-afropiano
-afroswing
 aggressive
 airy reverb and delay
-algorave
-alternative R&B
-alternative rock
 alto recorder
 ambient
-ambient techno
 andalusian accent
 angsty
 anime
 anime opening
 anthemic
 anthemic crowd vocals
-anti-folk
 anticipation
 AOR classic rock
 appalachian revival feel
@@ -45,8 +21,6 @@ atmosphere
 atmospheric
 autotune
 autotune accents
-avant-garde jazz
-bachata
 background vocals
 ballad
 ballad pop
@@ -55,17 +29,12 @@ baritone
 bass
 bass clarinet
 bass pattern
-bedroom pop
 belted vocals
 bicycle horn
-bluegrass
 blues
-blues rock
 bold
-boogie
 boogie piano
 boogie-woogie piano
-bossa nova
 bouncing
 brass punches
 bright
@@ -73,24 +42,13 @@ bright close chords
 bright steelpan
 bright tone
 brushed drums
-bubblegum bass
-bubblegum dance
-cabaret
-cajun
 call and response vocals
-cape verdean
 carefree summer energy
-caribbean
-carnatic
 catchy
 catchy chant hook
 cathedral choir swells
 celebratory
 cello
-celtic
-chanson
-chillstep
-chillsynth
 chinese epic rock
 chinese pop
 chinese traditional folk
@@ -103,11 +61,9 @@ clarinet
 classic
 classic country
 classic rock
-classical
 clean guitar chord stabs
 clean pop drum groove
 close-mic
-cloud rap
 club anthem
 comedic
 comedy rock
@@ -115,45 +71,34 @@ comfortable
 congas
 contemporary christian
 contemporary country
-coptic
 country
 crisp hi-hats
 crowd-shout hooks
-cumbia
 cute
 cyberpunk atmosphere
 cymbals
-dance
 dance music
 dance pop
 dance-floor fire
 danceable
-dancehall
 dark cabaret
 decelerating
 deep sub-bass
-dembow
-dirty south
 disco
 distorted guitars
 DJ
 double-kick drums
 dramatic
 dramatic crescendos
-dream pop
 dreamy
-drill
 driving bass
 driving palm-muted electric guitars
 driving rhythm
 driving rhythm section
 drum kit
 drums
-dubstep
 duet
 dynamic
-EDM
-egyptian
 electric guitar
 electric guitar chords
 electric piano
@@ -198,22 +143,16 @@ funky bass
 funky house
 fusion
 futuristic
-garage
 gentle filter movement
 gentle rhythm
-gnawa
-goa trance
 good time country
 gorgeous
 grand piano
-grime
-griot
 gritty english lead vocal
 groovy
 groovy bass
 groovy soulful jazz-funk
 growling
-grunge
 guitar
 guitar solo
 halftime bridge switch
@@ -230,16 +169,11 @@ heavy drums
 heavy metal
 heavy metal rock
 high tenor
-hip hop
 honking sax section
 honky tonk
 honky-tonk piano
-house
 humorous
 husky voice
-hyphy
-illbient
-indie
 infectious finish
 inspiring
 instrumental
@@ -252,25 +186,19 @@ j-eurobeat
 j-heavymetal
 j-pop
 japanese
-jazz
 jazz ballad
 jazz fusion
 jazz manouche
 joyful
 joyful energy
 joyful male harmonies
-jungle
-k-pop
-kawaii future bass
 keyboard
-klezmer
 latin pop
 layered but spacious
 layered harmonies
 layered vocal harmonies
 less drum
 light pop
-liquid drum and bass
 live vocal style
 lively fiddle
 lush orchestral strings
@@ -283,8 +211,6 @@ male voice
 mandarin
 mandarin child-and-adult unison vocals
 mandolin
-mariachi
-math rock
 mediterranean vibe
 medium beat
 medium tempo
@@ -292,7 +218,6 @@ medium tempo southern gospel
 melodic
 melodic bassline
 melodic rap
-merengue
 metal
 metallic vocal fx
 mezzo-soprano female
@@ -303,7 +228,6 @@ minor-key chamber folk
 moderate groove
 modern flamenco rap fusion
 modern rock
-motown
 muffled female vocals
 muted trumpet
 nature
@@ -312,16 +236,12 @@ neon light
 neon pads
 neon-lit night drive
 new age
-new jack swing
 new orleans brass-funk
-new wave
 nostalgic
 obsessive
 orchestra jazz
 overdriven guitar
 overdriven organ
-p-funk
-pacific reggae
 pad
 palm-muted guitar riff
 palm-muted riffs
@@ -336,8 +256,6 @@ playful
 playful mandarin duet
 playful piano
 polished and warm
-polka
-pop
 pop ballad
 pop music
 pop vocal
@@ -353,13 +271,10 @@ punchy rock drums
 punk
 R&B
 R&B hook
-raga
-rap
 rap vocals
 rapid hi-hats
 reflective bridge
 reflective vocal phrase
-reggae
 reggaeton
 retro
 retro-futuristic euphoria
@@ -367,15 +282,10 @@ rhythm guitar
 rhythmic
 rhythmic sense
 risers
-rock
-rockabilly
 romantic
 romantic danceable
 room reverb
 rubbery bass
-rumba
-salsa
-samba
 satirical mood
 saxophone
 second-line drums
@@ -387,7 +297,6 @@ shimmering guitars
 shiny archtop chops
 simple and memorable
 simple drums
-ska
 sleigh bells
 slow
 slow tempo
@@ -402,13 +311,11 @@ soft and bright
 soft and slightly fragile
 soft low-pass
 solo
-soul
 soul music
 soul-blues
 soulful
 soulful and lively
 sousaphone
-southern rock
 southern soul
 spirited
 spiritual
@@ -426,15 +333,10 @@ sub-bass
 subtle chorus width
 sung-rap verses in punjabi
 super eurobeat
-surf
-surf rock
 surprise
-swamp blues
 sweet vibe
-swing
 swing jazz
 swirling arps
-symphonic metal
 symphony
 syncopated acoustic guitar
 syncopated claps
@@ -444,8 +346,6 @@ synth stabs
 synth-pop
 synth-pop production
 synthesizer
-synthwave
-tango
 teen pop
 tenor
 tenor saxophone
@@ -453,13 +353,10 @@ theatrical hard rock
 tight live rhythm section
 tight punchy kick
 toy piano
-trance
-trap
 trio vocals
 triumph
 trombone and baritone sax
 trumpet stabs
-tuareg
 UK garage bounce
 UK pop rap
 unhurried phrasing
