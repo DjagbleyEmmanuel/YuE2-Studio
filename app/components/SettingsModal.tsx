@@ -4,7 +4,7 @@ import { BarChart3, Boxes, Cloud, Cpu, Image as ImageIcon, Info, Monitor, Plug, 
 import { SiGithub } from '@icons-pack/react-simple-icons';
 import { useAuth } from '../context/AuthContext';
 import { useI18n } from '../context/I18nContext';
-import type { Language } from '../i18n/translations';
+import { LANGUAGE_NAMES, type Language } from '../i18n/translations';
 import { ProviderSettings } from './ProviderSettings';
 import { EngineSettings } from './EngineSettings';
 import { SetupGate } from './SetupGate';
@@ -43,9 +43,6 @@ interface SettingsModalProps {
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
 }
-
-/** Each window language by its own name, whatever language the window is in: a reader looks for the name they read. */
-export const WINDOW_LANGUAGES: [Language, string][] = [['ru', 'Русский'], ['en', 'English'], ['zh', '简体中文'], ['ja', '日本語'], ['ko', '한국어']];
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, initialSection, onClose, theme, onToggleTheme }) => {
   const { user, setDisplayName } = useAuth();
@@ -190,7 +187,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, initialSec
                     </div>
                   </div>
                   <select value={language} onChange={(event) => setLanguage(event.target.value as Language)} className={INPUT}>
-                    {WINDOW_LANGUAGES.map(([code, name]) => <option key={code} value={code} lang={code}>{name}</option>)}
+                    {(Object.entries(LANGUAGE_NAMES) as [Language, string][]).map(([code, name]) => (
+                      <option key={code} value={code} lang={code}>{name}</option>
+                    ))}
                   </select>
                 </div>
 
