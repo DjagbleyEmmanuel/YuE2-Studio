@@ -339,6 +339,8 @@ export const en = {
     fxDesc_letterbox: 'Cinematic bars',
     textContent: 'Text content',
     downloadLrc: 'Download LRC (Lyrics)',
+    downloadSrt: 'Download SRT (subtitles)',
+    downloadSrtHint: 'The same timings as subtitles, for video editors that import SRT and not LRC (CapCut, Jianying, Premiere): each line runs until the next one starts.',
 
     // Video Studio
     videoStudio: 'Video Studio',

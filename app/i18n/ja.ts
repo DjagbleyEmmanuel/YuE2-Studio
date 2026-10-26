@@ -1450,6 +1450,8 @@ export const ja = {
     generateCoverPreview: 'カバーのプレビューを生成',
     noSongsYet: 'まだ曲がありません。',
     noLyrics: '歌詞なし',
+    downloadSrt: 'SRT（字幕）をダウンロード',
+    downloadSrtHint: '同じタイミングを字幕として書き出します。LRC ではなく SRT を読み込む動画編集ソフト（CapCut、Jianying、Premiere）向けで、各行は次の行が始まるまで表示されます。',
     noLyricsSaved: '歌詞が保存されていません',
     closeNotification: '通知を閉じる',
     displayNameHint: 'この名前はこのマシンにのみ保存され、スタジオの表示に使われます。',

@@ -56,6 +56,32 @@ export function parseLrc(lrcContent: string): LrcLine[] {
   return lines.sort((a, b) => a.time - b.time);
 }
 
+
+/** How long the last line stays on screen: an SRT cue needs an end, and nothing follows it. */
+const LAST_SRT_LINE_SECONDS = 3;
+
+function srtTime(seconds: number): string {
+  const total = Math.max(0, Math.round(seconds * 1000));
+  const pad = (value: number, width = 2) => String(value).padStart(width, '0');
+  return `${pad(Math.floor(total / 3_600_000))}:${pad(Math.floor(total / 60_000) % 60)}:${pad(Math.floor(total / 1000) % 60)},${pad(total % 1000, 3)}`;
+}
+
+/**
+ * The karaoke timings as SubRip subtitles, which video editors import where
+ * they do not take LRC: each sung line runs until the next one starts, the
+ * last for a few seconds. Section tags are not subtitles.
+ */
+export function lrcToSrt(lrcContent: string): string {
+  const sung = parseLrc(lrcContent).filter((line) => !line.isSection);
+  return sung
+    .map((line, index) => {
+      const next = sung.slice(index + 1).find((later) => later.time > line.time);
+      const end = next ? next.time : line.time + LAST_SRT_LINE_SECONDS;
+      return `${index + 1}\n${srtTime(line.time)} --> ${srtTime(end)}\n${line.text}\n`;
+    })
+    .join('\n');
+}
+
 /**
  * Find the current lyric line based on playback time.
  * Returns index of current line, or -1 if before first line.
