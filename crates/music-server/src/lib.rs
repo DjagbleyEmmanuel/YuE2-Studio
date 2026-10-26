@@ -2607,7 +2607,9 @@ async fn read_training(State(state): State<AppState>) -> Json<Value> {
         })
         .collect();
     let (pack, separator_ready) = training_pack_files(&state).await;
-    let listen_download = training.downloader().active_for(training::LISTEN_SCOPE).await.filter(|active| !active.done);
+    let listen_download = listen_download(&state).await.filter(|active| !active.done || active.error.is_some());
+    let listen_pack = listen_files(&state);
+    let listen_ready = listen_pack.iter().all(|file| file["installed"].as_bool() == Some(true));
     Json(serde_json::json!({
         "pack": pack,
         "pack_ready": training.pack_ready() && !trainer_cublas_missing(&state),
@@ -2621,8 +2623,8 @@ async fn read_training(State(state): State<AppState>) -> Json<Value> {
         "item_style": "style",
         "download": training_pack_download(&state).await,
         "listen": {
-            "pack": training.listen_status(),
-            "ready": training.listen_ready() && state.lyrics_sync.onnxruntime_library().is_some(),
+            "pack": listen_pack,
+            "ready": listen_ready,
             "download": listen_download,
         },
         "prepare": state.prepare.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone(),
@@ -2704,9 +2706,29 @@ async fn training_pack_runtime(State(state): State<AppState>) -> Json<Value> {
 
 /// The listening pack on the models page.
 async fn listen_pack_runtime(State(state): State<AppState>) -> Json<Value> {
-    let training = &state.training;
-    let ready = training.listen_ready() && state.lyrics_sync.onnxruntime_library().is_some();
-    Json(pack_runtime(training.listen_status(), ready, training.downloader().active_for(training::LISTEN_SCOPE).await))
+    let files = listen_files(&state);
+    let ready = files.iter().all(|file| file["installed"].as_bool() == Some(true));
+    Json(pack_runtime(files, ready, listen_download(&state).await))
+}
+
+/// The listening pack's files and the ONNX Runtime its tempo model runs on: a
+/// pack whose files are all here still waits for that runtime, and says so.
+fn listen_files(state: &AppState) -> Vec<Value> {
+    let mut files = state.training.listen_status();
+    if let Some(runtime) = lyrics_sync::asset("onnxruntime") {
+        files.push(serde_json::json!({ "id": runtime.id, "label": runtime.label, "bytes": runtime.bytes, "installed": state.lyrics_sync.onnxruntime_library().is_some() }));
+    }
+    files
+}
+
+/// The listening pack's download: its own files, else the ONNX Runtime fetched after them.
+async fn listen_download(state: &AppState) -> Option<downloads::DownloadProgress> {
+    let pack = state.training.downloader().active_for(training::LISTEN_SCOPE).await;
+    let runtime = state.lyrics_sync.downloader().active_for(training::LISTEN_SCOPE).await;
+    match (pack, runtime) {
+        (Some(pack), Some(runtime)) if pack.done && pack.error.is_none() => Some(runtime),
+        (pack, runtime) => pack.or(runtime),
+    }
 }
 
 /// Audio to MIDI on the models page: the transcriber, and its sizes as one
@@ -2755,18 +2777,21 @@ async fn install_training_pack(State(state): State<AppState>) -> Result<Json<Val
 }
 
 /// The optional listening pack, and the ONNX Runtime its tempo model runs
-/// on when nothing else has brought it yet.
+/// on when nothing else has brought it yet. A failure is the pack's download
+/// failing, shown where its progress is.
 async fn install_listen_pack(State(state): State<AppState>) -> Json<Value> {
     let background = state.clone();
     tokio::spawn(async move {
         if let Err(error) = background.training.install_listen().await {
             eprintln!("[ERROR] listening pack: {error:#}");
+            background.training.downloader().fail(training::LISTEN_SCOPE, format!("{error:#}")).await;
             return;
         }
         if background.lyrics_sync.onnxruntime_library().is_none() {
             let runtime: Vec<&'static lyrics_sync::Asset> = lyrics_sync::asset("onnxruntime").into_iter().collect();
-            if let Err(error) = background.lyrics_sync.downloader().install_all("listen", &runtime).await {
+            if let Err(error) = background.lyrics_sync.downloader().install_all(training::LISTEN_SCOPE, &runtime).await {
                 eprintln!("[ERROR] ONNX Runtime for the listening pack: {error:#}");
+                background.lyrics_sync.downloader().fail(training::LISTEN_SCOPE, format!("ONNX Runtime: {error:#}")).await;
             }
         }
     });
