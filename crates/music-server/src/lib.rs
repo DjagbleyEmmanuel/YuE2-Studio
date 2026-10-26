@@ -745,7 +745,7 @@ impl EngineOptions {
         }
         // Off Windows the engine is a single native build whose ggml loads its
         // own best device - Metal on Apple Silicon - so Auto asks the engine
-        // to choose (no GGML_BACKEND is set) and only falls back to the
+        // to choose (no --device is passed) and only falls back to the
         // processor if that start fails.
         #[cfg(not(windows))]
         {
@@ -4655,11 +4655,17 @@ async fn restart_engine(state: &AppState) -> Result<(), String> {
                 return Ok(());
             }
             Err(error) => {
-                last_error = format!("the local engine did not start: {error}");
+                let run = last_run_log();
+                last_error = match absent_device(&run) {
+                    Some((name, available)) => format!(
+                        "The engine has no device {name} on this computer; it sees {available}. Choose Auto in Settings, Engine, or one of those devices."
+                    ),
+                    None => format!("the local engine did not start: {error}"),
+                };
                 // Only Auto moves on, and never past a card that ran out of
                 // memory: Vulkan has no more of it, and the reason is shown.
                 let next = chain.get(index + 1).copied();
-                let log = last_run_log().to_lowercase();
+                let log = run.to_lowercase();
                 let out_of_memory = describes_exhausted_memory(&log) || describes_exhausted_ram(&log);
                 match next {
                     Some(next) if options.backend == music_engine::yue_server::ComputeBackend::Auto && !out_of_memory => {
@@ -4696,6 +4702,16 @@ fn last_run_log() -> String {
     tail[start..].join("\n")
 }
 
+/// The device the engine was told to use and did not find, with the devices
+/// it lists instead: `--device CUDA0 not found. Available: Vulkan0 CPU`.
+fn absent_device(log: &str) -> Option<(String, String)> {
+    log.lines().rev().find_map(|line| {
+        let (_, rest) = line.split_once("--device ")?;
+        let (name, available) = rest.split_once(" not found. Available:")?;
+        Some((name.trim().to_string(), available.trim().replace(' ', ", ")))
+    })
+}
+
 /// The engine log of the run before the current one: after a restart, the
 /// run that ended is where the reason is.
 fn previous_run_log() -> String {
@@ -4724,9 +4740,19 @@ fn lost_job_reason(log: &str) -> SongError {
         SongError::LostRam
     } else if describes_device_failure(&lowered) {
         SongError::LostDevice(device_error_line(log))
+    } else if let Some(exit) = engine_exit(log) {
+        SongError::LostExited { exit, line: last_engine_line(log) }
     } else {
         last_engine_line(log).map_or(SongError::Lost, SongError::LostAtLine)
     }
+}
+
+/// The exit code of the engine that ended, as the supervisor noted it in the
+/// log when it found the process gone: `... had already exited: exit code: 0xc000001d (0xc000001d)`.
+fn engine_exit(log: &str) -> Option<String> {
+    let line = log.lines().rev().find(|line| line.contains("had already exited:") || line.contains("had exited:"))?;
+    let code = line.rsplit_once("(0x")?.1.trim_end_matches(')').trim().to_lowercase();
+    (!code.is_empty() && code.chars().all(|c| c.is_ascii_hexdigit())).then(|| format!("0x{code}"))
 }
 
 /// The last thing the engine wrote before it went: a process the driver ends says nothing, and the stage it was
@@ -7862,7 +7888,7 @@ async fn free_the_card_for_the_engine(state: &AppState) {
 /// A card that ran out of memory says so in the log and then the process is
 /// gone; the studio saw only a refused connection, and told the user to
 /// download models that were already on disk.
-fn engine_failure_reason(state: &AppState, job_id: &str) -> Option<SongError> {
+fn engine_failure_reason(job_id: &str) -> Option<SongError> {
     let tail = music_engine::yue_server::startup_log_tail(80).join("\n").to_lowercase();
     if describes_exhausted_memory(&tail) {
         return Some(SongError::LoadVram);
@@ -7870,9 +7896,13 @@ fn engine_failure_reason(state: &AppState, job_id: &str) -> Option<SongError> {
     if describes_exhausted_ram(&tail) {
         return Some(SongError::LoadRam);
     }
-    let lines = state.engine_log.lines()?;
-    first_fatal(&lines, job_id).map(SongError::from_fatal)
+    // the engine's log file, not the window's last lines: a song with LoRA logs
+    // hundreds of lines and pushes its own start out of those
+    first_fatal(&music_engine::yue_server::startup_log_tail(JOB_LOG_LINES), job_id).map(SongError::from_fatal)
 }
+
+/// How far back in the engine's log a failed job's own start is looked for.
+const JOB_LOG_LINES: usize = 20_000;
 
 /// What the engine said when it gave this job up: the first FATAL line after the
 /// job's own start, without the stage tag. The lines after it are its consequences.
@@ -8467,7 +8497,7 @@ async fn follow_job(state: &AppState, job_id: &str, started: &mut Option<Option<
                 return;
             }
             // a stop asked for while the engine was being polled stays a stop
-            let failure = (remote.status == "failed").then(|| engine_failure_reason(&state, &job_id)).flatten();
+            let failure = (remote.status == "failed").then(|| engine_failure_reason(&job_id)).flatten();
             if let Some(job) = state.jobs.write().await.get_mut(&job_id).filter(|job| !matches!(job.status, MusicJobStatus::Cancelled)) {
                 apply_remote_status(job, &remote.status, failure);
             }
@@ -8731,7 +8761,7 @@ async fn cancel_music_job(
     let remote = state.music_server.cancel(&job_id).await.map_err(|error| {
         api_error(StatusCode::SERVICE_UNAVAILABLE, format!("the engine did not accept the cancel: {error}"))
     })?;
-    let failure = (remote.status == "failed").then(|| engine_failure_reason(&state, &job_id)).flatten();
+    let failure = (remote.status == "failed").then(|| engine_failure_reason(&job_id)).flatten();
     let mut jobs = state.jobs.write().await;
     let job = jobs
         .get_mut(&job_id)
@@ -9000,7 +9030,7 @@ async fn score_job_status(
             job.lm_seed = lm_seed;
             job.plans = plans_from_result(&result.content_type, &result.body).map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
         }
-        "failed" => job.error = Some(engine_failure_reason(&state, &job_id).map_or_else(|| "The engine could not write this score.".into(), |reason| reason.to_string())),
+        "failed" => job.error = Some(engine_failure_reason(&job_id).map_or_else(|| "The engine could not write this score.".into(), |reason| reason.to_string())),
         _ => {}
     }
     Ok(Json(job))
@@ -9715,6 +9745,28 @@ mod tests {
         assert_eq!(listed["replay_available"], true);
         assert_eq!(listed_song(&song(Some(serde_json::json!({ "abc": "X:1" })), Some(Value::Null))).unwrap()["replay_available"], false);
         assert_eq!(listed_song(&song(None, None)).unwrap()["replay_available"], false);
+    }
+
+    /// yue2.cpp `backend_set_device` prints this line before it exits.
+    #[test]
+    fn a_device_the_engine_does_not_have_is_named_with_the_ones_it_has() {
+        let log = "[studio] ---- starting yue-server ----\n--device CUDA0 not found. Available: Vulkan0 Vulkan1 CPU\n";
+        assert_eq!(absent_device(log), Some(("CUDA0".to_string(), "Vulkan0, Vulkan1, CPU".to_string())));
+        assert_eq!(absent_device("[Server] Listening on 127.0.0.1:18087"), None);
+    }
+
+    /// The supervisor's note of how the engine ended names the lost song's cause.
+    #[test]
+    fn a_lost_song_names_how_the_engine_ended() {
+        let crashed = "[NAR] Step 3/16\n[studio] the engine had already exited: exit code: 0xc000001d (0xc000001d)";
+        let reason = lost_job_reason(crashed);
+        assert_eq!(reason.code(), Some("lost_illegal_instruction"));
+        assert!(reason.to_string().contains("(an instruction this processor does not have, exit code 0xc000001d)"), "{reason}");
+        assert!(reason.to_string().contains("its last line was [NAR] Step 3/16."), "{reason}");
+        let access = lost_job_reason("[studio] the previous engine had exited: exit code: 0xc0000005 (0xc0000005)");
+        assert_eq!(access.code(), Some("lost_exited"));
+        assert_eq!(access.params()["exit"], "0xc0000005");
+        assert_eq!(lost_job_reason("[NAR] Step 3/16").code(), Some("lost_at_line"));
     }
 
     #[test]

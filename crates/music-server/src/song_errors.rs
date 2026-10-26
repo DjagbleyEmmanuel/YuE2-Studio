@@ -25,6 +25,8 @@ pub enum SongError {
     /// Lost with an engine that restarted, whose last line says where it was.
     LostAtLine(String),
     Lost,
+    /// Lost with an engine that ended on this exit code (`0xc0000005`), with its last line when it wrote one.
+    LostExited { exit: String, line: Option<String> },
     /// The engine gave the song up while loading the models: the card's memory ran out.
     LoadVram,
     /// The engine gave the song up while loading the models: the computer's memory ran out.
@@ -48,6 +50,23 @@ pub enum SongError {
     /// The engine's FATAL line: the score the model wrote cannot be sung;
     /// `adapters` when LoRAs were on, which the engine blames first.
     ScoreUnsingable { line: String, song: u64, problem: String, adapters: bool },
+}
+
+/// The Windows status of a process that ran an instruction the processor does not have.
+const ILLEGAL_INSTRUCTION: &str = "0xc000001d";
+
+/// What a Windows exit status of the engine means, for the statuses a person can act on.
+fn exit_meaning(exit: &str) -> Option<&'static str> {
+    Some(match exit {
+        "0xc0000005" => "a crash: an access violation",
+        ILLEGAL_INSTRUCTION => "an instruction this processor does not have",
+        "0xc0000409" => "a crash: the engine aborted",
+        "0xc00000fd" => "a crash: a stack overflow",
+        "0xc0000374" => "a crash: corrupted memory",
+        "0xc0000135" | "0xc0000139" | "0xc0000142" => "a library of the engine did not load",
+        "0xc0000017" | "0xc000012d" => "the computer ran out of memory",
+        _ => return None,
+    })
 }
 
 const CONTEXT_SHORT: (&str, &str, &str, &str, &str) =
@@ -80,6 +99,8 @@ impl SongError {
             SongError::LostDevice(None) => "lost_device_silent",
             SongError::LostAtLine(_) => "lost_at_line",
             SongError::Lost => "lost",
+            SongError::LostExited { exit, .. } if exit == ILLEGAL_INSTRUCTION => "lost_illegal_instruction",
+            SongError::LostExited { .. } => "lost_exited",
             SongError::LoadVram => "load_vram",
             SongError::LoadRam => "load_ram",
             SongError::EngineFatal(_) => "engine_fatal",
@@ -110,6 +131,7 @@ impl SongError {
             | SongError::EngineRefused(detail) => put("detail", json!(detail)),
             SongError::LostAtLine(line) | SongError::EngineFatal(line) => put("line", json!(line)),
             SongError::AdapterMissing(name) => put("name", json!(name)),
+            SongError::LostExited { exit, .. } => put("exit", json!(exit)),
             SongError::ContextShort { tokens, context, can_last, asked, .. } => {
                 put("tokens", json!(tokens));
                 put("context", json!(context));
@@ -162,6 +184,16 @@ impl fmt::Display for SongError {
             SongError::LostDevice(None) => f.write_str("The graphics card failed during this song (a CUDA or driver error) and the engine restarted, so the song was lost. The engine log is in Settings, Engine."),
             SongError::LostAtLine(line) => write!(f, "The engine stopped during this song and restarted, so the song was lost; its last line was {line}. The engine log is in Settings, Engine."),
             SongError::Lost => f.write_str("The engine stopped during this song and restarted, so the song was lost. The engine log is in Settings, Engine."),
+            SongError::LostExited { exit, line } => {
+                let how = match exit_meaning(exit) {
+                    Some(meaning) => format!("{meaning}, exit code {exit}"),
+                    None => format!("exit code {exit}"),
+                };
+                match line {
+                    Some(line) => write!(f, "The engine stopped during this song ({how}) and restarted, so the song was lost; its last line was {line}. The engine log is in Settings, Engine."),
+                    None => write!(f, "The engine stopped during this song ({how}) and restarted, so the song was lost. The engine log is in Settings, Engine."),
+                }
+            }
             SongError::LoadVram => f.write_str("The graphics card ran out of memory while the engine was loading the models. Choose a smaller quantisation in the model manager, or close whatever else is using the card - the writing assistant holds several gigabytes of its own."),
             SongError::LoadRam => f.write_str("The computer ran out of memory (RAM) while the engine was loading the models. Close other programs that take memory, or choose a smaller quantisation in the model manager."),
             SongError::EngineFatal(line) | SongError::ContextShort { line, .. } | SongError::ScoreUnsingable { line, .. } => f.write_str(line),
@@ -203,6 +235,8 @@ mod tests {
             SongError::LostDevice(None),
             SongError::LostAtLine("x".into()),
             SongError::Lost,
+            SongError::LostExited { exit: "0xc0000005".into(), line: None },
+            SongError::LostExited { exit: ILLEGAL_INSTRUCTION.into(), line: Some("x".into()) },
             SongError::LoadVram,
             SongError::LoadRam,
             SongError::EngineFatal("x".into()),
@@ -226,6 +260,7 @@ mod tests {
                 | SongError::LostDevice(_)
                 | SongError::LostAtLine(_)
                 | SongError::Lost
+                | SongError::LostExited { .. }
                 | SongError::LoadVram
                 | SongError::LoadRam
                 | SongError::EngineFatal(_)

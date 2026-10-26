@@ -79,7 +79,7 @@ pub enum ComputeBackend {
 }
 
 impl ComputeBackend {
-    /// The device name `yue-server` reads from `GGML_BACKEND`, none for `Auto`.
+    /// The device name `yue-server` takes as `--device`, none for `Auto`.
     pub fn ggml_device(self) -> Option<&'static str> {
         match self {
             Self::Auto => None,
@@ -94,7 +94,7 @@ impl ComputeBackend {
 /// read once at startup, so changing one restarts the engine.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct YueServerOptions {
-    /// The device to compute on, passed as `GGML_BACKEND`.
+    /// The device to compute on, passed as `--device`.
     pub backend: ComputeBackend,
     /// `--keep-loaded`: keep every module resident instead of evicting
     /// between the AR, NAR and VAE stages.
@@ -353,13 +353,8 @@ impl YueServerSupervisor {
                 command.env_remove("YUE_CUDA_BACKEND");
             }
         }
-        match self.config.options.backend.ggml_device() {
-            Some(device) => {
-                command.env("GGML_BACKEND", device);
-            }
-            None => {
-                command.env_remove("GGML_BACKEND");
-            }
+        if let Some(device) = self.config.options.backend.ggml_device() {
+            command.arg("--device").arg(device);
         }
         if let Some(directory) = self.config.executable.parent() {
             command.current_dir(directory);
@@ -408,7 +403,10 @@ impl YueServerSupervisor {
             return Ok(StopOutcome { was_running: false, graceful: true });
         };
         if let Some(status) = child.try_wait().context("inspect yue-server child")? {
-            note_in_log(&format!("the engine had already exited: {status}"));
+            note_in_log(&format!(
+                "the engine had already exited: {status}{}",
+                status.code().map(|code| format!(" (0x{:x})", code as u32)).unwrap_or_default()
+            ));
             self.child = None;
             return Ok(StopOutcome { was_running: false, graceful: true });
         }
