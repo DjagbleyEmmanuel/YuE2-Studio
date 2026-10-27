@@ -1862,4 +1862,5 @@ export const ru = {
     updateWhyMidiAudiocpp: "Звук в MIDI переводит MuScriptor в сервере audio.cpp",
     updateWhyNewer: "В этом релизе другая сборка",
     updateWhyUnused: "Больше не используется",
+    assistantVulkanGlibc: "Ассистент идёт на видеокарте через Vulkan: CUDA-сборке llama.cpp нужна glibc {need} или новее, в системе {glibc}",
 };

@@ -1863,4 +1863,5 @@ export const en = {
     updateWhyMidiAudiocpp: "Audio to MIDI runs MuScriptor in the audio.cpp server",
     updateWhyNewer: "This release uses another build of it",
     updateWhyUnused: "No longer used",
+    assistantVulkanGlibc: "The assistant runs on the card through Vulkan: the CUDA build of llama.cpp needs glibc {need} or newer, this system has {glibc}",
 };

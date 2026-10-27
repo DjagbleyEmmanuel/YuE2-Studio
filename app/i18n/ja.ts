@@ -1859,4 +1859,5 @@ export const ja = {
   updateWhyMidiAudiocpp: "オーディオから MIDI への変換は audio.cpp サーバーの MuScriptor で行います",
   updateWhyNewer: "このリリースでは別のビルドを使います",
   updateWhyUnused: "もう使われていません",
+  assistantVulkanGlibc: "アシスタントは Vulkan でグラフィックカードを使います：llama.cpp の CUDA ビルドには glibc {need} 以降が必要で、このシステムは {glibc} です",
 };
