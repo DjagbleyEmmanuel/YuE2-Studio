@@ -2376,7 +2376,7 @@ fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "score_instrumental",
-                description: "The score made instrumental, as the score card's Instrumental button does: the voice's melody moves to the instrument and Vocal keeps only its rests and chords.",
+                description: "The score made instrumental, as the score card's Instrumental button does: the voice's melody moves to the instrument and Vocal keeps only its rests and chords; a score without Vocal notes comes back as it is (moved 0).",
                 schema: || object(json!({ "abc": { "type": "string" } }), &["abc"]),
                 call: |args| post("/v1/score/instrumental".into(), json!({ "abc": text(args, "abc")? })),
             },
