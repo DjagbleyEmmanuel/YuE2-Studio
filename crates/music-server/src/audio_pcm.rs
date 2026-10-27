@@ -196,19 +196,27 @@ pub fn reads_audio(extension: &str) -> bool {
 }
 
 /// Whether the window's player plays this file as it is: MP3, FLAC, Ogg, AAC
-/// and a WAV of plain or float samples. Anything else the library keeps as
-/// FLAC.
+/// (an MP4 or M4A only when its audio is AAC, not ALAC) and a WAV of plain or
+/// float samples. Anything else the library keeps as FLAC.
 pub fn plays_in_window(extension: &str, audio: &[u8]) -> bool {
     match extension.to_ascii_lowercase().as_str() {
-        "mp3" | "flac" | "ogg" | "oga" | "m4a" | "mp4" | "aac" => true,
+        "mp3" | "flac" | "ogg" | "oga" | "aac" => true,
+        "m4a" | "mp4" => {
+            let Ok(format) = probe(Box::new(std::io::Cursor::new(audio.to_vec())), Some(extension)) else {
+                return false;
+            };
+            format.default_track(TrackType::Audio).and_then(|track| track.codec_params.as_ref()).is_some_and(|params| {
+                matches!(params, CodecParameters::Audio(audio) if audio.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_AAC)
+            })
+        }
         // the fmt chunk's format tag: 1 PCM, 3 float, 0xFFFE extensible
         "wav" => wav_format_tag(audio).is_some_and(|tag| matches!(tag, 1 | 3 | 0xFFFE)),
         _ => false,
     }
 }
 
-/// The format tag of a RIFF WAV's `fmt ` chunk, wherever it lies among the chunks (a JUNK, LIST or bext chunk can
-/// come first).
+/// The format tag of a WAV's `fmt ` chunk, wherever it stands among the chunks (a JUNK, bext or LIST chunk may come
+/// first).
 fn wav_format_tag(audio: &[u8]) -> Option<u16> {
     if audio.get(0..4)? != b"RIFF" || audio.get(8..12)? != b"WAVE" {
         return None;
@@ -444,13 +452,20 @@ mod tests {
 
     #[test]
     fn only_what_the_player_plays_is_kept_as_it_is() {
-        let chunk = |id: &[u8; 4], body: &[u8]| [id.as_slice(), &(body.len() as u32).to_le_bytes(), body].concat();
-        let wav = |tag: u16| [b"RIFF".as_slice(), &[0u8; 4], b"WAVE", &chunk(b"fmt ", &[tag.to_le_bytes().as_slice(), &[0u8; 14]].concat())].concat();
+        let chunk = |id: &[u8; 4], body: &[u8]| [id.as_slice(), &(body.len() as u32).to_le_bytes(), body, &vec![0u8; body.len() & 1]].concat();
+        let wav_with = |before: &[u8], tag: u16| {
+            let mut fmt = vec![0u8; 16];
+            fmt[0..2].copy_from_slice(&tag.to_le_bytes());
+            let body = [b"WAVE".as_slice(), before, &chunk(b"fmt ", &fmt), &chunk(b"data", &[0u8; 4])].concat();
+            chunk(b"RIFF", &body)
+        };
+        let wav = |tag: u16| wav_with(&[], tag);
         assert!(plays_in_window("wav", &wav(1)) && plays_in_window("WAV", &wav(3)) && plays_in_window("wav", &wav(0xFFFE)));
         assert!(!plays_in_window("wav", &wav(2)), "ADPCM");
-        let after_junk = [b"RIFF".as_slice(), &[0u8; 4], b"WAVE", &chunk(b"JUNK", &[0u8; 27]), &[0u8], &chunk(b"fmt ", &[1u8, 0, 2, 0])].concat();
-        assert!(plays_in_window("wav", &after_junk), "a JUNK chunk before fmt");
-        assert!(plays_in_window("mp3", &[]) && plays_in_window("m4a", &[]));
+        assert!(plays_in_window("wav", &wav_with(&chunk(b"JUNK", &[0u8; 27]), 3)), "a chunk before fmt, of odd size");
+        assert!(!plays_in_window("wav", &[0u8; 44]), "not a RIFF WAVE");
+        assert!(plays_in_window("mp3", &[]) && plays_in_window("aac", &[]));
+        assert!(!plays_in_window("m4a", &[]), "an M4A whose codec is not read as AAC is converted");
         assert!(!plays_in_window("mka", &[]) && !plays_in_window("caf", &[]) && !plays_in_window("aiff", &[]));
     }
 
