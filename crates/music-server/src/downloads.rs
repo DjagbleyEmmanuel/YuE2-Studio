@@ -155,7 +155,8 @@ impl Downloader {
     }
 
     /// Installed when its files are there and, for a runtime, its record names
-    /// today's pin (`install_record`); a runtime from before records counts as
+    /// today's pin (`install_record`), or its files are today's pin byte for byte
+    /// whichever address put them there; a runtime from before records counts as
     /// in `take_over`. A model counts by its file: its address can move to
     /// another revision of the same weights without them being fetched again.
     pub fn is_installed(&self, asset: &Asset) -> bool {
@@ -167,9 +168,44 @@ impl Downloader {
         }
         let record = self.record_of(asset);
         match crate::install_record::matches(&record, asset.url, &self.root) {
-            Some(current) => current,
-            None => self.take_over(asset, &record),
+            Some(true) => true,
+            Some(false) => self.holds_pinned_bytes(asset, &record),
+            None => self.take_over(asset, &record) || self.holds_pinned_bytes(asset, &record),
         }
+    }
+
+    /// Today's pin already on disk byte for byte, from whichever address: the files a pick takes out of its
+    /// package by the hashes the package lists, or a single file by the pin's own. Its record is then written for
+    /// today's pin, so the next look reads the record.
+    fn holds_pinned_bytes(&self, asset: &Asset, record: &Path) -> bool {
+        if crate::install_record::under_way(record) {
+            return false;
+        }
+        let files: Vec<PathBuf> = if !asset.pick.is_empty() {
+            let destination = self.picked_into(asset);
+            let mut files = Vec::new();
+            for entry in asset.pick {
+                let name = picked_file_name(entry);
+                let path = destination.join(name);
+                match crate::pin_sha::picked(asset.url, name) {
+                    Some(sha256) if crate::pin_sha::holds(&path, sha256) => files.push(path),
+                    _ => return false,
+                }
+            }
+            files
+        } else if asset.unzip_into.is_none() {
+            let path = self.path_of(asset);
+            match crate::pin_sha::sha256(asset.url) {
+                Some(sha256) if crate::pin_sha::holds(&path, sha256) => vec![path],
+                _ => return false,
+            }
+        } else {
+            return false;
+        };
+        if let Err(error) = crate::install_record::write(record, asset.url, "", &files, &self.root) {
+            eprintln!("[ERROR] {}: the record of today's files already on disk was not written: {error:#}", asset.label);
+        }
+        true
     }
 
     /// Where the record of an asset's download lies: beside its file or archive.
@@ -301,7 +337,7 @@ impl Downloader {
         let target = self.path_of(asset);
         let (Some(bytes), Some(name)) = (crate::sizes::known(asset.url), target.file_name()) else { return };
         if let Some((source, app)) = studio_hub_client::neighbors::find_file(name, bytes, target.parent().and_then(Path::file_name)) {
-            match studio_hub_client::neighbors::take_file(&source, &target, false, |_| true) {
+            match studio_hub_client::neighbors::take_file(&source, &target, false, |staged| crate::pin_sha::accepts(asset.url, staged)) {
                 Ok(()) => note_taken(asset.id, &target, &app),
                 Err(error) => report_take_failure(&target, &app, &error),
             }
@@ -539,7 +575,7 @@ impl Downloader {
         crate::install_record::begin(&self.record_of(asset))?;
         let target = self.path_of(asset);
         fetch(&self.http, asset, &target, cell, self.cancel.clone()).await?;
-        let sha256 = crate::install_record::sha256_of(&target)?;
+        let sha256 = crate::pin_sha::check(asset.url, &target)?;
         let files = match asset.unzip_into {
             Some(flavour) => extract_archive(&target, &self.runtime_dir(flavour))?,
             None => vec![target.clone()],
@@ -602,7 +638,7 @@ impl Downloader {
                 return;
             }
             let outcome = fetch(&http, asset, &target, &progress, cancel).await.and_then(|()| {
-                let sha256 = crate::install_record::sha256_of(&target)?;
+                let sha256 = crate::pin_sha::check(asset.url, &target)?;
                 let files = match asset.unzip_into {
                     Some(flavour) => extract_archive(&target, &runtime_root.join(flavour))?,
                     None => vec![target.clone()],
@@ -641,10 +677,10 @@ async fn fetch(
     if plan.total > 0 {
         crate::sizes::learn(asset.url, plan.total);
         // another program of timoncool's has it: taken from there, by copy too when it is on another drive
-        let (to, total) = (target.to_path_buf(), plan.total);
+        let (to, total, pinned) = (target.to_path_buf(), plan.total, asset.url);
         let taken = tokio::task::spawn_blocking(move || {
             let (source, app) = to.file_name().and_then(|name| studio_hub_client::neighbors::find_file(name, total, to.parent().and_then(Path::file_name)))?;
-            Some((studio_hub_client::neighbors::take_file(&source, &to, true, |_| true), app))
+            Some((studio_hub_client::neighbors::take_file(&source, &to, true, |staged| crate::pin_sha::accepts(pinned, staged)), app))
         })
         .await
         .ok()
@@ -761,9 +797,9 @@ async fn download_and_extract_named(
     let outcome = crate::chunked::fetch(http, &url, &archive, plan, written, cancel).await;
     reporter.abort();
     outcome?;
-    let (archive_path, wanted, destination) = (archive.clone(), asset.pick, destination.to_path_buf());
+    let (archive_path, wanted, destination, pinned) = (archive.clone(), asset.pick, destination.to_path_buf(), asset.url);
     let extracted = tokio::task::spawn_blocking(move || -> Result<(String, Vec<PathBuf>)> {
-        let sha256 = crate::install_record::sha256_of(&archive_path)?;
+        let sha256 = crate::pin_sha::check(pinned, &archive_path)?;
         Ok((sha256, extract_named_local(&archive_path, wanted, &destination)?))
     })
     .await

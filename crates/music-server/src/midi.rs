@@ -47,7 +47,7 @@ fn leak(text: String) -> &'static str {
 }
 
 /// A size's two files, from the open mirror at a fixed revision.
-fn weight_assets(size: &'static Size) -> &'static [Asset] {
+pub(crate) fn weight_assets(size: &'static Size) -> &'static [Asset] {
     static ASSETS: OnceLock<HashMap<&'static str, Vec<Asset>>> = OnceLock::new();
     ASSETS.get_or_init(|| {
         SIZES
