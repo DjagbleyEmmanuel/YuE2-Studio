@@ -478,6 +478,9 @@ const MAX_RESUMES: u32 = 3;
 /// The score stage draws up to 4096 tokens after its prompt in the same context,
 /// so a smaller context fails every song before it starts.
 const MIN_MAX_SEQ: u32 = 8192;
+/// The engine's cache on a Radeon of 8 GB or less (`EngineOptions::small_radeon`): the largest that runs there
+/// without flash attention.
+const RADEON_SMALL_MAX_SEQ: u32 = 9216;
 
 /// Songs the studio was closed on are started again, oldest first. The old
 /// job stays as `cancelled`, its message naming the job that took its place.
@@ -779,15 +782,28 @@ impl EngineOptions {
         }
     }
 
+    /// A Radeon of 8 GB or less on Vulkan: its flash attention is several times slower than without it, and a step
+    /// that long and a whole song's cache are where its driver gives the device up; without flash attention and with
+    /// the cache of `RADEON_SMALL_MAX_SEQ` it renders in chunks that the engine fades into each other.
+    fn small_radeon(&self) -> bool {
+        let hardware = hardware::hardware();
+        self.uses_vulkan()
+            && !hardware.nvidia
+            && hardware.total_vram_gb > 0.0
+            && hardware.total_vram_gb <= 8.5
+            && hardware.gpu_name.as_deref().is_some_and(|name| name.contains("Radeon") || name.contains("AMD"))
+    }
+
     fn to_engine(self) -> music_engine::yue_server::YueServerOptions {
+        let small_radeon = self.small_radeon();
         music_engine::yue_server::YueServerOptions {
             backend: self.backend,
             keep_loaded: self.keep_loaded,
             max_batch: Some(self.effective_max_batch()),
-            max_seq: self.max_seq.map(|value| value.max(MIN_MAX_SEQ)),
+            max_seq: self.max_seq.or(small_radeon.then_some(RADEON_SMALL_MAX_SEQ)).map(|value| value.max(MIN_MAX_SEQ)),
             vae_core: self.vae_core,
             vae_halo: self.vae_halo,
-            disable_flash_attention: self.disable_flash_attention,
+            disable_flash_attention: self.disable_flash_attention || small_radeon,
             // On an AMD Radeon through Vulkan the hidden states leave the FP16
             // range and the song comes out as pure silence, which the engine's
             // MP3 path then crashes on; the engine's own clamp fixes it.
