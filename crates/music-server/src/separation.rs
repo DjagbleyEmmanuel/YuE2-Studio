@@ -294,8 +294,7 @@ pub fn separate_htdemucs(
     let work = tempfile::tempdir()?;
     let mix = work.path().join("mix.wav");
     write_wav_stereo(&mix, audio)?;
-    let server = acpp.server(build, acpp_server::ModelEntry::htdemucs(crate::acpp::HTDEMUCS, model))?;
-    let result = crate::acpp::run(acpp, &server, crate::acpp::HTDEMUCS, serde_json::json!({ "audio": mix }), stop)?;
+    let result = crate::acpp::run(acpp, build, acpp_server::ModelEntry::htdemucs(crate::acpp::HTDEMUCS, model), serde_json::json!({ "audio": mix }), stop)?;
     let outputs = acpp_server::task_audio(&result).map_err(|error| anyhow::anyhow!("HT-Demucs: {}", crate::acpp::describe(&error)))?;
     let mut stems = Vec::new();
     for name in STEMS {

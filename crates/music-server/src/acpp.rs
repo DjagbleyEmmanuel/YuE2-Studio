@@ -246,7 +246,7 @@ impl Acpp {
     /// The running server of this build carrying `model` (registered with it) and every other registered model on
     /// disk: the one there is, or a new one in its place when the models on disk changed or the process ended. An
     /// error, before the program starts, when the program or its CUDA libraries are missing or `model` is not on disk.
-    pub fn server(&self, build: Build, model: ModelEntry) -> Result<Arc<Server>> {
+    fn server(&self, build: Build, model: ModelEntry) -> Result<Arc<Server>> {
         let id = model.id.clone();
         self.register(model);
         let config = self.config(build, self.models_on_disk());
@@ -286,12 +286,21 @@ pub fn describe(error: &AcppError) -> String {
     }
 }
 
-/// Runs `request` on the model `id` of `server`. `stop` is asked every tenth of a second. When the last run on the
-/// server ends - done, failed or stopped - the server is ended: an idle server still holds a gigabyte of the card,
-/// which belongs to the music engine between runs, and a stopped run would otherwise go on to its end. A run that
-/// ends while another is at work leaves the server to it.
-pub fn run(acpp: &Acpp, server: &Server, id: &str, request: Value, stop: &(dyn Fn() -> bool + Sync)) -> Result<Value> {
+/// Runs `request` on `model` in the server of `build` (`Acpp::server`). `stop` is asked every tenth of a second.
+/// When the last run on the server ends - done, failed or stopped - the server is ended: an idle server still holds
+/// a gigabyte of the card, which belongs to the music engine between runs, and a stopped run would otherwise go on
+/// to its end. A run counts from before its server is looked up, so one that ends meanwhile leaves the server to it.
+pub fn run(acpp: &Acpp, build: Build, model: ModelEntry, request: Value, stop: &(dyn Fn() -> bool + Sync)) -> Result<Value> {
     *acpp.active.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+    let id = model.id.clone();
+    let server = match acpp.server(build, model) {
+        Ok(server) => server,
+        Err(error) => {
+            *acpp.active.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) -= 1;
+            return Err(error);
+        }
+    };
+    let id = id.as_str();
     let cancel = AtomicBool::new(false);
     let finished = AtomicBool::new(false);
     let answer = std::thread::scope(|scope| {

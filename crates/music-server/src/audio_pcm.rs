@@ -203,9 +203,27 @@ pub fn plays_in_window(extension: &str, audio: &[u8]) -> bool {
     match extension.to_ascii_lowercase().as_str() {
         "mp3" | "flac" | "ogg" | "oga" | "m4a" | "mp4" | "aac" => true,
         // the fmt chunk's format tag: 1 PCM, 3 float, 0xFFFE extensible
-        "wav" => audio.get(20..22).is_some_and(|tag| matches!(u16::from_le_bytes([tag[0], tag[1]]), 1 | 3 | 0xFFFE)),
+        "wav" => wav_format_tag(audio).is_some_and(|tag| matches!(tag, 1 | 3 | 0xFFFE)),
         _ => false,
     }
+}
+
+/// The format tag of a RIFF WAV's `fmt ` chunk, wherever it lies among the chunks (a JUNK, LIST or bext chunk can
+/// come first).
+fn wav_format_tag(audio: &[u8]) -> Option<u16> {
+    if audio.get(0..4)? != b"RIFF" || audio.get(8..12)? != b"WAVE" {
+        return None;
+    }
+    let mut at = 12usize;
+    while let Some(header) = audio.get(at..at + 8) {
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        if &header[0..4] == b"fmt " {
+            let tag = audio.get(at + 8..at + 10)?;
+            return Some(u16::from_le_bytes([tag[0], tag[1]]));
+        }
+        at = at.checked_add(8 + size + (size & 1))?;
+    }
+    None
 }
 
 /// Decodes audio held in memory - a track as the engine sent it - to stereo
@@ -427,13 +445,12 @@ mod tests {
 
     #[test]
     fn only_what_the_player_plays_is_kept_as_it_is() {
-        let wav = |tag: u16| {
-            let mut header = vec![0u8; 44];
-            header[20..22].copy_from_slice(&tag.to_le_bytes());
-            header
-        };
+        let chunk = |id: &[u8; 4], body: &[u8]| [id.as_slice(), &(body.len() as u32).to_le_bytes(), body].concat();
+        let wav = |tag: u16| [b"RIFF".as_slice(), &[0u8; 4], b"WAVE", &chunk(b"fmt ", &[tag.to_le_bytes().as_slice(), &[0u8; 14]].concat())].concat();
         assert!(plays_in_window("wav", &wav(1)) && plays_in_window("WAV", &wav(3)) && plays_in_window("wav", &wav(0xFFFE)));
         assert!(!plays_in_window("wav", &wav(2)), "ADPCM");
+        let after_junk = [b"RIFF".as_slice(), &[0u8; 4], b"WAVE", &chunk(b"JUNK", &[0u8; 27]), &[0u8], &chunk(b"fmt ", &[1u8, 0, 2, 0])].concat();
+        assert!(plays_in_window("wav", &after_junk), "a JUNK chunk before fmt");
         assert!(plays_in_window("mp3", &[]) && plays_in_window("m4a", &[]));
         assert!(!plays_in_window("mka", &[]) && !plays_in_window("caf", &[]) && !plays_in_window("aiff", &[]));
     }

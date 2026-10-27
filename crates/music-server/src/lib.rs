@@ -2809,10 +2809,12 @@ async fn midi_runtime(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-/// The audio.cpp build MuScriptor transcribes on: the processor when the engine is set to it, else the card when there
-/// is one.
+/// The audio.cpp build MuScriptor transcribes on: the processor when the engine is set to it, else a CUDA card or a
+/// Mac's Metal when there is one. MuScriptor was checked note for note on CUDA only, so Vulkan's cards transcribe on
+/// the processor.
 fn midi_build(options: &EngineOptions) -> anyhow::Result<acpp_server::asset::Build> {
-    acpp::build_for(if options.backend == music_engine::yue_server::ComputeBackend::Cpu { "cpu" } else { "auto" })
+    let build = acpp::build_for(if options.backend == music_engine::yue_server::ComputeBackend::Cpu { "cpu" } else { "auto" })?;
+    Ok(if build == acpp_server::asset::Build::Vulkan { acpp_server::asset::Build::Cpu } else { build })
 }
 
 async fn install_training_pack(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
@@ -7306,8 +7308,7 @@ async fn transcribe_to_midi(state: &AppState, size: &'static midi::Size, audio: 
     let id = acpp::muscriptor_id(size.id);
     let background = state.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        let server = background.acpp.server(build, acpp_server::ModelEntry::muscriptor(&id, &model))?;
-        acpp::run(&background.acpp, &server, &id, serde_json::json!({ "audio": input }), &|| midi_stopped(&background))
+        acpp::run(&background.acpp, build, acpp_server::ModelEntry::muscriptor(&id, &model), serde_json::json!({ "audio": input }), &|| midi_stopped(&background))
     })
     .await
     .context("the transcriber stopped")?;
@@ -7906,7 +7907,8 @@ fn update_acpp_builds(state: &AppState, leftovers: &[update_screen::Leftover], s
     builds
 }
 
-/// This release's plan against the disk; it reads files and changes none.
+/// This release's plan against the disk. It downloads and removes nothing; a file already today's pin byte for byte
+/// gets its install record on the way, as every status read writes it.
 fn update_plan_now(state: &AppState, separation: lyrics_sync::OnnxFlavour, options: &EngineOptions) -> update_screen::Plan {
     use update_screen::{Candidate, Part};
     let of = |part: Part, asset: &'static downloads::Asset, downloader: &downloads::Downloader, earlier: Option<String>| Candidate {
@@ -8006,10 +8008,21 @@ async fn setup_update(State(state): State<AppState>) -> Result<Json<Value>, (Sta
 /// in the background, and once all of it is in place removes what former releases left; with nothing to download it
 /// removes them at once. The plan counts as shown.
 async fn setup_update_apply(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    if state.update_job.read().await.as_ref().is_some_and(|job| job.status == update_screen::JobStatus::Running) {
-        return Err(api_error(StatusCode::CONFLICT, "the update is already running".into()));
+    {
+        // the check and the claim under one lock: a second press while the plan is read finds this run
+        let mut job = state.update_job.write().await;
+        if job.as_ref().is_some_and(|job| job.status == update_screen::JobStatus::Running) {
+            return Err(api_error(StatusCode::CONFLICT, "the update is already running".into()));
+        }
+        *job = Some(update_screen::Job { status: update_screen::JobStatus::Running, error: None, updated: Vec::new(), added: Vec::new() });
     }
-    let plan = update_plan(&state).await?;
+    let plan = match update_plan(&state).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            *state.update_job.write().await = None;
+            return Err(error);
+        }
+    };
     if let Err(error) = update_screen::mark_seen(update_data_root(&state), studio_version()) {
         eprintln!("[ERROR] {error}");
     }
@@ -8047,6 +8060,9 @@ async fn run_update(state: &AppState, rows: &[update_screen::Row]) -> anyhow::Re
         let ids: Vec<&str> = rows.iter().filter(|row| row.part == part).flat_map(|row| row.ids.iter().copied()).collect();
         match (part, update_downloader(state, part)) {
             (update_screen::Part::Audiocpp, _) => {
+                let assets: Vec<&'static downloads::Asset> = update_catalogue(part).into_iter().filter(|asset| ids.contains(&asset.id)).collect();
+                state.acpp.downloader().install_all("audiocpp", &assets).await?;
+                // the CUDA 13 build runs on the engine's cuBLAS 13, which the engine's downloader keeps
                 for (build, scope) in update_acpp_builds(state, &retired::leftovers(&data_root), separation, &options) {
                     install_acpp(state, build, scope).await?;
                 }
@@ -8245,12 +8261,18 @@ async fn submit_music_job(state: AppState, mut request: CreateMusicJobRequest, a
         return (StatusCode::CONFLICT, Json(failed_request_job(request, engine_id, SongError::TrainingOnCard)));
     }
     if request.vocals_only {
-        if !state.separator.is_installed() {
+        let config = state.separation_config.read().await.clone();
+        let ready = match config.engine {
+            separation::Engine::Htdemucs => {
+                if let Err(error) = separation_build(config.runtime) {
+                    return (StatusCode::BAD_REQUEST, Json(failed_request_job(request, engine_id, SongError::SeparatorUnavailable(format!("{error:#}")))));
+                }
+                htdemucs_installed(&state, config.runtime)
+            }
+            separation::Engine::Roformer => state.separator.roformer_installed(roformer_on_card(&state, config.runtime)),
+        };
+        if !ready {
             return (StatusCode::BAD_REQUEST, Json(failed_request_job(request, engine_id, SongError::VocalsNeedSeparator)));
-        }
-        let runtime = state.separation_config.read().await.runtime;
-        if let Err(error) = state.lyrics_sync.onnx_card(runtime) {
-            return (StatusCode::BAD_REQUEST, Json(failed_request_job(request, engine_id, SongError::SeparatorUnavailable(format!("{error:#}")))));
         }
     }
     // an adapter named without strengths starts where the create page starts it

@@ -547,8 +547,8 @@ const STEPS_FILE: &str = "steps.jsonl";
 
 /// A run as its folder holds it: run.json, with the steps from their own file
 /// once it exists. A line still being written has no newline yet and is left
-/// for the next read; one a stop cut off mid-write lies before the next step's
-/// line, and that step is the only one lost.
+/// for the next read, and one a stop cut off mid-write goes with the next step's
+/// append.
 fn read_run(dir: &Path) -> Option<Run> {
     let mut run: Run = read_json(&dir.join("run.json"))?;
     if let Ok(text) = std::fs::read_to_string(dir.join(STEPS_FILE)) {
@@ -557,7 +557,7 @@ fn read_run(dir: &Path) -> Option<Run> {
         for line in complete.lines() {
             match serde_json::from_str(line) {
                 Ok(record) => steps.push(record),
-                Err(error) => eprintln!("[ERROR] {}: a step line cut off when it was written is left out ({error}): {line}", dir.join(STEPS_FILE).display()),
+                Err(error) => eprintln!("[ERROR] {}: a step line that is not JSON is left out ({error}): {line}", dir.join(STEPS_FILE).display()),
             }
         }
         run.steps = steps;
@@ -1058,17 +1058,23 @@ impl Training {
             write_steps(&dir, &run.steps)?;
             return write_json(&dir.join("run.json"), &Run { steps: Vec::new(), ..run });
         }
-        let mut file = std::fs::OpenOptions::new().read(true).append(true).open(dir.join(STEPS_FILE))?;
-        // a line cut off by a stop mid-write ends without its newline: the next record starts a line of its own
-        let mut torn = false;
-        if file.metadata()?.len() > 0 {
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(dir.join(STEPS_FILE))?;
+        // a line cut off by a stop mid-write ends without its newline: it goes, and the next record takes its place
+        let length = file.metadata()?.len();
+        if length > 0 {
             let mut last = [0u8; 1];
             file.seek(SeekFrom::End(-1))?;
             file.read_exact(&mut last)?;
-            torn = last[0] != b'\n';
+            if last[0] != b'\n' {
+                let mut text = Vec::new();
+                file.seek(SeekFrom::Start(0))?;
+                file.read_to_end(&mut text)?;
+                let kept = text.iter().rposition(|byte| *byte == b'\n').map_or(0, |end| end + 1);
+                file.set_len(kept as u64)?;
+            }
         }
-        let line = serde_json::to_string(&record)?;
-        file.write_all(format!("{}{line}\n", if torn { "\n" } else { "" }).as_bytes())?;
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(format!("{}\n", serde_json::to_string(&record)?).as_bytes())?;
         Ok(())
     }
 
