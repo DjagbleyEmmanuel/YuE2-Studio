@@ -1048,6 +1048,7 @@ pub async fn serve() -> anyhow::Result<()> {
         )),
         hub: start_hub(),
     };
+    let _ = ENGINE_AT_EXIT.set(state.engine.clone());
     processing::clear_workspace(state.library.media_dir());
     state.training.recover();
     if network_keyed {
@@ -5241,6 +5242,30 @@ static STUDIO_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// starts; a service run on its own is a development build of its crate.
 pub fn set_studio_version(version: String) {
     let _ = STUDIO_VERSION.set(version);
+}
+
+static ENGINE_AT_EXIT: std::sync::OnceLock<Arc<tokio::sync::Mutex<Option<music_engine::yue_server::YueServerSupervisor>>>> = std::sync::OnceLock::new();
+
+/// Stops the engine the service started, for the desktop shell right before the process exits: an exit runs no
+/// destructors, and on macOS nothing else ends a child with its parent.
+pub fn stop_engine() {
+    let Some(engine) = ENGINE_AT_EXIT.get() else { return };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut supervisor = loop {
+        match engine.try_lock() {
+            Ok(supervisor) => break supervisor,
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => {
+                eprintln!("[ERROR] the engine was not stopped at exit: a restart held it for three seconds");
+                return;
+            }
+        }
+    };
+    if let Some(running) = supervisor.as_mut() {
+        if let Err(error) = running.stop(std::time::Duration::from_secs(2)) {
+            eprintln!("[ERROR] the engine was not stopped at exit: {error:#}");
+        }
+    }
 }
 
 pub(crate) fn studio_version() -> &'static str {
