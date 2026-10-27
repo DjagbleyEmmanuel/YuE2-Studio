@@ -206,7 +206,7 @@ move around. Check the result with `ui_screenshot`.
 - **settings**: `settings_get`, `settings_set`.
 - **network**: `network_proxy_get`, `network_proxy_set` (no proxy, the system's or your own, and the HF-Mirror), `network_proxy_test`, `network_access_get`, `network_access_set` (opening the studio from other computers, a new key).
 - **journal**: `journal_read` (the Activity page), `journal_clear`, `journal_remove`.
-- **models**: `models_status`, `models_catalog`, `models_download`, `models_adopt` (files already on disk), `models_select`, `models_cancel_download`, `models_remove`.
+- **models**: `models_status`, `models_catalog`, `models_download`, `models_adopt` (files already on disk), `models_select`, `models_cancel_download`, `models_remove`, `models_update_plan` (what this release updates, adds and no longer needs, with the reasons: the update screen), `models_update_apply` (its button: downloads, then removes what former releases left), `models_update_later` (its «Later»).
 - **engine**: `engine_options_get`, `engine_options_set`, `engine_restart`, `engine_logs`.
 - **song**: `song_defaults` (what a field left out becomes), `song_create` (playlist_id puts the made songs into a playlist), `song_job_get`, `song_jobs_list`, `song_job_cancel`, `song_replay`, `song_tokenize`, `song_job_dismiss` (an ended job's card off the page).
 - **score**: `score_compose`, `score_chord_bed`, `score_job_get`, `score_job_cancel`, `score_transcribe`, `score_match_sections`, `score_to_midi` (base64 .mid), `score_instrumental` (the voice's melody to the instrument), `score_vocal_octave`, `score_from_midi` (a .mid path), `score_mark` (sections from style and lyrics).
