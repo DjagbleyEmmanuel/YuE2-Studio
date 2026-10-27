@@ -86,6 +86,7 @@ const PINNED: &[(&str, &str)] = &[
     ("https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2/resolve/4df90f75321148c3a29a9e2351b7ddf8f5b115a8/vocabulary.json", "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1"),
     ("https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/29d097773436b69ff9feafd636ab4cf873786537/gemma-4-12b-it-qat-q4_0.gguf", "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b"),
     ("https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/4b4a2c1d584be7264f87aac328a1bc739ce81b6c/gemma-4-E4B_q4_0-it.gguf", "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee"),
+    ("https://huggingface.co/nerualdreming/MOSS-Music-8B-Instruct-GGUF/resolve/0b4eac01086c26baf93238aa8b142ec07b3ae56d/moss-lm-q4_k_m.gguf", "bc2783b68fee6dac606599c4b8f15bff5e37913b8d10fbfb8c550f5667dee3e8"),
     ("https://huggingface.co/scragnog/MOSS-Music-8B-Instruct-GGUF/resolve/9fe86435bd542bf29cbf4984e9e0ab0ea8ca7e00/moss-aud-f16.gguf", "014b971719a9b46586ea78ea3d15f39ac0f1932678e30c72fa63222f8aea5f79"),
     ("https://huggingface.co/scragnog/MOSS-Music-8B-Instruct-GGUF/resolve/9fe86435bd542bf29cbf4984e9e0ab0ea8ca7e00/moss-lm-q8_0.gguf", "482e1e82c66f819401708c82b3eaa1dd6635c68a211f03b645b0055d0b7b031b"),
     ("https://huggingface.co/scragnog/YuE2-GGUF/resolve/eb7de0903bf4dfbd14a2384ae0c0d14150cfa2c7/checkpoints/yue2_3b_int8_convrot.safetensors", "96fe199377309001ed8cd26a944baeee8cc31a20ba7c36d1d3c0a7e1f4149db6"),

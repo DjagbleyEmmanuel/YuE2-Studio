@@ -494,6 +494,13 @@ pub(crate) fn listen_pack() -> &'static [Asset] {
                 8_709_513_792,
             ),
             model(
+                "moss-lm-q4",
+                "MOSS-Music 8B (Q4_K_M)",
+                "https://huggingface.co/nerualdreming/MOSS-Music-8B-Instruct-GGUF/resolve/0b4eac01086c26baf93238aa8b142ec07b3ae56d/moss-lm-q4_k_m.gguf",
+                "models/moss/moss-lm-q4_k_m.gguf",
+                5_188_223_648,
+            ),
+            model(
                 "beat-this",
                 "Beat This! (tempo)",
                 "https://github.com/mosynthkey/beat_this_cpp/raw/07ab790a9ec2eda8093d52d249e3ec4f0510ee72/onnx/beat_this.onnx",
@@ -620,20 +627,26 @@ impl Training {
         self.downloader.is_installed(asset)
     }
 
+    /// The listening pack this machine downloads and runs: every file but the MOSS-Music build its card does not take
+    /// (`listen::hearing`).
+    fn listen_files(&self) -> impl Iterator<Item = &'static Asset> {
+        let hearing = crate::listen::hearing(&crate::hardware::hardware());
+        listen_pack().iter().filter(move |asset| !asset.id.starts_with("moss-lm") || asset.relative_path.ends_with(hearing.lm))
+    }
+
     /// The listening pack's files with whether each is on disk.
     pub fn listen_status(&self) -> Vec<serde_json::Value> {
-        listen_pack()
-            .iter()
+        self.listen_files()
             .map(|asset| serde_json::json!({ "id": asset.id, "label": asset.label, "bytes": asset.bytes, "installed": self.listen_installed(asset) }))
             .collect()
     }
 
     pub fn listen_ready(&self) -> bool {
-        listen_pack().iter().all(|asset| self.listen_installed(asset))
+        self.listen_files().all(|asset| self.listen_installed(asset))
     }
 
     pub async fn install_listen(&self) -> Result<()> {
-        let missing: Vec<&'static Asset> = listen_pack().iter().filter(|asset| !self.listen_installed(asset)).collect();
+        let missing: Vec<&'static Asset> = self.listen_files().filter(|asset| !self.listen_installed(asset)).collect();
         if missing.is_empty() {
             return Ok(());
         }

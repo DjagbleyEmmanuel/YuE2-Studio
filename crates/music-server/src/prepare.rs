@@ -355,7 +355,7 @@ async fn describe_style_of(state: &AppState, audio: std::path::PathBuf, lyrics: 
             let facts = audio_facts::Measurer::load(&facts_dir, card)?.measure_mono(&audio_facts::decode(&audio)?)?;
             let cancel = AtomicBool::new(false);
             let mut caption: Option<anyhow::Result<String>> = None;
-            listen::hear_batch(&captioner, &moss, Some(&libraries), std::slice::from_ref(&audio), &cancel, |_, heard| caption = Some(heard))?;
+            listen::hear_batch(&captioner, &moss, &listen::hearing(&crate::hardware::hardware()), Some(&libraries), std::slice::from_ref(&audio), &cancel, |_, heard| caption = Some(heard))?;
             let caption = caption.context("MOSS-Music wrote nothing for the song")??;
             Ok((listen::heard(&caption, &facts)?, facts))
         })
@@ -843,7 +843,7 @@ async fn listen_branch(state: &AppState, job: &Job, style_items: &[&training::Da
         let (training, dataset_id, task_ids, task_job) = (state.training.clone(), id.to_string(), ids.clone(), job.clone());
         let libraries = crate::engine_bundle_root();
         let log = tokio::task::spawn_blocking(move || {
-            listen::hear_batch(&captioner, &moss, Some(&libraries), &audio, &task_cancel, |index, caption| {
+            listen::hear_batch(&captioner, &moss, &listen::hearing(&crate::hardware::hardware()), Some(&libraries), &audio, &task_cancel, |index, caption| {
                 let item = &task_ids[index];
                 let measured = loop {
                     if let Some(measured) = task_facts.lock().unwrap_or_else(|poisoned| poisoned.into_inner())[index].clone() {

@@ -32,6 +32,14 @@ pub fn write_wav16k_mono(input: &Path, output: &Path) -> Result<()> {
     write_wav(output, &decode_mono_16k(input)?)
 }
 
+/// `write_wav16k_mono` of at most `seconds` of `input`, from its middle when it is longer.
+pub fn write_wav16k_mono_middle(input: &Path, output: &Path, seconds: f64) -> Result<()> {
+    let samples = decode_mono_16k(input)?;
+    let keep = ((seconds * TARGET_RATE as f64) as usize).min(samples.len());
+    let start = (samples.len() - keep) / 2;
+    write_wav(output, &samples[start..start + keep])
+}
+
 /// Decodes `input` to interleaved 44.1 kHz stereo, which is what the separation
 /// model was trained on. Mono sources are doubled rather than refused: a mono
 /// track still separates, it simply has the same signal in both channels.
