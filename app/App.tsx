@@ -111,6 +111,7 @@ import { SearchPage } from './components/SearchPage';
 import { NewsPage } from './components/NewsPage';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { SetupGate } from './components/SetupGate';
+import { UpdateScreen, readUpdatePlan } from './components/UpdateScreen';
 import { EngineStarting } from './components/EngineStarting';
 import { StudioOffline } from './components/StudioOffline';
 import { StudioToolsPanel } from './components/StudioToolsPanel';
@@ -124,11 +125,12 @@ import { createNativePlaylist, deleteNativeSong, moveStoredLikes, setNativeSongL
 import { foldStems } from './services/songStems';
 import { noteStudioMessage } from './services/journal';
 import { JournalPanel } from './components/JournalPanel';
-import { hubStateChanged, useHubState } from './services/studioQueries';
-import { setTelemetry, showsNow, type HubButton } from './services/studioHub';
+import { hubStateChanged, useActivity, useHubState } from './services/studioQueries';
+import { hubView, setTelemetry, showsNow, type HubButton } from './services/studioHub';
 import { HubBars } from './components/HubBars';
 import { ShellPrompts } from './components/ShellPrompts';
 import { HubPopup } from './components/HubPopup';
+import { applyUiScale, scaleForKey, setUiScale, storedUiScale, UI_SCALE_EVENT } from './services/uiScale';
 
 /** Where versions before 3.3 kept the likes, in the window's own storage. */
 const STORED_LIKES_KEY = 'yue2-studio-liked-song-ids';
@@ -163,13 +165,29 @@ function AppContent() {
   const { t, language } = useI18n();
 
   // Responsive
-  const { isMobile, isDesktop } = useResponsive();
+  const { isMobile, isDesktop, hasSidePanel } = useResponsive();
 
   // Auth
   const { user } = useAuth();
   const leftPanel = useResizablePanel('create', 420, 320, 1200, 'left', t('createMusic'));
   const rightPanel = useResizablePanel('details', 400, 320, 1200, 'right', t('songDetails'));
   const [nativeSetupReady, setNativeSetupReady] = useState(false);
+  // a release that changed what the studio downloads shows its update screen once, before the studio
+  const [updateShown, setUpdateShown] = useState(false);
+  useEffect(() => {
+    // the window can open before the service answers: the plan is asked again until it does
+    let timer = 0;
+    let cancelled = false;
+    const read = () => readUpdatePlan().then(
+      (update) => { if (!cancelled) setUpdateShown(update.plan.show); },
+      (problem: unknown) => {
+        console.error('the update plan was not read, asking again', problem);
+        if (!cancelled) timer = window.setTimeout(read, 3000);
+      },
+    );
+    void read();
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, []);
   // A track sent here from a menu's "separate into stems".
   const [stemsSongId, setStemsSongId] = useState<string | null>(null);
   // Which of the three situations the studio is in. It starts unknown, and
@@ -399,8 +417,12 @@ function AppContent() {
   // Anonymous statistics are on by default: the start screen's checkbox decides on a first run, and an install that
   // updated past that screen keeps the default until it is unchecked in Settings.
   const hub = useHubState(language);
-  // Strips from the hub show to everyone; popups stay in its test channel (STUDIO_HUB_TEST=1) until they are released.
-  const hubItems = nativeSetupReady && hub.data ? hub.data.items.filter(item => item.kind === 'bar' || hub.data?.test) : [];
+  // every kind of the hub's notices shows to everyone; the service decides which fit this launch
+  const hubItems = nativeSetupReady && hub.data ? hub.data.items : [];
+  const activity = useActivity();
+  // a popup waits until nothing is being made: no song or re-render, no cover or timings in progress
+  const making = generations.isGenerating || generations.activeJobCount > 0 || (activity.data ?? []).some(entry => entry.state === 'running');
+  const hubSection = hubView(currentView, showSettingsModal);
   const [hubClosed, setHubClosed] = useState<Set<string>>(() => new Set());
   const hubStart = useRef(Date.now());
   const [hubElapsed, setHubElapsed] = useState(0);
@@ -420,7 +442,7 @@ function AppContent() {
     setHubClosed(previous => new Set(previous).add(id));
     hubStateChanged();
   };
-  const hubPopup = hubItems.find(item => item.kind === 'popup' && !hubClosed.has(item.id) && showsNow(item, hubElapsed, currentView));
+  const hubPopup = making ? undefined : hubItems.find(item => item.kind === 'popup' && !hubClosed.has(item.id) && showsNow(item, hubElapsed, hubSection));
   const openHubTarget = (target: NonNullable<HubButton['target']>) => {
     if (target === 'news') {
       setCurrentView('news');
@@ -499,20 +521,23 @@ function AppContent() {
     }
   };
 
-  // the library has no side panel: its details open over the page, and the same button closes them
+  // the library's details button opens and closes the side panel, or the details over the page where it has no room
   const toggleLibraryDetails = (song: Song) => {
-    if (showMobileDetails && selectedSong?.id === song.id) {
-      setShowMobileDetails(false);
+    const open = hasSidePanel ? showRightSidebar : showMobileDetails;
+    if (open && selectedSong?.id === song.id) {
+      if (hasSidePanel) setShowRightSidebar(false);
+      else setShowMobileDetails(false);
       return;
     }
     setSelectedSong(song);
-    setShowMobileDetails(true);
+    if (hasSidePanel) setShowRightSidebar(true);
+    else setShowMobileDetails(true);
   };
 
   const handleShowDetails = (song: Song) => {
     setSelectedSong(song);
     // the side panel exists from Tailwind's xl up; below it the details open over the page
-    if (window.matchMedia('(min-width: 80rem)').matches) setShowRightSidebar(true);
+    if (hasSidePanel) setShowRightSidebar(true);
     else setShowMobileDetails(true);
   };
 
@@ -533,6 +558,40 @@ function AppContent() {
       setSelectedSong(updatedSong);
     }
   };
+
+  // The interface scale kept from the last session, and Ctrl with plus, minus, nought or the wheel to change it.
+  // The Winamp mode zooms the page for its skin and leaves the shortcuts alone while it is open.
+  useEffect(() => {
+    let scale = storedUiScale();
+    applyUiScale(scale).catch((error) => console.error('[ERROR] the interface scale could not be applied:', error));
+    const winampOpen = () => document.getElementById('webamp') !== null;
+    const change = (next: number | null) => {
+      if (next === null || next === scale) return;
+      scale = next;
+      setUiScale(next).catch((error) => console.error('[ERROR] the interface scale could not be applied:', error));
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || winampOpen()) return;
+      const next = scaleForKey(event.key, scale);
+      if (next === null) return;
+      event.preventDefault();
+      change(next);
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey || winampOpen() || event.deltaY === 0) return;
+      event.preventDefault();
+      change(scaleForKey(event.deltaY < 0 ? '+' : '-', scale));
+    };
+    const onScale = (event: Event) => { scale = (event as CustomEvent<number>).detail; };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('wheel', onWheel, { passive: false });
+    window.addEventListener(UI_SCALE_EVENT, onScale);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('wheel', onWheel);
+      window.removeEventListener(UI_SCALE_EVENT, onScale);
+    };
+  }, []);
 
   // Theme Effect
   useEffect(() => {
@@ -1259,6 +1318,30 @@ function AppContent() {
   // made after it was opened appears there too
   const selectedShown = selectedSong ? librarySongs.find(song => song.id === selectedSong.id) ?? selectedSong : null;
 
+  // the song details beside the list, on a window wide enough for them
+  const sidePanel = showRightSidebar && selectedShown && (
+    <>
+    {rightPanel.handle}
+    <div
+      className="hidden xl:block min-h-0 min-w-0 shrink-0 h-full bg-zinc-50 dark:bg-suno-panel relative z-10 transition-colors duration-300"
+      style={{ width: rightPanel.width }}
+    >
+      <RightSidebar
+        song={selectedShown}
+        onClose={() => setShowRightSidebar(false)}
+        onOpenCoverRegen={() => selectedSong && openCoverRegen(selectedSong)}
+        onReuse={handleReuse}
+        onSongUpdate={handleSongUpdate}
+        isLiked={selectedSong ? likedSongIds.has(selectedSong.id) : false}
+        onToggleLike={toggleLike}
+        onPlay={playSong}
+        isPlaying={isPlaying}
+        currentSong={currentSong}
+      />
+    </div>
+    </>
+  );
+
   const renderContent = (view: typeof currentView = currentView) => {
     switch (view) {
       case 'tools':
@@ -1269,6 +1352,7 @@ function AppContent() {
 
       case 'library': {
         return (
+          <div className="relative flex h-full min-h-0 min-w-0 w-full overflow-hidden">
           <LibraryView
             allSongs={librarySongs}
             likedSongs={likedSongs}
@@ -1289,9 +1373,17 @@ function AppContent() {
             onAddToPlaylist={openAddToPlaylistModal}
             onDeleteMany={handleDeleteSongs}
             onMidiMany={transcribeManyToMidi}
+            selectedSong={selectedSong}
+            onSelect={(s) => {
+              setSelectedSong(s);
+              setShowRightSidebar(true);
+            }}
             onShowDetails={toggleLibraryDetails}
-            detailsSongId={showMobileDetails ? selectedSong?.id ?? null : null}
+            onOpenCoverRegen={openCoverRegen}
+            detailsSongId={(hasSidePanel ? showRightSidebar : showMobileDetails) ? selectedSong?.id ?? null : null}
           />
+          {sidePanel}
+          </div>
         );
       }
 
@@ -1326,7 +1418,7 @@ function AppContent() {
         );
 
       case 'news':
-        return <NewsPage />;
+        return <NewsPage onOpen={openHubTarget} />;
 
       case 'create':
       default:
@@ -1335,6 +1427,7 @@ function AppContent() {
         // through. They used to be the same page, which made a running studio
         // look like it owed 26 GB.
         if (nativeModels === 'offline') return <StudioOffline />;
+        if (updateShown) return <UpdateScreen onLeave={() => setUpdateShown(false)} />;
         if (!nativeSetupReady) {
           // Until the studio has answered, and while the engine is coming up,
           // this is a wait - not a decision. The download page appears only
@@ -1402,29 +1495,7 @@ function AppContent() {
               />
             </div>
 
-            {/* Right Sidebar */}
-            {showRightSidebar && selectedShown && (
-              <>
-              {rightPanel.handle}
-              <div
-                className="hidden xl:block min-h-0 min-w-0 shrink-0 h-full bg-zinc-50 dark:bg-suno-panel relative z-10 transition-colors duration-300"
-                style={{ width: rightPanel.width }}
-              >
-                <RightSidebar
-                  song={selectedShown}
-                  onClose={() => setShowRightSidebar(false)}
-                  onOpenCoverRegen={() => selectedSong && openCoverRegen(selectedSong)}
-                  onReuse={handleReuse}
-                  onSongUpdate={handleSongUpdate}
-                  isLiked={selectedSong ? likedSongIds.has(selectedSong.id) : false}
-                  onToggleLike={toggleLike}
-                  onPlay={playSong}
-                  isPlaying={isPlaying}
-                  currentSong={currentSong}
-                />
-              </div>
-              </>
-            )}
+            {sidePanel}
 
             {/* Mobile Toggle Button */}
             <div className="md:hidden absolute top-4 right-4 z-50">
@@ -1466,7 +1537,7 @@ function AppContent() {
   return (
     <SongActionsProvider value={songActions}>
     <div className="flex h-dvh min-h-0 min-w-0 flex-col overflow-hidden bg-white dark:bg-suno text-zinc-900 dark:text-white font-sans antialiased selection:bg-pink-500/30 transition-colors duration-300">
-      <HubBars items={hubItems} elapsed={hubElapsed} view={currentView} closed={hubClosed} onClosed={closeHubNotice} />
+      <HubBars items={hubItems} elapsed={hubElapsed} view={hubSection} closed={hubClosed} onClosed={closeHubNotice} />
       {hubPopup && <HubPopup item={hubPopup} onClose={() => closeHubNotice(hubPopup.id)} onOpen={openHubTarget} />}
       <ShellPrompts />
       <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
@@ -1637,7 +1708,7 @@ function AppContent() {
 
       {/* Mobile Details Modal */}
       {showMobileDetails && selectedShown && (
-        <div className={`fixed inset-0 z-60 flex justify-end ${currentView === 'create' ? 'xl:hidden' : ''}`}>
+        <div className={`fixed inset-0 z-60 flex justify-end ${currentView === 'create' || currentView === 'library' ? 'xl:hidden' : ''}`}>
           <div
             className="absolute inset-0 bg-black/60 backdrop-blur-xs animate-in fade-in"
             onClick={() => setShowMobileDetails(false)}
