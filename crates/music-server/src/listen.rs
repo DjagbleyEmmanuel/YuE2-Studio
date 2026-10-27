@@ -117,6 +117,10 @@ fn seconds_within(peaks: &[(f64, f64)], budget: f64) -> Option<f64> {
 /// Q8_0 where the card holds it for two minutes of a song, Q4_K_M where it does not, the processor with Q4_K_M
 /// where not even a minute fits or the card does not run the captioner's CUDA 13.
 pub fn hearing(hardware: &crate::hardware::Hardware) -> Hearing {
+    // the Mac's captioner computes on Metal in the memory it shares with the system, which the table does not measure
+    if cfg!(target_os = "macos") {
+        return Hearing { lm: "moss-lm-q8_0.gguf", on_card: true, seconds: MAX_SECONDS };
+    }
     let budget = hardware.total_vram_gb - CARD_RESERVE_GB;
     let cuda13 = hardware.card_cuda == Some(crate::hardware::CudaBuild::Cuda13);
     if cuda13 {
@@ -371,6 +375,9 @@ mod tests {
 
     #[test]
     fn a_card_hears_what_its_memory_holds() {
+        if cfg!(target_os = "macos") {
+            return;
+        }
         let card = |gb: f64, cuda: Option<crate::hardware::CudaBuild>| crate::hardware::Hardware {
             gpu_name: None,
             total_vram_gb: gb,
