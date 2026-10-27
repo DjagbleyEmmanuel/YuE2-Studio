@@ -7,6 +7,7 @@ Windows build.
 
 ### Fixed
 
+- **Stems and Audio to MIDI on a computer with the CUDA Toolkit**: audio.cpp's CUDA 13 server looked for cuBLAS 13 beside itself and beside the engine only, while the engine takes it from an installed CUDA Toolkit and downloads none; the server then counted as not installed and HT-Demucs refused to run. The libraries on PATH, which the server loads too, now count.
 - **The assistant starts on Linux with a glibc older than 2.38**: the CUDA builds of llama.cpp need glibc 2.38, so on Ubuntu 22.04 and the like the assistant did not start; there it now runs the card through the Vulkan build, and its settings say why, as in Speech Studio.
 - **Programs started from the Linux AppImage no longer load its libraries**: the file manager, nvidia-smi, llama-server, Whisper, the trainer, the captioner and the command-line agents were started with the image's library path and could stop on a newer system («undefined symbol»); they start without it, as in Dub Studio.
 - **A program downloaded without its execute bit runs on Linux and macOS**: an archive packed on Windows carries none - audio.cpp's Linux server among them - and the program answered «Permission denied» or was left out of the unpacking; the studio makes it executable.

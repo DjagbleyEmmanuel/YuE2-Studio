@@ -220,14 +220,17 @@ impl Acpp {
         self.missing(build).is_empty() && (std::env::var_os("YUE_AUDIOCPP_SERVER").is_some() || self.missing_libraries(build).is_empty())
     }
 
-    /// The CUDA libraries a CUDA build imports that are in none of the places they come to: beside the program, and
-    /// the music engine's cuBLAS 13.
+    /// The CUDA libraries a CUDA build imports that are in none of the places Windows loads them from for the server:
+    /// beside the program, the music engine's cuBLAS 13, and PATH, which the server inherits (an installed CUDA
+    /// Toolkit's own, for which the engine downloads none).
     fn missing_libraries(&self, build: Build) -> Vec<&'static str> {
         let beside = self.folder(build);
+        let path: Vec<PathBuf> = std::env::var_os("PATH").map(|path| std::env::split_paths(&path).collect()).unwrap_or_default();
         let mut dirs: Vec<&Path> = vec![&beside];
         if let Some(cuda13) = self.cuda13_libraries.get() {
             dirs.push(cuda13);
         }
+        dirs.extend(path.iter().map(PathBuf::as_path));
         acpp_server::asset::missing_libraries(build, &dirs)
     }
 
