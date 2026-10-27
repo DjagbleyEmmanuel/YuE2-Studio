@@ -782,14 +782,14 @@ impl EngineOptions {
         }
     }
 
-    /// A Radeon of 8 GB or less on Vulkan: its flash attention is several times slower than without it, and a step
+    /// A Radeon card of 4 to 8 GB on Vulkan (an integrated Radeon reports less): its flash attention is several times slower than without it, and a step
     /// that long and a whole song's cache are where its driver gives the device up; without flash attention and with
     /// the cache of `RADEON_SMALL_MAX_SEQ` it renders in chunks that the engine fades into each other.
     fn small_radeon(&self) -> bool {
         let hardware = hardware::hardware();
         self.uses_vulkan()
             && !hardware.nvidia
-            && hardware.total_vram_gb > 0.0
+            && hardware.total_vram_gb >= 3.5
             && hardware.total_vram_gb <= 8.5
             && hardware.gpu_name.as_deref().is_some_and(|name| name.contains("Radeon") || name.contains("AMD"))
     }
@@ -2708,7 +2708,7 @@ async fn training_pack_files(state: &AppState) -> (Vec<Value>, bool) {
 async fn training_pack_download(state: &AppState) -> Option<downloads::DownloadProgress> {
     let separator_download = separation_download_progress(
         state.separator.downloader().active_for("separation").await,
-        state.lyrics_sync.downloader().active_for("separation").await,
+        state.acpp.downloader().active_for("separation").await,
     );
     let cublas_download = state.engine_runtime.downloader().active_for("engine").await;
     match state.training.downloader().active_for(training::SCOPE).await {
@@ -3309,7 +3309,12 @@ async fn start_separation(
     let wanted_runtime = state.separation_config.read().await.runtime;
     let engine = state.separation_config.read().await.engine;
     // audio.cpp's server of the chosen device is HT-Demucs's; Mel-Band RoFormer runs its own engine
-    let build = separation_build(wanted_runtime).map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    let build = separation_build(wanted_runtime);
+    if engine == separation::Engine::Htdemucs {
+        if let Err(error) = &build {
+            return Err(api_error(StatusCode::BAD_REQUEST, format!("{error:#}")));
+        }
+    }
     let roformer_gpu = roformer_on_card(&state, wanted_runtime);
     if engine == separation::Engine::Roformer && !state.separator.roformer_installed(roformer_gpu) {
         return Err(api_error(StatusCode::BAD_REQUEST, "Mel-Band RoFormer is not installed yet: Settings - Models - Stems".into()));
@@ -3346,7 +3351,7 @@ async fn start_separation(
                 }
                 return Ok((written, roformer_gpu));
             }
-            let separated = separation::separate_htdemucs(&acpp, &model, &audio, build, &|| false)?;
+            let separated = separation::separate_htdemucs(&acpp, &model, &audio, build?, &|| false)?;
             let mut written = Vec::new();
             let ran_on_gpu = separated.used_gpu;
             for stem in separated.stems {
@@ -7844,11 +7849,6 @@ async fn setup_cancel(State(state): State<AppState>) -> Result<Json<Value>, (Sta
     Ok(Json(compose_setup_status(&state, manager_status).await))
 }
 
-const ACPP_BUILDS: [acpp_server::asset::Build; 5] = {
-    use acpp_server::asset::Build;
-    [Build::Cuda13, Build::Cuda12, Build::Vulkan, Build::Cpu, Build::Metal]
-};
-
 /// The downloads of a part of the studio the update screen compares with the disk, its downloader's own catalogue
 /// (the assistant keeps its own kind of asset and is read apart).
 fn update_catalogue(part: update_screen::Part) -> Vec<&'static downloads::Asset> {
@@ -7860,7 +7860,7 @@ fn update_catalogue(part: update_screen::Part) -> Vec<&'static downloads::Asset>
         Part::Midi => midi::SIZES.iter().flat_map(midi::weight_assets).collect(),
         Part::Training => training::pack().iter().collect(),
         Part::Listening => training::listen_pack().iter().collect(),
-        Part::Audiocpp => ACPP_BUILDS.into_iter().flat_map(acpp::assets).collect(),
+        Part::Audiocpp => acpp::BUILDS.into_iter().flat_map(acpp::assets).collect(),
         Part::Assistant => Vec::new(),
     };
     let mut seen = std::collections::HashSet::new();
@@ -8878,7 +8878,7 @@ async fn import_completed_result(state: &AppState, job: &MusicJob, job_id: &str)
         if vocals_only {
             let model = state.separator.model_path();
             let config = state.separation_config.read().await.clone();
-            let build = separation_build(config.runtime)?;
+            let build = separation_build(config.runtime);
             if config.engine == separation::Engine::Htdemucs && !htdemucs_installed(state, config.runtime) {
                 anyhow::bail!("HT-Demucs is the chosen separator and is not installed: Settings - Models - Stems");
             }
@@ -8918,7 +8918,7 @@ async fn import_completed_result(state: &AppState, job: &MusicJob, job_id: &str)
                     }
                 }
                 let cancelled = || progress_state.jobs.blocking_read().get(&progress_id).is_none_or(|active| matches!(active.status, MusicJobStatus::Cancelled));
-                let separated = separation::separate_htdemucs(&acpp, &model, &samples, build, &cancelled)
+                let separated = separation::separate_htdemucs(&acpp, &model, &samples, build?, &cancelled)
                     .map_err(|error| if cancelled() { anyhow::anyhow!("Vocals extraction cancelled") } else { error })?;
                 let voice = separated.stems.into_iter().find(|stem| stem.name == "vocals").context("the separator returned no vocals")?;
                 let stereo = audio_post::Stereo {

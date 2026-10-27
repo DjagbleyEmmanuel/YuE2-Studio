@@ -1389,11 +1389,6 @@ mod tests {
         assert_eq!(resolved.prefix_args.len(), 3);
     }
 
-    fn invocation(id: &str, resolved: &ResolvedCli, model: Option<&str>) -> Invocation {
-        let workdir = tempfile::tempdir().unwrap();
-        build_invocation(kind(id), resolved, workdir.path(), "system contract", "user request", model).expect("a buildable invocation")
-    }
-
     #[test]
     fn claude_runs_headless_without_tools_or_mcp() {
         let workdir = tempfile::tempdir().unwrap();

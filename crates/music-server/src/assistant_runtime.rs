@@ -919,7 +919,9 @@ async fn download_asset(
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    if crate::downloads::holds_todays(asset.kind == AssetKind::Model, asset.url, target).await {
+    // the assistant's pins name their commits, so a file of another size is another build
+    let pinned_size = fs::metadata(target).is_ok_and(|meta| meta.len() == asset.bytes);
+    if pinned_size && crate::downloads::holds_todays(asset.kind == AssetKind::Model, asset.url, target).await {
         return Ok(());
     }
 

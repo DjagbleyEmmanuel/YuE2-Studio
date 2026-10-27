@@ -547,7 +547,8 @@ const STEPS_FILE: &str = "steps.jsonl";
 
 /// A run as its folder holds it: run.json, with the steps from their own file
 /// once it exists. A line still being written has no newline yet and is left
-/// for the next read.
+/// for the next read; one a stop cut off mid-write lies before the next step's
+/// line, and that step is the only one lost.
 fn read_run(dir: &Path) -> Option<Run> {
     let mut run: Run = read_json(&dir.join("run.json"))?;
     if let Ok(text) = std::fs::read_to_string(dir.join(STEPS_FILE)) {
@@ -556,10 +557,7 @@ fn read_run(dir: &Path) -> Option<Run> {
         for line in complete.lines() {
             match serde_json::from_str(line) {
                 Ok(record) => steps.push(record),
-                Err(error) => {
-                    eprintln!("[ERROR] {}: a step line is not JSON ({error}): {line}", dir.join(STEPS_FILE).display());
-                    return None;
-                }
+                Err(error) => eprintln!("[ERROR] {}: a step line cut off when it was written is left out ({error}): {line}", dir.join(STEPS_FILE).display()),
             }
         }
         run.steps = steps;
@@ -1052,7 +1050,7 @@ impl Training {
 
     /// Records one trained step by adding a line, not by writing the whole run again.
     fn append_step(&self, run_id: &str, record: TrainingStepRecord) -> Result<()> {
-        use std::io::Write;
+        use std::io::{Read, Seek, SeekFrom, Write};
         let dir = self.run_dir(run_id)?;
         if !dir.join(STEPS_FILE).is_file() {
             let mut run = self.run(run_id)?;
@@ -1060,8 +1058,17 @@ impl Training {
             write_steps(&dir, &run.steps)?;
             return write_json(&dir.join("run.json"), &Run { steps: Vec::new(), ..run });
         }
-        let mut file = std::fs::OpenOptions::new().append(true).open(dir.join(STEPS_FILE))?;
-        file.write_all(format!("{}\n", serde_json::to_string(&record)?).as_bytes())?;
+        let mut file = std::fs::OpenOptions::new().read(true).append(true).open(dir.join(STEPS_FILE))?;
+        // a line cut off by a stop mid-write ends without its newline: the next record starts a line of its own
+        let mut torn = false;
+        if file.metadata()?.len() > 0 {
+            let mut last = [0u8; 1];
+            file.seek(SeekFrom::End(-1))?;
+            file.read_exact(&mut last)?;
+            torn = last[0] != b'\n';
+        }
+        let line = serde_json::to_string(&record)?;
+        file.write_all(format!("{}{line}\n", if torn { "\n" } else { "" }).as_bytes())?;
         Ok(())
     }
 
@@ -1720,6 +1727,9 @@ mod tests {
         std::io::Write::write_all(&mut torn, b"{\"step\":5,\"lo").unwrap();
         drop(torn);
         assert_eq!(training.run("r1").unwrap().steps.len(), 4);
+        // a stop cut that line off: the run carries on after it
+        training.append_step("r1", record(6)).unwrap();
+        assert_eq!(training.run("r1").unwrap().steps.iter().map(|record| record.step).collect::<Vec<_>>(), [1, 2, 3, 4, 6]);
         let mut again = training.run("r1").unwrap();
         again.steps.retain(|record| record.step <= 2);
         again.status = RunStatus::Done;

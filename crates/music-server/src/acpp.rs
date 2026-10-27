@@ -58,11 +58,14 @@ fn exe_name() -> &'static str {
     if cfg!(windows) { "audiocpp_server.exe" } else { "audiocpp_server" }
 }
 
+/// Every build of the server, published for this platform or not.
+pub const BUILDS: [Build; 5] = [Build::Cuda13, Build::Cuda12, Build::Vulkan, Build::Cpu, Build::Metal];
+
 /// The server archive of a build, as the studio's downloader fetches it into `runtime/<build folder>`.
 fn server_asset(build: Build) -> Option<&'static Asset> {
     static ASSETS: OnceLock<Vec<(Build, Asset)>> = OnceLock::new();
     let all = ASSETS.get_or_init(|| {
-        [Build::Cuda13, Build::Cuda12, Build::Vulkan, Build::Cpu, Build::Metal]
+        BUILDS
             .into_iter()
             .filter_map(|build| {
                 let pinned = build.server()?;
@@ -176,10 +179,12 @@ impl Acpp {
     }
 
     /// The registered models whose files are on disk now: the server reads each configured model's contract when it
-    /// starts, and one missing file would stop all of them.
+    /// starts, and one missing file would stop all of them. A model folder (MuScriptor's) counts once both of its
+    /// files are there, since the folder appears with the first of them.
     fn models_on_disk(&self) -> Vec<ModelEntry> {
+        let complete = |path: &Path| path.is_file() || ["config.json", "model.safetensors"].iter().all(|file| path.join(file).is_file());
         let known = self.known.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut models: Vec<ModelEntry> = known.iter().filter(|model| model.path.exists()).cloned().collect();
+        let mut models: Vec<ModelEntry> = known.iter().filter(|model| complete(&model.path)).cloned().collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
     }
@@ -324,7 +329,7 @@ mod tests {
 
     #[test]
     fn every_build_this_platform_publishes_has_its_downloads() {
-        for build in [Build::Cuda13, Build::Cuda12, Build::Vulkan, Build::Cpu, Build::Metal] {
+        for build in BUILDS {
             let Some(pinned) = build.server() else { continue };
             let downloads = assets(build);
             assert_eq!(downloads[0].url, pinned.url);

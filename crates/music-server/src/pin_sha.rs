@@ -108,11 +108,6 @@ const NO_PUBLISHED_SHA256: &[&str] = &[
     "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-8.9.7.29_cuda11-archive.tar.xz",
 ];
 
-const ACPP_BUILDS: [acpp_server::asset::Build; 5] = {
-    use acpp_server::asset::Build;
-    [Build::Cuda13, Build::Cuda12, Build::Vulkan, Build::Cpu, Build::Metal]
-};
-
 /// The SHA-256 the pin at `url` names: this table, then the transcribe.cpp builds and models of the shared binding,
 /// then audio.cpp's server archives and the CUDA 12 wheels of the shared client.
 pub fn sha256(url: &str) -> Option<&'static str> {
@@ -125,7 +120,7 @@ pub fn sha256(url: &str) -> Option<&'static str> {
     if let Some(model) = dub_tcpp::MODELS.iter().find(|model| model.download.url == url) {
         return Some(model.download.sha256);
     }
-    ACPP_BUILDS
+    crate::acpp::BUILDS
         .iter()
         .filter_map(|build| build.server())
         .chain(acpp_server::asset::CUDA12_RUNTIME.iter().copied())
@@ -238,7 +233,7 @@ mod tests {
         urls.extend(crate::assistant_runtime::ASSETS.iter().map(|asset| asset.url));
         urls.extend([crate::separation::MODEL.url, crate::separation::ROFORMER_MODEL.url]);
         urls.extend([true, false].into_iter().filter_map(crate::separation::Separator::roformer_engine).map(|asset| asset.url));
-        urls.extend(ACPP_BUILDS.into_iter().flat_map(crate::acpp::assets).map(|asset| asset.url));
+        urls.extend(crate::acpp::BUILDS.into_iter().flat_map(crate::acpp::assets).map(|asset| asset.url));
         urls.extend(crate::midi::SIZES.iter().flat_map(crate::midi::weight_assets).map(|asset| asset.url));
         urls.extend(crate::training::pack().iter().chain(crate::training::listen_pack()).map(|asset| asset.url));
         let missing: Vec<&str> = urls.into_iter().filter(|url| sha256(url).is_none() && !unpublished(url)).collect();

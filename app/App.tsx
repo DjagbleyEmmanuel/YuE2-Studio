@@ -175,10 +175,18 @@ function AppContent() {
   // a release that changed what the studio downloads shows its update screen once, before the studio
   const [updateShown, setUpdateShown] = useState(false);
   useEffect(() => {
-    readUpdatePlan().then(
-      (update) => setUpdateShown(update.plan.show),
-      (problem: unknown) => console.error('the update plan was not read', problem),
+    // the window can open before the service answers: the plan is asked again until it does
+    let timer = 0;
+    let cancelled = false;
+    const read = () => readUpdatePlan().then(
+      (update) => { if (!cancelled) setUpdateShown(update.plan.show); },
+      (problem: unknown) => {
+        console.error('the update plan was not read, asking again', problem);
+        if (!cancelled) timer = window.setTimeout(read, 3000);
+      },
     );
+    void read();
+    return () => { cancelled = true; window.clearTimeout(timer); };
   }, []);
   // A track sent here from a menu's "separate into stems".
   const [stemsSongId, setStemsSongId] = useState<string | null>(null);
