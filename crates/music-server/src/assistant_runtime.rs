@@ -957,9 +957,10 @@ async fn download_asset(
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     // a model counts here as `is_installed` counts it, by the pin's exact size: a file of another size is replaced
+    let pinned_size = fs::metadata(target).is_ok_and(|meta| meta.len() == asset.bytes);
     let todays = match asset.kind {
-        AssetKind::Model => fs::metadata(target).is_ok_and(|meta| meta.len() == asset.bytes),
-        _ => crate::downloads::holds_todays(false, asset.url, target).await,
+        AssetKind::Model => pinned_size,
+        _ => pinned_size && crate::downloads::holds_todays(false, asset.url, target).await,
     };
     if todays {
         return Ok(());
