@@ -3,6 +3,17 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## 2026-10-27 — 3.8.2
+
+YuE2 Studio, ACE-Step Studio and MiniMax Music3 Studio are on one version again: 3.8.2 follows 3.8.0 here.
+
+### Fixed
+
+- **The engine starts when its port is taken or reserved**: the engine listens on port 18087, and when another program held it - or Windows had reserved it for Hyper-V, WSL or Docker - every song was lost with "cannot bind 127.0.0.1:18087". The studio now checks the port before the engine starts and, when it cannot have it, gives the engine a free one; the engine log says which program held 18087 (its name and PID) or which reserved range it lies in, and a song lost to a port taken later says so in the window's language.
+- **A hub popup stays on screen once shown**, until it is closed, rather than going away when a song starts.
+- **An M4A of Apple Lossless is kept as FLAC**: only an M4A or MP4 whose audio is AAC plays in the window as it is.
+- **Downloads check, unpack and record their files off the service's workers**, so a gigabytes-large check no longer holds up the window's other requests; the update screen's progress keeps polling while the window around it redraws.
+
 ## 2026-10-27 — 3.8.0
 
 ### Fixed

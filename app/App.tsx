@@ -175,18 +175,20 @@ function AppContent() {
   // a release that changed what the studio downloads shows its update screen once, before the studio
   const [updateShown, setUpdateShown] = useState(false);
   useEffect(() => {
-    // the window can open before the service answers: the plan is asked again until it does
-    let timer = 0;
-    let cancelled = false;
-    const read = () => readUpdatePlan().then(
-      (update) => { if (!cancelled) setUpdateShown(update.plan.show); },
-      (problem: unknown) => {
-        console.error('the update plan was not read, asking again', problem);
-        if (!cancelled) timer = window.setTimeout(read, 3000);
-      },
-    );
-    void read();
-    return () => { cancelled = true; window.clearTimeout(timer); };
+    // the window can come up before the service listens: the plan is asked for again until it answers
+    let stopped = false;
+    let timer: number | undefined;
+    const ask = () => {
+      readUpdatePlan().then(
+        (update) => { if (!stopped) setUpdateShown(update.plan.show); },
+        (problem: unknown) => {
+          console.error('the update plan was not read', problem);
+          if (!stopped) timer = window.setTimeout(ask, 2000);
+        },
+      );
+    };
+    ask();
+    return () => { stopped = true; window.clearTimeout(timer); };
   }, []);
   // A track sent here from a menu's "separate into stems".
   const [stemsSongId, setStemsSongId] = useState<string | null>(null);
@@ -424,6 +426,7 @@ function AppContent() {
   const making = generations.isGenerating || generations.activeJobCount > 0 || (activity.data ?? []).some(entry => entry.state === 'running');
   const hubSection = hubView(currentView, showSettingsModal);
   const [hubClosed, setHubClosed] = useState<Set<string>>(() => new Set());
+  const [hubPopupOnScreen, setHubPopupOnScreen] = useState<string | null>(null);
   const hubStart = useRef(Date.now());
   const [hubElapsed, setHubElapsed] = useState(0);
   const hubNextDelay = hubItems.reduce<number | null>((next, item) => (item.rules.delay_s > hubElapsed && (next === null || item.rules.delay_s < next) ? item.rules.delay_s : next), null);
@@ -442,7 +445,11 @@ function AppContent() {
     setHubClosed(previous => new Set(previous).add(id));
     hubStateChanged();
   };
-  const hubPopup = making ? undefined : hubItems.find(item => item.kind === 'popup' && !hubClosed.has(item.id) && showsNow(item, hubElapsed, hubSection));
+  // a popup waits until nothing is being made to appear, and once on screen it stays until it is closed
+  const heldPopup = hubPopupOnScreen ? hubItems.find(item => item.id === hubPopupOnScreen && !hubClosed.has(item.id) && showsNow(item, hubElapsed, hubSection)) : undefined;
+  const hubPopup = heldPopup ?? (making ? undefined : hubItems.find(item => item.kind === 'popup' && !hubClosed.has(item.id) && showsNow(item, hubElapsed, hubSection)));
+  // what was on screen is known once the render that showed it is committed
+  useEffect(() => { setHubPopupOnScreen(hubPopup?.id ?? null); }, [hubPopup?.id]);
   const openHubTarget = (target: NonNullable<HubButton['target']>) => {
     if (target === 'news') {
       setCurrentView('news');
