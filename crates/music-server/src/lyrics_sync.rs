@@ -1702,6 +1702,7 @@ impl LyricsSync {
         if let Some(path) = music_core::process::own_libraries_first(binary) {
             command.env("LD_LIBRARY_PATH", path);
         }
+        dub_core::proc::outside_appimage(&mut command);
         command
             .args(wavs)
             .arg("--model")

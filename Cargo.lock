@@ -1655,6 +1655,7 @@ dependencies = [
  "chrono",
  "dicebear-core",
  "dicebear-styles",
+ "dub-core",
  "dub-sep",
  "dub-tcpp",
  "encoding_rs",

@@ -210,7 +210,7 @@ pub fn recommended_local_profile() -> &'static str {
 }
 
 fn quiet(program: &str) -> Command {
-    let mut command = Command::new(program);
+    let mut command = dub_core::proc::host_command(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
