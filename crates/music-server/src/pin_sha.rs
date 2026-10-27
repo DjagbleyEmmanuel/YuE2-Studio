@@ -101,6 +101,7 @@ const PINNED: &[(&str, &str)] = &[
 
 /// Pins whose publisher states no SHA-256 (Purfview's Whisper-Faster releases have no GitHub digest, NVIDIA's
 /// manifest of cuDNN 8.9.7.29 lists only its CUDA 12 builds): checked by size and install record only.
+#[cfg(test)]
 const NO_PUBLISHED_SHA256: &[&str] = &[
     "https://github.com/Purfview/whisper-standalone-win/releases/download/faster-whisper/Whisper-Faster_r192.3_windows.zip",
     "https://github.com/Purfview/whisper-standalone-win/releases/download/faster-whisper/Whisper-Faster_r189.1_linux.zip",
@@ -129,6 +130,7 @@ pub fn sha256(url: &str) -> Option<&'static str> {
 }
 
 /// Whether `url` is a pin whose publisher states no SHA-256.
+#[cfg(test)]
 pub fn unpublished(url: &str) -> bool {
     NO_PUBLISHED_SHA256.contains(&url)
 }

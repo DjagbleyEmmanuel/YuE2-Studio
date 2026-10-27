@@ -936,6 +936,7 @@ pub fn picked_file_name(entry: &str) -> &str {
 
 /// The programs among unpacked `files`: the ones `marker` names, without an extension, as Linux and macOS name
 /// programs (a library or a data file has one).
+#[cfg(any(unix, test))]
 fn programs_among<'a>(marker: &str, files: &'a [PathBuf]) -> Vec<&'a PathBuf> {
     if marker.is_empty() {
         return Vec::new();

@@ -173,7 +173,6 @@ fn probe(source: Box<dyn symphonia::core::io::MediaSource>, extension: Option<&s
 }
 
 /// A file's length from its header, without decoding it.
-#[cfg(test)]
 pub fn duration_seconds(path: &Path) -> Option<f64> {
     let format = open_format(path).ok()?;
     let track = format.default_track(TrackType::Audio)?;
