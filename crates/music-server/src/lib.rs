@@ -4779,6 +4779,12 @@ fn lost_job_reason(log: &str) -> SongError {
             Some(card) => format!("{error} on {card}"),
             None => error,
         }))
+    } else if lowered.contains("cannot bind") {
+        SongError::LostPort {
+            port: music_engine::yue_server::engine_port(),
+            set: music_engine::yue_server::engine_port_is_set(),
+            note: music_engine::yue_server::engine_port_note().map(str::to_string),
+        }
     } else if let Some(exit) = engine_exit(log) {
         SongError::LostExited { exit, line: last_engine_line(log) }
     } else {
@@ -4903,7 +4909,7 @@ fn engine_location(options: EngineOptions) -> music_engine::yue_server::YueServe
             .map(PathBuf::from)
             .or_else(|| options.engine_bin.as_ref().map(|path| path.trim()).filter(|path| !path.is_empty()).map(PathBuf::from)),
         host: env::var("YUE_ENGINE_HOST").ok(),
-        port: env::var("YUE_ENGINE_PORT").ok().and_then(|value| value.parse().ok()),
+        port: Some(music_engine::yue_server::engine_port()),
         options: options.to_engine(),
     }
 }
@@ -9364,7 +9370,7 @@ async fn cancel_score_job(
 impl EngineClient {
     fn from_environment() -> Self {
         let base_url = env::var("YUE_ENGINE_BASE_URL")
-            .unwrap_or_else(|_| format!("http://127.0.0.1:{}", music_engine::yue_server::DEFAULT_PORT))
+            .unwrap_or_else(|_| format!("http://127.0.0.1:{}", music_engine::yue_server::engine_port()))
             .trim_end_matches('/')
             .to_owned();
         // the engine's server drops a connection idle for 5 s; a pooled one can be
@@ -9995,6 +10001,8 @@ mod tests {
         assert!(lost_job_reason("ggml_cuda_compute_forward: MUL_MAT failed").to_string().contains("CUDA or driver error"));
         assert!(lost_job_reason("[NAR] Step 2/16, 87844 ms\n[NAR] Step 3/16\n[studio] the engine stopped answering").to_string().contains("its last line was [NAR] Step 3/16."));
         assert!(lost_job_reason("[Server] listening").to_string().contains("stopped during this song"));
+        let taken = lost_job_reason("[Server] FATAL: cannot bind 127.0.0.1:18087").to_string();
+        assert!(taken.contains(&format!("could not listen on port {}", music_engine::yue_server::engine_port())) && taken.contains("another program"), "{taken}");
     }
 
     #[test]

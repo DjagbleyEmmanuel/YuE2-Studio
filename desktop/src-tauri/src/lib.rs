@@ -124,7 +124,7 @@ fn configure_studio_runtime_paths() {
     // The service resolves and supervises the engine; the shell only needs the
     // loopback address they agree on.
     let host = std::env::var("YUE_ENGINE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let port = std::env::var("YUE_ENGINE_PORT").ok().and_then(|value| value.parse::<u16>().ok()).unwrap_or(music_engine::yue_server::DEFAULT_PORT);
+    let port = music_engine::yue_server::engine_port();
     if std::env::var_os("YUE_ENGINE_BASE_URL").is_none() {
         unsafe {
             std::env::set_var("YUE_ENGINE_BASE_URL", format!("http://{host}:{port}"));

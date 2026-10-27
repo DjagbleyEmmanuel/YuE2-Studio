@@ -27,6 +27,9 @@ pub enum SongError {
     Lost,
     /// Lost with an engine that ended on this exit code (`0xc0000005`), with its last line when it wrote one.
     LostExited { exit: String, line: Option<String> },
+    /// Lost with an engine that could not listen on its port: `set` when YUE_ENGINE_PORT names it, else another
+    /// program took the port the studio chose, which `note` says when it was not the engine's own.
+    LostPort { port: u16, set: bool, note: Option<String> },
     /// The engine gave the song up while loading the models: the card's memory ran out.
     LoadVram,
     /// The engine gave the song up while loading the models: the computer's memory ran out.
@@ -101,6 +104,8 @@ impl SongError {
             SongError::Lost => "lost",
             SongError::LostExited { exit, .. } if exit == ILLEGAL_INSTRUCTION => "lost_illegal_instruction",
             SongError::LostExited { .. } => "lost_exited",
+            SongError::LostPort { set: true, .. } => "lost_port_set",
+            SongError::LostPort { set: false, .. } => "lost_port_taken",
             SongError::LoadVram => "load_vram",
             SongError::LoadRam => "load_ram",
             SongError::EngineFatal(_) => "engine_fatal",
@@ -132,6 +137,7 @@ impl SongError {
             SongError::LostAtLine(line) | SongError::EngineFatal(line) => put("line", json!(line)),
             SongError::AdapterMissing(name) => put("name", json!(name)),
             SongError::LostExited { exit, .. } => put("exit", json!(exit)),
+            SongError::LostPort { port, .. } => put("port", json!(port)),
             SongError::ContextShort { tokens, context, can_last, asked, .. } => {
                 put("tokens", json!(tokens));
                 put("context", json!(context));
@@ -194,6 +200,11 @@ impl fmt::Display for SongError {
                     None => write!(f, "The engine stopped during this song ({how}) and restarted, so the song was lost. The engine log is in Settings, Engine."),
                 }
             }
+            SongError::LostPort { port, set: true, .. } => write!(f, "The engine could not listen on port {port}, which YUE_ENGINE_PORT sets, so the song was lost: another program holds it. Close that program or set another port."),
+            SongError::LostPort { port, set: false, note } => {
+                let chosen = note.as_deref().map(|note| format!(" (At start {note}.)")).unwrap_or_default();
+                write!(f, "The engine could not listen on port {port}, so the song was lost: another program took the port after the studio chose it.{chosen} Restart the studio: it chooses a free port at start.")
+            }
             SongError::LoadVram => f.write_str("The graphics card ran out of memory while the engine was loading the models. Choose a smaller quantisation in the model manager, or close whatever else is using the card - the writing assistant holds several gigabytes of its own."),
             SongError::LoadRam => f.write_str("The computer ran out of memory (RAM) while the engine was loading the models. Close other programs that take memory, or choose a smaller quantisation in the model manager."),
             SongError::EngineFatal(line) | SongError::ContextShort { line, .. } | SongError::ScoreUnsingable { line, .. } => f.write_str(line),
@@ -237,6 +248,8 @@ mod tests {
             SongError::Lost,
             SongError::LostExited { exit: "0xc0000005".into(), line: None },
             SongError::LostExited { exit: ILLEGAL_INSTRUCTION.into(), line: Some("x".into()) },
+            SongError::LostPort { port: 18087, set: true, note: None },
+            SongError::LostPort { port: 18088, set: false, note: Some("x".into()) },
             SongError::LoadVram,
             SongError::LoadRam,
             SongError::EngineFatal("x".into()),
@@ -261,6 +274,7 @@ mod tests {
                 | SongError::LostAtLine(_)
                 | SongError::Lost
                 | SongError::LostExited { .. }
+                | SongError::LostPort { .. }
                 | SongError::LoadVram
                 | SongError::LoadRam
                 | SongError::EngineFatal(_)
