@@ -86,15 +86,16 @@ pub const ROFORMER_MODEL: Asset = Asset {
     note: "The vocals and the rest, cleaner than HT-Demucs: Dub Studio's separator, run by BSRoformer.cpp.",
 };
 
-/// BSRoformer.cpp (chenmozhijin), the CUDA build and the processor build, as Dub Studio ships them.
+/// BSRoformer.cpp (timoncool studio-0.1.1), the CUDA build and the processor build, each with a ggml-cpu per
+/// instruction level so any x86-64 runs it, as Dub Studio ships them.
 #[cfg(windows)]
 pub const ROFORMER_ENGINE: Asset = Asset {
     id: "bsroformer-engine",
     label: "BSRoformer.cpp (CUDA)",
     kind: AssetKind::Runtime,
-    url: "https://github.com/chenmozhijin/BSRoformer.cpp/releases/download/v0.1.0/BSRoformer-windows-cuda-13.1.0.zip",
+    url: "https://github.com/timoncool/BSRoformer.cpp/releases/download/studio-0.1.1/BSRoformer-windows-cuda13-x64.zip",
     relative_path: "bsroformer-cuda.zip",
-    bytes: 164_990_561,
+    bytes: 119_367_905,
     unzip_into: Some("bsroformer"),
     marker: "bs_roformer-cli",
     pick: &[],
@@ -106,9 +107,9 @@ pub const ROFORMER_ENGINE_CPU: Asset = Asset {
     id: "bsroformer-engine-cpu",
     label: "BSRoformer.cpp (processor)",
     kind: AssetKind::Runtime,
-    url: "https://github.com/chenmozhijin/BSRoformer.cpp/releases/download/v0.1.0/BSRoformer-windows-x64-msvc.zip",
+    url: "https://github.com/timoncool/BSRoformer.cpp/releases/download/studio-0.1.1/BSRoformer-windows-cpu-x64.zip",
     relative_path: "bsroformer-cpu.zip",
-    bytes: 671_031,
+    bytes: 3_006_666,
     unzip_into: Some("bsroformer-cpu"),
     marker: "bs_roformer-cli",
     pick: &[],
@@ -120,9 +121,9 @@ pub const ROFORMER_ENGINE: Asset = Asset {
     id: "bsroformer-engine",
     label: "BSRoformer.cpp (CUDA)",
     kind: AssetKind::Runtime,
-    url: "https://github.com/chenmozhijin/BSRoformer.cpp/releases/download/v0.1.0/BSRoformer-linux-cuda-13.1.0.tar.xz",
-    relative_path: "bsroformer-cuda.tar.xz",
-    bytes: 239_527_692,
+    url: "https://github.com/timoncool/BSRoformer.cpp/releases/download/studio-0.1.1/BSRoformer-linux-cuda13-x64.tar.gz",
+    relative_path: "bsroformer-cuda.tar.gz",
+    bytes: 123_464_218,
     unzip_into: Some("bsroformer"),
     marker: "bs_roformer-cli",
     pick: &[],
@@ -134,9 +135,9 @@ pub const ROFORMER_ENGINE_CPU: Asset = Asset {
     id: "bsroformer-engine-cpu",
     label: "BSRoformer.cpp (processor)",
     kind: AssetKind::Runtime,
-    url: "https://github.com/chenmozhijin/BSRoformer.cpp/releases/download/v0.1.0/BSRoformer-linux-x64-cpu.tar.xz",
-    relative_path: "bsroformer-cpu.tar.xz",
-    bytes: 640_204,
+    url: "https://github.com/timoncool/BSRoformer.cpp/releases/download/studio-0.1.1/BSRoformer-linux-cpu-x64.tar.gz",
+    relative_path: "bsroformer-cpu.tar.gz",
+    bytes: 5_849_988,
     unzip_into: Some("bsroformer-cpu"),
     marker: "bs_roformer-cli",
     pick: &[],
@@ -244,8 +245,6 @@ impl Separator {
     /// The vocals and the rest of interleaved 44.1 kHz stereo, through Dub Studio's separator.
     pub fn separate_roformer(&self, samples: &[f32], gpu: bool) -> Result<(Vec<f32>, Vec<f32>)> {
         let cli = self.roformer_cli(gpu).context("Mel-Band RoFormer has no build for this platform")?;
-        // both builds carry one ggml-cpu built for AVX2 and FMA, the card's one too
-        dub_tcpp::cpu_floor("Mel-Band RoFormer").map_err(|reason| anyhow::anyhow!(reason))?;
         let work = tempfile::tempdir()?;
         let mix = work.path().join("mix.wav");
         let stereo = audio_post::Stereo {
