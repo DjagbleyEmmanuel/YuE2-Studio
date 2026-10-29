@@ -387,6 +387,12 @@ fn annotations(name: &str) -> Value {
 const JOURNAL: &[(&str, &str, &str)] = &[
     ("network_proxy_set", "updated", "settings"),
     ("network_access_set", "updated", "settings"),
+    // the weights going to another disk is the person's decision, and moving
+    // them is a change of theirs the Activity page should show
+    ("models_folder_set", "updated", "settings"),
+    // the LoRAs and the runtimes going to another disk is the person's
+    // decision, and moving them is a change of theirs Activity should show
+    ("downloads_folder_set", "updated", "settings"),
     ("cover_look_set", "updated", "settings"),
     ("midi_set", "updated", "midi"),
     ("library_song_note_set", "updated", "song"),
@@ -1814,6 +1820,30 @@ fn tools() -> &'static [Tool] {
                 call: |args| post("/setup/remove".into(), args.clone()),
             },
             Tool {
+                name: "models_folder_get",
+                description: "Where the downloaded model sets are stored, the room left on that disk, and whether the studio's own folder or the user's choice is in force.",
+                schema: nothing,
+                call: |_| get("/v1/models/directory".into()),
+            },
+            Tool {
+                name: "models_folder_set",
+                description: "Point the studio at another folder for the model sets, on any disk this machine has; directory is the folder to download into and move_existing carries the model files already downloaded over to it instead of downloading them again. An empty directory returns to the studio's own folder, and a running download must be cancelled first.",
+                schema: || object(json!({ "directory": { "type": "string" }, "move_existing": { "type": "boolean" } }), &[]),
+                call: |args| send(Method::PUT, "/v1/models/directory".into(), args.clone()),
+            },
+            Tool {
+                name: "downloads_folder_get",
+                description: "Where the LoRAs and every other download (stem separator, karaoke, Audio to MIDI, the audio.cpp runtime, the assistant's models, the trainer) are kept, what each folder takes, the room left on that disk, and whether a restart is needed to use a folder saved since.",
+                schema: nothing,
+                call: |_| get("/v1/downloads/directory".into()),
+            },
+            Tool {
+                name: "downloads_folder_set",
+                description: "Point the studio at another folder for the LoRAs and the other downloads, on any disk this machine has; directory is the folder and move_existing carries the folders already downloaded over to it instead of fetching them again. An empty directory returns to the studio's data folder, a running LoRA download must be cancelled first, and the folder is read the next time the studio starts.",
+                schema: || object(json!({ "directory": { "type": "string" }, "move_existing": { "type": "boolean" } }), &[]),
+                call: |args| send(Method::PUT, "/v1/downloads/directory".into(), args.clone()),
+            },
+            Tool {
                 name: "engine_logs",
                 description: "The music engine's recent log, for when a song fails or the engine will not start.",
                 schema: nothing,
@@ -3196,6 +3226,8 @@ mod tests {
     const NOT_TOOLS: &[(&str, &str, &str)] = &[
         ("GET", "/health", "the service's identity for the desktop shell: initialize names the server and its version"),
         ("POST", "/engine/pick-executable", "a file dialog for the person: engine_options_set takes the executable's path"),
+        ("POST", "/v1/models/pick-directory", "a folder dialog for the person: models_folder_set takes the folder's path"),
+        ("POST", "/v1/downloads/pick-directory", "a folder dialog for the person: downloads_folder_set takes the folder's path"),
         ("GET", "/v1/engine/progress", "the starting page's progress stream: studio_status and engine_logs"),
         ("GET", "/v1/proxy/image", "pictures from the internet relayed for the page"),
         ("POST", "/v1/files/save", "a save dialog for the person: the tools write to the path the agent names"),

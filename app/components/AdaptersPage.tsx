@@ -6,6 +6,7 @@ import { useI18n } from '../context/I18nContext';
 import { openExternal } from '../services/externalLinks';
 import { ConfirmDialog } from './ConfirmDialog';
 import { TrainingPanel } from './TrainingPanel';
+import { DownloadsFolderCard } from './DownloadsFolderCard';
 import {
   AdapterSlot,
   AdapterState,
@@ -668,6 +669,11 @@ export function AdaptersPage(): React.ReactElement {
                 />
               </div>
             </section>
+
+            {/* Where the LoRAs are read from: the folder used to be the
+                studio's own, and a full home partition had no answer in the
+                window. Also every other model the studio downloads. */}
+            <DownloadsFolderCard />
 
             {state && !state.engine_checked && state.installed.some(adapter => adapter.slots.length === 0) && (
               <p className="text-xs text-amber-600 dark:text-amber-300">{t('adaptersEngineOff')}</p>

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { openRouterSettingsChanged, SELF_READ } from '../services/studioQueries';
-import { Check, ChevronDown, Download, FolderDown, FolderOpen, Loader2, Square, Trash2, X } from 'lucide-react';
+import { Check, ChevronDown, Download, FolderCog, FolderDown, FolderOpen, Loader2, Square, Trash2, X } from 'lucide-react';
 import { useI18n } from '../context/I18nContext';
 import { DevicePicker, type Device } from './DevicePicker';
 import { ManualDownloads } from './ManualDownloads';
@@ -63,6 +63,30 @@ type SetupStatus = {
   portable?: boolean;
   /** Models taken from another program of timoncool's in this run instead of being downloaded, by id. */
   taken_from?: Record<string, { app: string; file: string }>;
+};
+
+/** Where the model sets are downloaded, and the room left on that disk. */
+type ModelsFolder = {
+  directory: string;
+  /** The folder the user picked and saved; null is the studio's own folder. */
+  chosen: string | null;
+  default: string;
+  free_bytes: number;
+  total_bytes: number;
+  /** An environment variable in force over both, when the studio was started by one. */
+  environment: string | null;
+};
+
+/** What pointing the studio at another folder did. */
+type RelocationReport = {
+  previous: string;
+  directory: string;
+  moved_existing: boolean;
+  moved: { file: string; bytes: number }[];
+  moved_bytes: number;
+  failed: { file: string; error: string }[];
+  free_bytes: number;
+  total_bytes: number;
 };
 
 type Profile = {
@@ -818,6 +842,83 @@ export const SetupGate: React.FC<{ onReady?: () => void; mode?: 'first-run' | 's
   const progress = active && active.total_bytes > 0 ? Math.min(100, (active.downloaded_bytes / active.total_bytes) * 100) : 0;
   const installedIds = status?.installed_components ?? [];
   const missing = (chosenIds ?? chosenValues).filter((id) => !installedIds.includes(id));
+  const missingBytes = selectedComponentBytes(catalog?.components || [], missing);
+  const installedBytes = (catalog?.components ?? [])
+    .filter((component) => installedIds.includes(component.id))
+    .reduce((sum, component) => sum + component.bytes, 0);
+
+  // Where the weights go. The studio used to decide this alone, and a home
+  // partition that filled up with twenty-six gigabytes said so through a failed
+  // download. The folder is the user's to choose, and the disk they pick may be
+  // any partition they have; this is the picker for it.
+  const [modelsFolder, setModelsFolder] = useState<ModelsFolder | null>(null);
+  const [pickedFolder, setPickedFolder] = useState<{ path: string; free_bytes: number; total_bytes: number } | null>(null);
+  const [moveExisting, setMoveExisting] = useState(false);
+  const [folderNote, setFolderNote] = useState<string | null>(null);
+  const [folderBusy, setFolderBusy] = useState(false);
+
+  const loadModelsFolder = useCallback(async () => {
+    const response = await fetch('/v1/models/directory');
+    if (!response.ok) return;
+    setModelsFolder((await response.json()) as ModelsFolder);
+  }, []);
+
+  useEffect(() => {
+    void loadModelsFolder().catch(() => undefined);
+  }, [loadModelsFolder]);
+
+  const chooseModelsFolder = async () => {
+    if (folderBusy) return;
+    setFolderNote(null);
+    const response = await fetch('/v1/models/pick-directory', { method: 'POST' });
+    if (!response.ok) {
+      setError(await errorMessage(response));
+      return;
+    }
+    const body = (await response.json()) as { picked: boolean; path: string | null; free_bytes: number; total_bytes: number };
+    if (!body.picked || !body.path || body.path === modelsFolder?.directory) return;
+    setPickedFolder({ path: body.path, free_bytes: body.free_bytes, total_bytes: body.total_bytes });
+    // Carrying gigabytes that are already here is offered, never assumed: on
+    // another disk it is a copy that takes as long as the download did.
+    setMoveExisting(installedBytes > 0);
+  };
+
+  const applyModelsFolder = async (directory: string | null) => {
+    if (folderBusy) return;
+    setFolderBusy(true);
+    setFolderNote(null);
+    setError(null);
+    try {
+      const response = await fetch('/v1/models/directory', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ directory, move_existing: moveExisting }),
+      });
+      if (!response.ok) {
+        setError(await errorMessage(response));
+        return;
+      }
+      const body = (await response.json()) as { report: RelocationReport };
+      setPickedFolder(null);
+      setFolderNote(
+        [
+          t('modelsFolderSet').replace('{folder}', body.report.directory),
+          body.report.moved.length > 0
+            ? t('modelsFolderMoved').replace('{count}', String(body.report.moved.length)).replace('{size}', bytes(body.report.moved_bytes))
+            : '',
+          body.report.failed.length > 0
+            ? t('modelsFolderRefused').replace('{files}', body.report.failed.map((file) => file.file).join(', '))
+            : '',
+        ]
+          .filter(Boolean)
+          .join(' '),
+      );
+      await loadModelsFolder();
+      await refresh().catch(() => undefined);
+    } finally {
+      setFolderBusy(false);
+    }
+  };
 
   // What the studio is set to right now, so "use this set" only appears when
   // the selection on screen is something else.
@@ -1146,6 +1247,90 @@ export const SetupGate: React.FC<{ onReady?: () => void; mode?: 'first-run' | 's
                         : t('adoptRefusedUnknown')}
                   </p>
                 ))}
+              </div>
+            )}
+            {/* Where the weights are downloaded. People whose home partition
+                filled up had no way to answer this from inside the studio. */}
+            {modelsFolder && (
+              <div className="mt-2 rounded-lg border border-zinc-200 p-3 dark:border-white/10">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">{t('modelsFolder')}</p>
+                <p className="mt-1 break-all font-mono text-[11px] text-zinc-600 dark:text-zinc-300">{modelsFolder.directory}</p>
+                <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                  {t('modelsFolderSpace').replace('{free}', bytes(modelsFolder.free_bytes)).replace('{total}', bytes(modelsFolder.total_bytes))}
+                </p>
+                {modelsFolder.environment && (
+                  <p className="mt-1 break-all text-[11px] leading-4 text-amber-600 dark:text-amber-300">
+                    {t('modelsFolderOverride').replace('{path}', modelsFolder.environment)}
+                  </p>
+                )}
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void chooseModelsFolder()}
+                    disabled={folderBusy || active?.status === 'downloading'}
+                    title={active?.status === 'downloading' ? t('modelsFolderBusy') : undefined}
+                    className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 px-2 py-1 text-[11px] font-medium text-zinc-600 hover:border-pink-400 hover:text-pink-600 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/15 dark:text-zinc-300"
+                  >
+                    <FolderCog size={13} />
+                    {t('modelsFolderChange')}
+                  </button>
+                  {modelsFolder.chosen && (
+                    <button
+                      type="button"
+                      onClick={() => void applyModelsFolder(null)}
+                      disabled={folderBusy || active?.status === 'downloading'}
+                      className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 px-2 py-1 text-[11px] font-medium text-zinc-600 hover:border-pink-400 hover:text-pink-600 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/15 dark:text-zinc-300"
+                    >
+                      {t('modelsFolderDefault')}
+                    </button>
+                  )}
+                </div>
+                {pickedFolder && (
+                  <div className="mt-2 rounded-lg border border-pink-400/40 bg-pink-500/5 p-2">
+                    <p className="text-[11px] font-medium text-zinc-600 dark:text-zinc-300">{t('modelsFolderPicked')}</p>
+                    <p className="mt-1 break-all font-mono text-[11px] text-zinc-700 dark:text-zinc-200">{pickedFolder.path}</p>
+                    <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                      {t('modelsFolderSpace').replace('{free}', bytes(pickedFolder.free_bytes)).replace('{total}', bytes(pickedFolder.total_bytes))}
+                    </p>
+                    {missingBytes > pickedFolder.free_bytes && (
+                      <p className="mt-1 text-[11px] leading-4 text-amber-600 dark:text-amber-300">
+                        {t('modelsFolderTight').replace('{need}', bytes(missingBytes)).replace('{free}', bytes(pickedFolder.free_bytes))}
+                      </p>
+                    )}
+                    {installedBytes > 0 && (
+                      <label className="mt-2 flex items-start gap-2 text-[11px] leading-4 text-zinc-600 dark:text-zinc-300">
+                        <input
+                          type="checkbox"
+                          checked={moveExisting}
+                          onChange={(event) => setMoveExisting(event.target.checked)}
+                          className="mt-0.5"
+                        />
+                        <span>{t('modelsFolderMove').replace('{size}', bytes(installedBytes))}</span>
+                      </label>
+                    )}
+                    <div className="mt-2 flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void applyModelsFolder(pickedFolder.path)}
+                        disabled={folderBusy}
+                        className="inline-flex items-center gap-1 rounded-lg bg-linear-to-r from-orange-500 to-pink-600 px-3 py-1 text-[11px] font-bold text-white hover:brightness-110 disabled:opacity-50"
+                      >
+                        {folderBusy ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+                        {t('modelsFolderUse')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPickedFolder(null)}
+                        disabled={folderBusy}
+                        className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium text-zinc-500 hover:text-zinc-700 disabled:opacity-40 dark:text-zinc-400 dark:hover:text-zinc-200"
+                      >
+                        <X size={13} />
+                        {t('cancel')}
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {folderNote && <p className="mt-2 text-[11px] leading-4 text-emerald-600 dark:text-emerald-300">{folderNote}</p>}
               </div>
             )}
           </div>

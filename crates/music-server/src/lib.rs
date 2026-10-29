@@ -17,6 +17,7 @@ mod prepare;
 mod audio_pcm;
 mod legacy_text;
 mod downloads;
+mod download_folders;
 mod install_record;
 mod pin_sha;
 mod engine_runtime;
@@ -90,6 +91,14 @@ struct AppState {
     /// the running job's progress.
     engine_log: engine_log::EngineLog,
     model_manager: ModelManager,
+    /// The folder the user picked for the downloaded model sets, as it is
+    /// saved: None is the studio's own folder. The manager's own root is what
+    /// is in force - this is what goes back into the settings file.
+    models_directory: Arc<RwLock<Option<String>>>,
+    /// The folder the user picked for the other downloads, as it is saved: None
+    /// is the studio's own data folder. The capabilities hold the folder that
+    /// is in force - this is what goes back into the settings file.
+    downloads_directory: Arc<RwLock<Option<String>>>,
     selected_profile_id: Arc<RwLock<Option<String>>>,
     selected_component_ids: Arc<RwLock<Option<Vec<String>>>>,
     settings_path: PathBuf,
@@ -664,6 +673,18 @@ struct PersistedStudioSettings {
     /// Access from other computers, off unless turned on.
     #[serde(default)]
     network: Option<remote::NetworkAccess>,
+    /// The folder the user picked for the downloaded model sets, when it is not
+    /// the studio's own data folder. Model weights are four to twenty-six
+    /// gigabytes, so which disk they land on is the user's decision, not the
+    /// studio's; this is where that decision is kept.
+    #[serde(default)]
+    models_directory: Option<String>,
+    /// The folder the user picked for everything else the studio downloads -
+    /// the LoRAs, the separators, the karaoke and MIDI models, the runtimes -
+    /// when it is not the studio's own data folder. Read at start, since each
+    /// capability keeps the folder it was built with.
+    #[serde(default)]
+    downloads_directory: Option<String>,
 }
 
 #[derive(Default)]
@@ -988,7 +1009,12 @@ pub async fn serve() -> anyhow::Result<()> {
     };
     let music_server = EngineClient::from_environment();
     let engine_log = engine_log::EngineLog::follow(music_server.http.clone(), music_server.url("/logs"));
-    let acpp = Arc::new(acpp::Acpp::new(&studio_data_root().unwrap_or_else(|| std::path::PathBuf::from("."))));
+    // Everything the capabilities download is read from here, at start: the
+    // LoRAs, the separators, the MIDI and karaoke models, the runtimes, the
+    // assistant's own models and the trainer. A person whose home disk is full
+    // keeps them on another one.
+    let downloads_root = downloads_base();
+    let acpp = Arc::new(acpp::Acpp::new(&downloads_root));
     let state = AppState {
         configuration: Arc::new(RwLock::new(sanitize_persisted_configuration(
             persisted.as_ref().map(|settings| settings.configuration.clone()).unwrap_or_else(initial_configuration),
@@ -997,6 +1023,20 @@ pub async fn serve() -> anyhow::Result<()> {
         music_server,
         engine_log,
         model_manager,
+        models_directory: Arc::new(RwLock::new(
+            persisted
+                .as_ref()
+                .and_then(|settings| settings.models_directory.clone())
+                .map(|path| path.trim().to_owned())
+                .filter(|path| !path.is_empty()),
+        )),
+        downloads_directory: Arc::new(RwLock::new(
+            persisted
+                .as_ref()
+                .and_then(|settings| settings.downloads_directory.clone())
+                .map(|path| path.trim().to_owned())
+                .filter(|path| !path.is_empty()),
+        )),
         cover_templates: Arc::new(RwLock::new(
             persisted
                 .as_ref()
@@ -1022,28 +1062,20 @@ pub async fn serve() -> anyhow::Result<()> {
         separation_config: Arc::new(RwLock::new(
             persisted.as_ref().and_then(|settings| settings.separation.clone()).unwrap_or_default(),
         )),
-        separator: Arc::new(separation::Separator::new(
-            &studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")),
-        )),
+        separator: Arc::new(separation::Separator::new(&downloads_root)),
         acpp: acpp.clone(),
         separation_run: Arc::new(RwLock::new(None)),
-        midi: Arc::new(midi::Transcriber::new(&studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")), acpp.clone())),
+        midi: Arc::new(midi::Transcriber::new(&downloads_root, acpp.clone())),
         midi_run: Arc::new(RwLock::new(None)),
         midi_notes: Arc::new(RwLock::new(Vec::new())),
         midi_stop: Arc::new((std::sync::atomic::AtomicBool::new(false), tokio::sync::Notify::new())),
-        adapters: Arc::new(adapters::AdapterLibrary::new(
-            &studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")),
-            PRIMARY_MUSIC_ENGINE_ID,
-        )),
+        adapters: Arc::new(adapters::AdapterLibrary::new(&downloads_root, PRIMARY_MUSIC_ENGINE_ID)),
         processing_run: Arc::new(RwLock::new(None)),
         prepare: Arc::new(std::sync::Mutex::new(None)),
         prepare_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         prepare_train: Arc::new(std::sync::Mutex::new(None)),
         update_job: Arc::new(RwLock::new(None)),
-        training: Arc::new(training::Training::new(
-            &studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")),
-            PRIMARY_MUSIC_ENGINE_ID,
-        )),
+        training: Arc::new(training::Training::new(&downloads_root, PRIMARY_MUSIC_ENGINE_ID)),
         selected_profile_id: Arc::new(RwLock::new(selected_profile_id)),
         selected_component_ids: Arc::new(RwLock::new(selected_component_ids)),
         settings_path,
@@ -1057,12 +1089,8 @@ pub async fn serve() -> anyhow::Result<()> {
         engine_start_error: Arc::new(RwLock::new(None)),
         active_device: Arc::new(RwLock::new(None)),
         assistant: Arc::new(RwLock::new(persisted.as_ref().map(|settings| settings.assistant.clone()).unwrap_or_default())),
-        assistant_runtime: Arc::new(assistant_runtime::AssistantRuntime::new(
-            &studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")),
-        )),
-        lyrics_sync: Arc::new(lyrics_sync::LyricsSync::new(
-            &studio_data_root().unwrap_or_else(|| std::path::PathBuf::from(".")),
-        )),
+        assistant_runtime: Arc::new(assistant_runtime::AssistantRuntime::new(&downloads_root)),
+        lyrics_sync: Arc::new(lyrics_sync::LyricsSync::new(&downloads_root)),
         lyrics_sync_config: Arc::new(RwLock::new(
             persisted.as_ref().map(|settings| settings.lyrics_sync.clone().migrated()).unwrap_or_default(),
         )),
@@ -1260,6 +1288,10 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/setup/download", post(setup_download))
         .route("/setup/remove", post(setup_remove))
         .route("/setup/adopt", post(setup_adopt))
+        .route("/v1/models/directory", get(models_directory_status).put(set_models_directory))
+        .route("/v1/models/pick-directory", post(pick_models_directory))
+        .route("/v1/downloads/directory", get(downloads_directory_status).put(set_downloads_directory))
+        .route("/v1/downloads/pick-directory", post(pick_downloads_directory))
         .route("/v1/open-data-directory", post(open_data_directory))
         .route("/setup/select", post(setup_select))
         .route("/setup/cancel", post(setup_cancel))
@@ -5426,6 +5458,44 @@ fn load_studio_settings(path: &PathBuf) -> Option<PersistedStudioSettings> {
     fs::read_to_string(path).ok().and_then(|body| serde_json::from_str(&body).ok())
 }
 
+/// The folder the user picked for the downloaded model sets, when the studio
+/// does not keep them in its own folder.
+///
+/// Read before anything resolves a model path, by the desktop shell as well as
+/// by this service, so both agree on one model library. A value that cannot be
+/// used is ignored rather than fatal: a studio pointed at a disk that is not
+/// mounted still has to start, and say so where a download would begin.
+pub fn saved_models_directory() -> Option<PathBuf> {
+    load_studio_settings(&studio_settings_path())
+        .and_then(|settings| settings.models_directory)
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The folder the user picked for everything else the studio downloads - the
+/// LoRAs, the stem separator, the karaoke and MIDI models, the runtimes, the
+/// assistant's own models and the trainer - when it is not the studio's data
+/// folder.
+///
+/// Read at start, before the capabilities that keep those folders are built: a
+/// folder chosen in the window takes effect the next time the studio opens.
+pub fn saved_downloads_directory() -> Option<PathBuf> {
+    load_studio_settings(&studio_settings_path())
+        .and_then(|settings| settings.downloads_directory)
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The root the downloaded model folders are read from: the user's choice, else
+/// the studio's own data folder.
+pub fn downloads_base() -> PathBuf {
+    saved_downloads_directory()
+        .or_else(studio_data_root)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 async fn persist_studio_settings(state: &AppState) -> anyhow::Result<()> {
     let settings = PersistedStudioSettings {
         engine_options: state.engine_options.read().await.clone(),
@@ -5442,6 +5512,8 @@ async fn persist_studio_settings(state: &AppState) -> anyhow::Result<()> {
         cover_look: Some(state.cover_look.read().await.clone()),
         proxy: Some(net::current()),
         network: Some(remote::current()),
+        models_directory: state.models_directory.read().await.clone(),
+        downloads_directory: state.downloads_directory.read().await.clone(),
     };
     if let Some(parent) = state.settings_path.parent() { fs::create_dir_all(parent)?; }
     let temporary = state.settings_path.with_extension("json.part");
@@ -7654,16 +7726,232 @@ fn adopt_refusals(components: &[model_manager::Component], root: &std::path::Pat
         .collect()
 }
 
+/// Where the model sets are downloaded, and the room left on that disk.
+///
+/// The folder used to be the studio's to decide alone, and a home partition
+/// that filled up with twenty-six gigabytes of weights said so through a failed
+/// download. The folder is the user's to choose; this reports what is in force,
+/// what the studio's own folder would be, and what filesystem the answer is on.
+async fn models_directory_status(State(state): State<AppState>) -> Json<Value> {
+    let root = state.model_manager.models_directory();
+    let (free_bytes, total_bytes) = state.model_manager.models_space();
+    // A variable the desktop shell set itself names the folder this studio would
+    // have used anyway, so it is not an override. Only one the person exported
+    // is: that is the folder a pick in the window would not survive a restart
+    // with, and the window says so.
+    let environment = env::var("YUE_MODELS_ROOT")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .filter(|_| env::var_os("YUE_MODELS_ROOT_DEFAULT").is_none());
+    Json(serde_json::json!({
+        "directory": root.display().to_string(),
+        // What was picked and saved; null is the studio's own folder.
+        "chosen": state.models_directory.read().await.clone(),
+        "default": model_manager::default_model_root().display().to_string(),
+        "free_bytes": free_bytes,
+        "total_bytes": total_bytes,
+        // An environment variable is an explicit override, as it is for the
+        // engine binary: said plainly here, so a studio started by a script
+        // does not look like it ignored the folder its user picked.
+        "environment": environment,
+    }))
+}
+
+/// Opens the system's own folder picker. Any mounted partition is in it, which
+/// is the whole point: the weights can go on the disk that has the room.
+async fn pick_models_directory() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Folder for the downloaded model sets".to_string())
+            .pick_folder()
+    })
+    .await
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let (free_bytes, total_bytes) = picked.as_deref().map(model_manager::space_at).unwrap_or((0, 0));
+    Ok(Json(serde_json::json!({
+        "picked": picked.is_some(),
+        "path": picked.as_ref().map(|path| path.display().to_string()),
+        "free_bytes": free_bytes,
+        "total_bytes": total_bytes,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsDirectoryRequest {
+    /// The folder to download into. Null or empty is the studio's own folder.
+    directory: Option<String>,
+    /// Carry the model sets already downloaded over to the new folder instead
+    /// of leaving them behind to be downloaded again.
+    #[serde(default)]
+    move_existing: bool,
+}
+
+/// Points the studio at another folder for its models, and says what it cost.
+async fn set_models_directory(
+    State(state): State<AppState>,
+    Json(request): Json<ModelsDirectoryRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let chosen = request
+        .directory
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty());
+    let target = chosen
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(model_manager::default_model_root);
+    let report = state
+        .model_manager
+        .relocate(target, request.move_existing)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    *state.models_directory.write().await = chosen;
+    persist_studio_settings(&state)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    // `yue-server` takes its weights at launch, so a folder it was not started
+    // on is a restart: this restarts an engine this studio owns when the files
+    // it serves are no longer the ones in force.
+    reload_engine_if_models_changed(&state).await;
+    let status = state.model_manager.status(effective_install_target(&state).await).await;
+    Ok(Json(serde_json::json!({
+        "report": report,
+        "status": compose_setup_status(&state, status).await,
+    })))
+}
+
+/// The root the downloaded model folders are read from at this moment: the one
+/// the capabilities were built with, which is the choice saved when the studio
+/// last started. A folder picked since is not in force until the studio opens
+/// again, and the window says so.
+async fn downloads_root_in_force(state: &AppState) -> PathBuf {
+    // The LoRAs are one folder of the root, so their parent is the root itself.
+    state
+        .adapters
+        .root()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(downloads_base)
+}
+
+/// Where the LoRAs, the runtimes and every other download are kept, the room
+/// left on that disk, and the folders and the space each takes.
+///
+/// The folder used to be the studio's alone, which left the person with a full
+/// home partition and no way to answer it from inside the studio. It is theirs
+/// to choose now; this reports what is in force and what was chosen.
+async fn downloads_directory_status_json(state: &AppState) -> Value {
+    let active = downloads_root_in_force(state).await;
+    let (free_bytes, total_bytes) = model_manager::space_at(&active);
+    let saved = downloads_base();
+    serde_json::json!({
+        "directory": active.display().to_string(),
+        // What was picked and saved; null is the studio's own folder.
+        "chosen": state.downloads_directory.read().await.clone(),
+        "default": studio_data_root().unwrap_or_else(|| PathBuf::from(".")).display().to_string(),
+        "free_bytes": free_bytes,
+        "total_bytes": total_bytes,
+        // What each folder takes where it is now.
+        "folders": download_folders::folder_sizes(&active),
+        // A folder chosen since the studio started is only read at the next
+        // start, so the window offers the restart instead of pretending.
+        "restart_required": saved != active,
+    })
+}
+
+async fn downloads_directory_status(State(state): State<AppState>) -> Json<Value> {
+    Json(downloads_directory_status_json(&state).await)
+}
+
+/// Opens the system's own folder picker for the downloads root. Any mounted
+/// partition is in it, which is the whole point.
+async fn pick_downloads_directory() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Folder for the LoRAs and the other downloads".to_string())
+            .pick_folder()
+    })
+    .await
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let (free_bytes, total_bytes) = picked.as_deref().map(model_manager::space_at).unwrap_or((0, 0));
+    Ok(Json(serde_json::json!({
+        "picked": picked.is_some(),
+        "path": picked.as_ref().map(|path| path.display().to_string()),
+        "free_bytes": free_bytes,
+        "total_bytes": total_bytes,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadsDirectoryRequest {
+    /// The root to keep the downloaded folders under. Null or empty is the
+    /// studio's own data folder.
+    directory: Option<String>,
+    /// Carry the folders already there to the new root instead of leaving them
+    /// behind to be downloaded again.
+    #[serde(default)]
+    move_existing: bool,
+}
+
+/// Points the studio at another folder for its other downloads, carrying what is
+/// already there when asked. Takes effect when the studio next opens, since each
+/// capability reads its folder once, at start.
+async fn set_downloads_directory(
+    State(state): State<AppState>,
+    Json(request): Json<DownloadsDirectoryRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let chosen = request
+        .directory
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty());
+    let target = chosen
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| studio_data_root().unwrap_or_else(|| PathBuf::from(".")));
+    let active = downloads_root_in_force(&state).await;
+    // Half a LoRA is not a LoRA: a download still arriving stays where it is.
+    if state.adapters.downloader().active_for(adapters::SCOPE).await.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "a LoRA download is running; cancel it before changing the downloads folder".into(),
+        ));
+    }
+    let report = if request.move_existing && target != active {
+        let (from, to) = (active.clone(), target.clone());
+        Some(
+            tokio::task::spawn_blocking(move || download_folders::relocate(&from, &to))
+                .await
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+                .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?,
+        )
+    } else {
+        fs::create_dir_all(&target)
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("create {}: {error}", target.display())))?;
+        None
+    };
+    *state.downloads_directory.write().await = chosen;
+    persist_studio_settings(&state)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let status = downloads_directory_status_json(&state).await;
+    Ok(Json(serde_json::json!({
+        "report": report,
+        "status": status,
+        "restart_required": status["restart_required"].as_bool().unwrap_or(false),
+    })))
+}
+
 /// Takes models the user already has instead of downloading them again.
 ///
 /// Anyone who has run yue2.cpp by hand already has these weights on disk, and
 /// they are gigabytes each. This opens a folder picker,
 /// looks for the files the catalogue names - by name, then by their contents -
-/// and hard-links or copies them into the studio's own model directory.
+/// and hard-links or copies them into the models folder the studio is using.
 async fn setup_adopt(State(state): State<AppState>, body: axum::body::Bytes) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let Some(models_root) = studio_data_root().map(|root| root.join("models").join(model_manager::ENGINE_ID)) else {
-        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "the studio has no data directory".into()));
-    };
+    // The folder the studio is working in right now: someone who moved the
+    // models to another disk must not have what they pick adopted into the old
+    // folder, where nothing would look for it again.
+    let models_root = state.model_manager.models_directory();
     let catalog = state.model_manager.catalog();
     // a folder an agent names is taken as it is; the window asks the user
     let named = serde_json::from_slice::<Value>(&body).ok().and_then(|value| value.get("path").and_then(Value::as_str).map(std::path::PathBuf::from));
@@ -10562,6 +10850,10 @@ mod tests {
             },
             selected_profile_id: None,
             selected_component_ids: Some(vec!["backbone-q8".into(), "vae-f32".into()]),
+            // The models folder a user picked: it outlives a restart.
+            models_directory: Some("/mnt/models/yue2".into()),
+            // So does the folder the LoRAs and the other downloads live in.
+            downloads_directory: Some("/mnt/models/downloads".into()),
             cover_templates: Some(cover_prompt::default_templates()),
             cover_auto: Some(true),
             cover_look: None,
@@ -10576,6 +10868,9 @@ mod tests {
         assert_eq!(restored.lyrics_sync.provider, lyrics_sync::AsrProvider::Parakeet);
         assert!(restored.selected_profile_id.is_none());
         assert_eq!(restored.selected_component_ids.unwrap(), vec!["backbone-q8", "vae-f32"]);
+        // A studio pointed at another disk stays pointed at it.
+        assert_eq!(restored.models_directory.as_deref(), Some("/mnt/models/yue2"));
+        assert_eq!(restored.downloads_directory.as_deref(), Some("/mnt/models/downloads"));
         // Engine flags survive a restart, and the songs-per-request ceiling is
         // derived from them rather than assumed.
         assert!(restored.engine_options.keep_loaded);
