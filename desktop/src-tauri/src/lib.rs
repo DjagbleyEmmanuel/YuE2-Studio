@@ -98,14 +98,8 @@ fn configure_studio_runtime_paths() {
             }
         }
     }
-    if std::env::var_os("YUE_MODELS_ROOT").is_none() {
-        unsafe {
-            std::env::set_var(
-                "YUE_MODELS_ROOT",
-                data_root.join("models").join("yue2-cpp"),
-            );
-        }
-    }
+    // The settings file and the data root are named before the models folder is
+    // resolved, because the saved models folder is read out of that very file.
     if std::env::var_os("YUE_STUDIO_SETTINGS_PATH").is_none() {
         unsafe {
             std::env::set_var("YUE_STUDIO_SETTINGS_PATH", data_root.join("studio-settings.json"));
@@ -118,6 +112,23 @@ fn configure_studio_runtime_paths() {
     if std::env::var_os("YUE_STUDIO_DATA_ROOT").is_none() {
         unsafe {
             std::env::set_var("YUE_STUDIO_DATA_ROOT", &data_root);
+        }
+    }
+    // The folder the user picked for the weights comes before the studio's own
+    // layout. A model set is four to twenty-six gigabytes, and a disk that has
+    // filled up is the reason to move them somewhere else; where they go is not
+    // the studio's decision to make. An environment variable already set stays
+    // the explicit override above both, as it is for the engine binary.
+    if std::env::var_os("YUE_MODELS_ROOT").is_none() {
+        let models = music_server::saved_models_directory()
+            .unwrap_or_else(|| data_root.join("models").join("yue2-cpp"));
+        unsafe {
+            std::env::set_var("YUE_MODELS_ROOT", models);
+            // This folder is the studio's own answer, recomputed from the saved
+            // choice at every start. Saying so keeps it apart from a variable
+            // the person exported themselves, which a folder picked in the
+            // window would not survive and which the interface warns about.
+            std::env::set_var("YUE_MODELS_ROOT_DEFAULT", "studio");
         }
     }
 
@@ -319,6 +330,18 @@ fn quit_prompt_cancelled(prompts: tauri::State<'_, Prompts>) {
 #[tauri::command]
 fn quit_studio(app: tauri::AppHandle) {
     std::thread::spawn(move || quit_now(&app, Vec::new()));
+}
+
+/// Reopens the studio, for a choice only the next start reads: the folders the
+/// downloads live in are opened once, when the service starts. The engine goes
+/// down first, as it does on quit, so nothing is left running beside the new
+/// process.
+#[tauri::command]
+fn restart_studio(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        music_server::stop_engine();
+        app.restart();
+    });
 }
 
 /// The update found at start, for a window that loaded after the event went out.
@@ -671,6 +694,7 @@ pub fn run() {
             quit_prompt_shown,
             quit_prompt_cancelled,
             quit_studio,
+            restart_studio,
             pending_update,
             install_update
         ]);

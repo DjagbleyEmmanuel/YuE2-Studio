@@ -610,7 +610,9 @@ export const Player: React.FC<PlayerProps> = ({
             <div className="flex-1 flex items-center justify-between px-2 sm:px-4 lg:px-6 gap-2 sm:gap-4">
 
                 {/* Song Info */}
-                <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1 max-w-[30%] lg:max-w-[33%]">
+                {/* The title gives way when the window narrows; the controls
+                    and the times keep their size, so nothing overlaps. */}
+                <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
                     <div className="w-10 h-10 lg:w-12 lg:h-12 rounded-sm bg-zinc-200 dark:bg-zinc-800 overflow-hidden shadow-xs shrink-0">
                         <SongCover song={currentSong} size="full" className="w-full h-full" />
                     </div>
@@ -674,8 +676,8 @@ export const Player: React.FC<PlayerProps> = ({
                 </div>
 
                 {/* Volume & Extras */}
-                <div className="flex items-center justify-end gap-1 sm:gap-2 lg:gap-3 min-w-0 flex-1 max-w-[30%] lg:max-w-[33%] text-zinc-500 dark:text-zinc-400">
-                    <span className="text-[10px] sm:text-xs font-mono text-right text-zinc-600 dark:text-zinc-400 hidden md:block">
+                <div className="flex shrink-0 items-center justify-end gap-1 sm:gap-2 lg:gap-3 text-zinc-500 dark:text-zinc-400">
+                    <span className="text-[10px] sm:text-xs font-mono tabular-nums text-right text-zinc-600 dark:text-zinc-400 hidden md:block shrink-0 whitespace-nowrap">
                         {formatTime(currentTime)} / {formatTime(duration || 0)}
                     </span>
 

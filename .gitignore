@@ -17,6 +17,17 @@ desktop/src-tauri/resources/
 *.db-shm
 *.db-wal
 
+# The downloaded model folders can be put on this disk from the LoRA page (the
+# downloads folder), which leaves them in the checkout: gigabytes, never a commit.
+/adapters/
+/audiocpp/
+/karaoke/
+/midi/
+/separation/
+/assistant/
+/training/
+/hotstep/
+
 # Built installers and portable archives belong to a GitHub release, not here.
 release/
 
