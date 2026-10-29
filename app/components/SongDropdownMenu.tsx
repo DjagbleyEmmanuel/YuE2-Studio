@@ -213,7 +213,7 @@ export const SongDropdownMenu: React.FC<SongDropdownMenuProps> = ({
             : `${window.location.origin}${song.audioUrl}`;
         // AudioMass is a fully client-side editor shipped as static assets, so
         // it runs without any backend service - in a window of the studio.
-        void openAudioEditor(audioUrl);
+        void openAudioEditor(audioUrl, song.title);
         onClose();
     };
 
