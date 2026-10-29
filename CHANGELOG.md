@@ -3,6 +3,13 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## 2026-10-28 — 3.8.4
+
+### Fixed
+
+- **The equalizer, visualizer and Winamp mode keep their sound on Linux**: a Web Audio context that the system interrupted - WebKitGTK calls the state "interrupted", where the studio only knew "suspended" - stayed silent while the song played on, and only a restart brought the sound back; the player's context, Winamp's and the visualizer window's are now resumed whenever they stop running, and Winamp's element is no longer left behind an interrupted context when the mode opens.
+- **Edit audio opens inside the studio**: the AudioMass editor, which every "Edit audio" item, the track sidebar and the studio tools open, was handed to the system browser; it now opens in a window of the studio, like the visualizer, on the file asked for, and a second edit reuses that window. A plain browser still opens it in a tab.
+
 ## 2026-10-27 — 3.8.2
 
 YuE2 Studio, ACE-Step Studio and MiniMax Music3 Studio are on one version again: 3.8.2 follows 3.8.0 here.
