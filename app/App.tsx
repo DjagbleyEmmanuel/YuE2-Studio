@@ -125,6 +125,8 @@ import { createNativePlaylist, deleteNativeSong, moveStoredLikes, setNativeSongL
 import { foldStems } from './services/songStems';
 import { noteStudioMessage } from './services/journal';
 import { JournalPanel } from './components/JournalPanel';
+import { AudioEditorPanel } from './components/AudioEditorPanel';
+import { closeAudioEditor } from './services/audioEditor';
 import { hubStateChanged, useActivity, useHubState } from './services/studioQueries';
 import { hubView, setTelemetry, showsNow, type HubButton } from './services/studioHub';
 import { HubBars } from './components/HubBars';
@@ -1551,6 +1553,8 @@ function AppContent() {
         <Sidebar
           currentView={currentView}
           onNavigate={(v) => {
+            // the editor covers the content area: going elsewhere puts it away
+            closeAudioEditor();
             setCurrentView(v);
             if (v === 'create') {
               setMobileShowList(false);
@@ -1579,6 +1583,7 @@ function AppContent() {
         <main className="relative ml-[72px] flex min-h-0 min-w-0 flex-1 overflow-hidden md:ml-0">
           {createKept && <Activity mode={showingCreate ? 'visible' : 'hidden'}>{renderContent('create')}</Activity>}
           {!(createKept && showingCreate) && renderContent()}
+          <AudioEditorPanel />
         </main>
       </div>
 

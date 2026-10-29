@@ -433,7 +433,7 @@ export function StudioToolsPanel({ initialSongId }: { initialSongId?: string | n
               onClick={() => {
                 if (!songId) return;
                 const url = apiUrl(`/v1/library/media/${encodeURIComponent(songId)}`);
-                void openAudioEditor(url);
+                void openAudioEditor(url, songs.find(song => song.id === songId)?.title ?? null);
               }}
               disabled={!songId}
               className="inline-flex items-center gap-2 rounded-lg border border-zinc-300 px-3 py-2 text-xs font-semibold text-zinc-700 hover:border-pink-400 hover:text-pink-600 disabled:opacity-50 dark:border-white/15 dark:text-zinc-200"
@@ -446,7 +446,7 @@ export function StudioToolsPanel({ initialSongId }: { initialSongId?: string | n
                 type="button"
                 onClick={() => {
                   const url = apiUrl(`/v1/library/songs/${encodeURIComponent(songId)}/stems/${stem}`);
-                  void openAudioEditor(url);
+                  void openAudioEditor(url, songs.find(song => song.id === songId)?.title ?? null);
                 }}
                 className="inline-flex items-center gap-2 rounded-lg border border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-600 hover:border-pink-400 hover:text-pink-600 dark:border-white/10 dark:text-zinc-300"
               >
