@@ -3,6 +3,12 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## 2026-10-29 — 3.8.5
+
+### Changed
+
+- **The audio editor opens in the studio window**: AudioMass opened in a window of its own in 3.8.4, and in a browser tab before that. It is now a panel over the studio, with the player and the rest of the interface in the same window behind it, so editing no longer feels like a separate program. Putting the panel away leaves the edit loaded, and opening the same file again carries on where it was left.
+
 ## 2026-10-28 — 3.8.4
 
 ### Fixed
