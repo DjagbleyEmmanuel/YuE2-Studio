@@ -29,6 +29,13 @@ Windows build.
 
 - **Every engine runs on any x86-64 processor, with or without AVX2** ([#181](https://github.com/timoncool/YuE2-Studio/issues/181)): the engines are built as all-variants packages with no processor floor, so the 0xc0000005 crash on CPUs without AVX2 (such as older Intel i3) is gone.
 
+## 2026-10-28 — 3.8.4 (fork)
+
+### Fixed
+
+- **The equalizer, visualizer and Winamp mode keep their sound on Linux**: a Web Audio context that the system interrupted - WebKitGTK calls the state "interrupted", where the studio only knew "suspended" - stayed silent while the song played on, and only a restart brought the sound back; the player's context, Winamp's and the visualizer window's are now resumed whenever they stop running, and Winamp's element is no longer left behind an interrupted context when the mode opens.
+- **Edit audio opens inside the studio**: the AudioMass editor, which every "Edit audio" item, the track sidebar and the studio tools open, was handed to the system browser; it now opens in a window of the studio, like the visualizer, on the file asked for, and a second edit reuses that window. A plain browser still opens it in a tab.
+
 ## 2026-10-27 — 3.8.2
 
 YuE2 Studio, ACE-Step Studio and MiniMax Music3 Studio are on one version again: 3.8.2 follows 3.8.0 here.
