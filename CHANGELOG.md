@@ -3,6 +3,21 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## 2026-11-06 — 3.8.6
+
+Based on upstream 3.8.5, plus the fork's in-app audio editor panel,
+ models-folder picker and Linux audio fixes.
+
+### Fixed
+
+- **Mid-sized Blackwell cards keep the full song length with flash attention off** ([#201](https://github.com/timoncool/YuE2-Studio/issues/201)): with the flash-attention regression fix the KV cache roughly doubles, so a 12 GB RTX 5070 that fit on 3.8.3 overran memory mid-song on 3.8.4; cards up to 16.5 GB with flash attention off are now held to the small-card cap.
+- **Blocked Hugging Face falls back to the HF-Mirror automatically** on unattainable networks instead of failing setup.
+- The engine is pinned to 16be2f5 for the #183 NAR chunk overlap/crossfade fix.
+
+### Added
+
+- The HOT-Step tools are repinned to hotstep-tools-2ef93a1c (the trainer's ConvRot8 F32 fallback on Turing, #199), and the site shows community reviews.
+
 ## 2026-10-29 — 3.8.5
 
 ### Changed
