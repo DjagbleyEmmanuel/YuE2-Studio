@@ -3,6 +3,16 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## 2026-11-10 — 3.8.7
+
+Based on upstream through 2026-11-09, plus the fork's in-app audio editor
+panel, models-folder picker and Linux audio fixes.
+
+### Fixed
+
+- **Saving a long song no longer needs several copies of it in memory**: the dual-mono FLAC and MP3 writers encode a mono track piece by piece into the file instead of building the whole track in RAM first, so a long render saves on a small machine without the extra gigabyte or two of headroom. The FLAC writer also buffers libFLAC's small writes before they reach the sink.
+- The star history chart on the site is up to date.
+
 ## 2026-11-06 — 3.8.6
 
 Based on upstream 3.8.5, plus the fork's in-app audio editor panel,
