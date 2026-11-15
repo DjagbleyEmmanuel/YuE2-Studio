@@ -13,6 +13,9 @@ app/data/changelog.json
 models/
 engines/*/bin/
 desktop/src-tauri/resources/
+# Tauri writes this one on Linux only; upstream keeps the other four generated
+# schemas in git, and a local build must not add a fifth to a commit.
+desktop/src-tauri/gen/schemas/linux-schema.json
 *.db
 *.db-shm
 *.db-wal
