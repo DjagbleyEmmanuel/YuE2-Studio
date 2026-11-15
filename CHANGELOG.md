@@ -3,6 +3,22 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## 2026-11-15 — 4.0.2
+
+Upstream 4.0.0, plus this fork's own work: the audio editor is a panel of the
+studio, the downloads folder can sit on any disk, and Web Audio keeps playing
+on Linux when the system interrupts it. 4.0.2 makes an engine that dies without
+a word say what is known about it, and keeps a running song out of a restart it
+did not ask for.
+
+### Changed
+
+- **An engine that dies without a word now says which thread started it, and what a signal 9 means**: on Linux the engine is started with `PR_SET_PDEATHSIG`, which ties it to the thread that spawned it rather than to the studio - so a SIGKILL can be either an outside killer or the studio's own thread ending, and until now the log could not tell them apart. The engine log now names that thread when the engine is gone by signal 9, and says whether the thread is still running (a killer from outside) or has ended (the engine's own tie to it). A stop that outlives its grace period also says so before it forces the engine down, where before a force-stop left no line at all and only the next look's "already exited: signal: 9" remained, reading like an outside killer.
+
+### Fixed
+
+- **A saved engine option no longer restarts the engine under a running song**: changing a value in Settings - Local engine restarts a healthy engine to apply it, and the Reset of a cache fitted after the card ran out of memory did the same - so saving a dropdown while a song was being made stopped the engine mid-step and lost that song. Both now wait: the value is saved, and it reaches the engine at its next start, as the fields that need a start already say. Restarting the engine by the button is still obeyed - it is the person's own choice - but the engine log now records that a song was lost to it.
+
 ## 2026-11-15 — 4.0.1
 
 Upstream 4.0.0, plus this fork's own work: the audio editor is a panel of the

@@ -437,6 +437,36 @@ pub struct StopOutcome {
 pub struct YueServerSupervisor {
     config: YueServerLaunchConfig,
     child: Option<Child>,
+    /// The thread of this process that spawned the engine, as the system numbers
+    /// it. Linux ties an engine started with `PR_SET_PDEATHSIG` to that one
+    /// thread, not to the process: a signal 9 with that thread gone is the death
+    /// explained, and a signal 9 with it still running is a killer from outside.
+    spawned_by: Option<u32>,
+}
+
+/// The caller's thread as the system numbers it, so a log line about the engine
+/// names a thread that can be looked for. Linux keeps it in `/proc/thread-self`.
+#[cfg(target_os = "linux")]
+fn current_thread_id() -> Option<u32> {
+    let link = fs::read_link("/proc/thread-self").ok()?;
+    link.file_name()?.to_string_lossy().parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_thread_id() -> Option<u32> {
+    None
+}
+
+/// Whether a thread of this process is still running, so a SIGKILL can be told
+/// apart from the engine's parent thread having ended.
+#[cfg(target_os = "linux")]
+fn thread_is_running(tid: u32) -> bool {
+    Path::new(&format!("/proc/self/task/{tid}")).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_is_running(_tid: u32) -> bool {
+    false
 }
 
 impl YueServerLocation {
@@ -510,7 +540,7 @@ impl YueServerSupervisor {
     pub fn new(config: YueServerLaunchConfig) -> Result<Self> {
         canonical_file(&config.executable, "yue-server executable")?;
         validate_loopback_host(&config.host)?;
-        Ok(Self { config, child: None })
+        Ok(Self { config, child: None, spawned_by: None })
     }
 
     pub fn config(&self) -> &YueServerLaunchConfig {
@@ -582,11 +612,13 @@ impl YueServerSupervisor {
             }
         }
         configure_child_process(&mut command);
+        let spawned_by = current_thread_id();
         let child = command
             .spawn()
             .with_context(|| format!("start yue-server {}", self.config.executable.display()))?;
         // The engine must not outlive the studio, however the studio ends.
         music_core::process::adopt(&child);
+        self.spawned_by = spawned_by;
         self.child = Some(child);
         if let Err(error) = self.wait_until_healthy(readiness_timeout) {
             let _ = self.stop(Duration::from_secs(1));
@@ -603,10 +635,12 @@ impl YueServerSupervisor {
         };
         if let Some(status) = child.try_wait().context("inspect yue-server child")? {
             note_in_log(&format!(
-                "the engine had already exited: {status}{}",
-                status.code().map(|code| format!(" (0x{:x})", code as u32)).unwrap_or_default()
+                "the engine had already exited: {status}{}{}",
+                status.code().map(|code| format!(" (0x{code:x})")).unwrap_or_default(),
+                self.describe_death(&status)
             ));
             self.child = None;
+            self.spawned_by = None;
             return Ok(StopOutcome { was_running: false, graceful: true });
         }
 
@@ -618,14 +652,47 @@ impl YueServerSupervisor {
         while Instant::now() < deadline {
             if child.try_wait().context("wait for yue-server shutdown")?.is_some() {
                 self.child = None;
+                self.spawned_by = None;
                 return Ok(StopOutcome { was_running: true, graceful: true });
             }
             thread::sleep(Duration::from_millis(50));
         }
+        // Said before it happens: a force-stop leaves no other trace in the log,
+        // and the line the next look writes - "already exited: signal: 9" - reads
+        // like a killer from outside when it was this call.
+        note_in_log(&format!(
+            "the engine did not stop within {} s; forcing it down (SIGKILL)",
+            grace_period.as_secs()
+        ));
         child.kill().context("force-stop yue-server after grace period")?;
         child.wait().context("wait for force-stopped yue-server")?;
         self.child = None;
+        self.spawned_by = None;
         Ok(StopOutcome { was_running: true, graceful: false })
+    }
+
+    /// What can be said of an engine that ended without being asked to. On Linux
+    /// a signal 9 has two explanations, and the thread that spawned the engine
+    /// tells them apart: with `PR_SET_PDEATHSIG` the engine dies when *that
+    /// thread* ends, however the studio is doing.
+    fn describe_death(&self, status: &std::process::ExitStatus) -> String {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if status.signal() == Some(9) {
+                return match self.spawned_by {
+                    Some(tid) if thread_is_running(tid) => format!(
+                        "; killed from outside the studio: the thread that started it (tid {tid}) is still running"
+                    ),
+                    Some(tid) => format!(
+                        "; the thread that started it (tid {tid}) is gone, and on Linux the engine is bound to it (PR_SET_PDEATHSIG)"
+                    ),
+                    None => String::new(),
+                };
+            }
+        }
+        let _ = status;
+        String::new()
     }
 
     /// Whether the engine this supervisor started is still a running process: one inside a long step can miss a
@@ -638,10 +705,12 @@ impl YueServerSupervisor {
         if let Some(child) = self.child.as_mut() {
             if let Some(status) = child.try_wait().context("inspect yue-server child")? {
                 note_in_log(&format!(
-                    "the previous engine had exited: {status}{}",
-                    status.code().map(|code| format!(" (0x{:x})", code as u32)).unwrap_or_default()
+                    "the previous engine had exited: {status}{}{}",
+                    status.code().map(|code| format!(" (0x{code:x})")).unwrap_or_default(),
+                    self.describe_death(&status)
                 ));
                 self.child = None;
+                self.spawned_by = None;
             }
         }
         Ok(())
@@ -908,14 +977,17 @@ mod tests {
             port: DEFAULT_PORT,
             options: YueServerOptions { cuda_folder: folder, ..Default::default() },
         };
+        // The backend is named as the platform names it, which is not the same
+        // file on Windows and on Linux.
+        let cuda = if cfg!(windows) { "ggml-cuda.dll" } else { "libggml-cuda.so" };
         assert_eq!(config(None).cuda_backend().unwrap(), None);
         // A release without the folder is broken, never quietly off CUDA.
         assert!(config(Some("cuda12")).cuda_backend().is_err());
         fs::create_dir_all(root.join("cuda12")).unwrap();
-        fs::write(root.join("cuda12").join("ggml-cuda.dll"), b"x").unwrap();
-        assert_eq!(config(Some("cuda12")).cuda_backend().unwrap(), Some(root.join("cuda12").join("ggml-cuda.dll")));
+        fs::write(root.join("cuda12").join(cuda), b"x").unwrap();
+        assert_eq!(config(Some("cuda12")).cuda_backend().unwrap(), Some(root.join("cuda12").join(cuda)));
         // A developer build: the one backend beside the executable.
-        fs::write(root.join("ggml-cuda.dll"), b"x").unwrap();
+        fs::write(root.join(cuda), b"x").unwrap();
         assert_eq!(config(Some("cuda13")).cuda_backend().unwrap(), None);
         fs::remove_dir_all(&root).ok();
     }

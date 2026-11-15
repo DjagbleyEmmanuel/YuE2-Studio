@@ -5651,7 +5651,11 @@ async fn update_engine_options(
     let _ = persist_studio_settings(&state).await;
 
     let mut restarted = false;
-    if changed && state.music_server.health().await {
+    // A song being made is not interrupted for a saved option: stopping the
+    // engine mid-step loses the song, and the person who changed a dropdown did
+    // not ask for that. The value is saved and reaches the engine at its next
+    // start, which Settings already says for the fields that need one.
+    if changed && !engine_at_work(&state).await && state.music_server.health().await {
         let _restart = state.engine_use.write().await;
         restart_engine(&state).await.map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
         restarted = true;
@@ -5671,7 +5675,7 @@ async fn reset_fitted_max_seq(State(state): State<AppState>) -> Result<Json<Valu
     let removed = state.engine_options.write().await.fitted_max_seq.remove(&key).is_some();
     persist_studio_settings(&state).await.map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("the settings could not be saved: {error}")))?;
     let mut restarted = false;
-    if removed && state.music_server.health().await {
+    if removed && !engine_at_work(&state).await && state.music_server.health().await {
         let _restart = state.engine_use.write().await;
         restart_engine(&state).await.map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
         restarted = true;
@@ -5680,6 +5684,12 @@ async fn reset_fitted_max_seq(State(state): State<AppState>) -> Result<Json<Valu
 }
 
 async fn restart_local_engine(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    // The button is the person's own choice, so it is obeyed - but a restart
+    // under a running song is a song lost, and the reason belongs in the log
+    // beside the song's last line.
+    if engine_at_work(&state).await {
+        music_engine::yue_server::note_in_log("the engine was restarted from the window while a song was being made; that song is lost");
+    }
     let _restart = state.engine_use.write().await;
     restart_engine(&state).await.map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
     Ok(Json(serde_json::json!({ "engine_id": PRIMARY_MUSIC_ENGINE_ID, "restarted": true })))
@@ -13434,7 +13444,10 @@ mod tests {
         let vulkan = EngineOptions { backend: music_engine::yue_server::ComputeBackend::Vulkan, ..EngineOptions::default() }.to_engine(None);
         assert!(vulkan.clamp_fp16, "Vulkan runs clamp hidden states to FP16");
         let cuda = EngineOptions { backend: music_engine::yue_server::ComputeBackend::Cuda, ..EngineOptions::default() }.to_engine(None);
-        assert!(!cuda.clamp_fp16);
+        // A card that does not accumulate in FP16 - Pascal and older - needs the
+        // clamp on CUDA as well, so this reads the card rather than assuming the
+        // newer cards' faster path.
+        assert_eq!(cuda.clamp_fp16, hardware::accumulates_in_fp16());
         // Every card starts on the model's full context; only the user's own value sets it smaller.
         assert_eq!(EngineOptions::capped_max_seq(None), None, "the full context unless set");
         assert_eq!(EngineOptions::capped_max_seq(Some(16384)), Some(16384), "the user's own value is passed as it is");
