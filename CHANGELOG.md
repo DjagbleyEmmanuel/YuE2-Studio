@@ -3,6 +3,24 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## 2026-11-15 — 4.0.1
+
+Upstream 4.0.0, plus this fork's own work: the audio editor is a panel of the
+studio, the downloads folder can sit on any disk, and Web Audio keeps playing
+on Linux when the system interrupts it.
+
+### Added
+
+- **The downloads folder can live on another disk**: Setup and Settings - Models show the folder the LoRAs, the stem separator, the karaoke and Audio to MIDI models, the audio.cpp runtime, the assistant's models and the trainer are kept in, with the room left on that disk, and moving it carries what is already downloaded along. The choice is read at the next start of the studio, and the models folder picked the same way keeps the weights themselves on whichever disk has room. Agents have `downloads_folder_get` and `downloads_folder_set`.
+
+### Changed
+
+- **The audio editor opens in the studio window**: AudioMass opened in a window of its own in 3.8.4, and in a browser tab before that. It is now a panel over the content area, with the sidebar, the player and the studio's navigation still in the same window around it, and a change of view puts it away. The page stays loaded behind the panel, so putting the panel away to look at the studio and opening the same file again carries on with the edit instead of starting over; it loads from the studio's own files rather than the service's port, so it stays in the window's origin.
+
+### Fixed
+
+- **On Linux the sound comes back when the system interrupts Web Audio**: WebKitGTK calls that state "interrupted", where the studio only knew "suspended", so a song played on in silence and only a restart brought the sound back. The player's context, Winamp's and the visualizer window's are now resumed whenever they stop running, and Winamp's element is no longer left behind an interrupted context when the mode opens.
+
 ## 2026-11-13 — 4.0.0
 
 ### Added
