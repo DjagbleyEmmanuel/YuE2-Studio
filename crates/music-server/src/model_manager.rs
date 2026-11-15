@@ -299,7 +299,7 @@ impl ModelManager {
     /// How much of a component a download left behind unfinished: its part file's pieces, or 0. The next download
     /// of it resumes them; removing the component takes them away.
     pub fn partial_bytes(&self, filename: &str) -> u64 {
-        crate::chunked::on_disk(&part_path(&self.root.join(filename)))
+        crate::chunked::on_disk(&part_path(&self.root().join(filename)))
     }
 
     /// `target` is the set the user actually selected. Progress and readiness
@@ -357,7 +357,7 @@ impl ModelManager {
             }
             // A half-finished download of the same component is just as much
             // disk as the finished one.
-            let part = part_path(&self.root.join(&component.filename));
+            let part = part_path(&self.root().join(&component.filename));
             let _ = fs::remove_file(crate::chunked::manifest_path(&part));
             let _ = fs::remove_file(part);
         }
@@ -380,7 +380,7 @@ impl ModelManager {
 
     pub async fn install(&self, request: InstallRequest) -> Result<DownloadJob> {
         let mut selection = resolve_install(request)?;
-        fs::create_dir_all(&self.root())
+        fs::create_dir_all(self.root())
             .with_context(|| format!("create model root {}", self.root().display()))?;
         preflight_space(&self.root(), &selection)?;
         // Progress starts from what is already published on disk. This uses the
