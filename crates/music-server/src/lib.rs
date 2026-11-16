@@ -946,9 +946,33 @@ impl EngineOptions {
     fn cuda_build(&self) -> Option<hardware::CudaBuild> {
         use music_engine::yue_server::ComputeBackend;
         match self.backend {
-            ComputeBackend::Cuda | ComputeBackend::Auto => hardware::hardware().cuda,
+            ComputeBackend::Cuda | ComputeBackend::Auto => self.shipped_cuda_build(),
             ComputeBackend::Vulkan | ComputeBackend::Cpu => None,
         }
+    }
+
+    /// The CUDA build this installation can give the card. A hand-built engine
+    /// brings its own folder, so what the studio ships says nothing about it;
+    /// the bundled one is only what the package carries.
+    fn shipped_cuda_build(&self) -> Option<hardware::CudaBuild> {
+        let wanted = hardware::hardware().cuda?;
+        if self.engine_bin.is_some() || env::var_os("YUE_ENGINE_BIN").is_some() {
+            return Some(wanted);
+        }
+        let bundle = engine_bundle_root();
+        let build = cuda_build_in(wanted, |build| bundle.join(build.folder()).is_dir());
+        if build != wanted {
+            let line = format!(
+                "this package carries no {} engine build; the card computes on the {} build, whose kernels cover every card CUDA 13 does",
+                wanted.folder(),
+                build.folder()
+            );
+            // A start asks this more than once - the log gets the line once.
+            if music_engine::yue_server::startup_log_tail(1).last() != Some(&format!("[studio] {line}")) {
+                music_engine::yue_server::note_in_log(&line);
+            }
+        }
+        Some(build)
     }
 
     /// Whether the engine will compute on Vulkan: chosen outright, or left to
@@ -6089,6 +6113,18 @@ fn describes_device_failure(log: &str) -> bool {
     ]
     .iter()
     .any(|marker| log.contains(marker))
+}
+
+/// The CUDA build of the engine the installation can run on the card: the
+/// card's own when the package carries it, else CUDA 12 for a card that would
+/// take CUDA 13, whose kernels also cover every card CUDA 13 does. Never the
+/// other way round: CUDA 13 dropped Pascal and Volta, so a package with only
+/// that build cannot serve the cards CUDA 12 can.
+fn cuda_build_in(wanted: hardware::CudaBuild, ships: impl Fn(hardware::CudaBuild) -> bool) -> hardware::CudaBuild {
+    match wanted {
+        hardware::CudaBuild::Cuda13 if !ships(wanted) && ships(hardware::CudaBuild::Cuda12) => hardware::CudaBuild::Cuda12,
+        _ => wanted,
+    }
 }
 
 /// Where the packaged or developer-built `yue-server` lives. Every value is
@@ -13490,6 +13526,18 @@ mod tests {
         // and stay unavailable when it is not.
         assert!(restored.assistant.available());
         assert!(!AssistantConfig::default().available());
+    }
+
+    #[test]
+    fn a_package_without_the_cuda13_build_uses_the_cuda12_one() {
+        use hardware::CudaBuild::{Cuda12, Cuda13};
+        let only12 = |build: hardware::CudaBuild| build == Cuda12;
+        let only13 = |build: hardware::CudaBuild| build == Cuda13;
+        let both = |_: hardware::CudaBuild| true;
+        assert_eq!(cuda_build_in(Cuda13, only12), Cuda12, "CUDA 12 runs every card CUDA 13 does");
+        assert_eq!(cuda_build_in(Cuda13, both), Cuda13, "the card's own build wins when the package carries it");
+        assert_eq!(cuda_build_in(Cuda12, only13), Cuda12, "CUDA 13 has no code for Pascal or Volta");
+        assert_eq!(cuda_build_in(Cuda12, only12), Cuda12);
     }
 
     #[test]

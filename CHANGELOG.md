@@ -18,6 +18,7 @@ did not ask for.
 ### Fixed
 
 - **A saved engine option no longer restarts the engine under a running song**: changing a value in Settings - Local engine restarts a healthy engine to apply it, and the Reset of a cache fitted after the card ran out of memory did the same - so saving a dropdown while a song was being made stopped the engine mid-step and lost that song. Both now wait: the value is saved, and it reaches the engine at its next start, as the fields that need a start already say. Restarting the engine by the button is still obeyed - it is the person's own choice - but the engine log now records that a song was lost to it.
+- **A Linux package that carries only the CUDA 12 engine build still computes on the card**: a Turing or newer card on a driver from 580 takes the CUDA 13 build by the studio's own table, so a package without that folder sent the engine to a backend that was not there and left the song to the processor. The card now takes the CUDA 12 build in that case - its device code covers every architecture CUDA 13 does - and the engine log says so. The other direction is never taken: CUDA 13 dropped Pascal and Volta, so it cannot stand in for the cards CUDA 12 serves.
 
 ## 2026-11-15 — 4.0.1
 
