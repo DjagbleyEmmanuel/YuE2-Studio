@@ -30,17 +30,23 @@ if [ "${1:-}" = "--inside" ]; then
     curl -sSfL "https://sdk.lunarg.com/sdk/download/$vulkan/linux/vulkansdk-linux-x86_64-$vulkan.tar.xz" | tar -xJ -C /cache/vulkansdk-$vulkan --strip-components=1
   fi
   export VULKAN_SDK=/cache/vulkansdk-$vulkan/x86_64 PATH=/cache/vulkansdk-$vulkan/x86_64/bin:$PATH
-  # the engine's CUDA 13 backend: nvcc, the runtime and cuBLAS from NVIDIA's Ubuntu 22.04 repository, the packages kept in the cache
+  # the engine's CUDA backends: 12.9 serves Maxwell, Pascal, Volta and every card CUDA 13 does; CUDA 13 is added only
+  # when asked (YUE_CUDA13=1), and this fork's packages carry the CUDA 12 build alone.
   cuda=13-3
-  echo "[..] CUDA $cuda"
   curl -sSfL -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
   dpkg -i /tmp/cuda-keyring.deb >/dev/null
   mkdir -p /cache/apt
   apt-get update -q >/dev/null
-  apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives=/cache/apt cuda-nvcc-$cuda cuda-cudart-dev-$cuda libcublas-dev-$cuda >/dev/null
-  # the CUDA 12 backend's toolkit beside it, from the same repository (the audio.cpp server's CUDA 12 build is 12.9 too)
+  if [ "${YUE_CUDA13:-0}" = "1" ]; then
+    echo "[..] CUDA $cuda"
+    apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives=/cache/apt cuda-nvcc-$cuda cuda-cudart-dev-$cuda libcublas-dev-$cuda >/dev/null
+    export PATH=/usr/local/cuda-13.3/bin:$PATH
+  else
+    echo "[..] CUDA 13 skipped (YUE_CUDA13=0): the package carries the CUDA 12 build"
+  fi
+  # the CUDA 12 backend's toolkit, from the same repository (the audio.cpp server's CUDA 12 build is 12.9 too)
   apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives=/cache/apt cuda-nvcc-12-9 cuda-cudart-dev-12-9 libcublas-dev-12-9 >/dev/null
-  export PATH=/usr/local/cuda-13.3/bin:$PATH CUDA12_ROOT=/usr/local/cuda-12.9
+  export CUDA12_ROOT=/usr/local/cuda-12.9
   echo "[..] source $(git -c safe.directory=/src -C /src rev-parse --short HEAD)"
   rm -rf /cache/src && mkdir -p /cache/src
   git -c safe.directory=/src -C /src archive HEAD | tar -x -C /cache/src
@@ -52,11 +58,14 @@ if [ "${1:-}" = "--inside" ]; then
   engine=desktop/src-tauri/resources/yue2-cpp/yue-server
   if ldd "$engine" | grep -i 'not found'; then echo "[ERROR] the engine misses libraries"; exit 1; fi
   # libcuda.so.1 comes with the display driver, which a build container has not got
-  backend=desktop/src-tauri/resources/yue2-cpp/cuda13/libggml-cuda.so
-  [ -f "$backend" ] || { echo "[ERROR] the engine was built without its CUDA backend"; exit 1; }
-  if ldd "$backend" | grep -i 'not found' | grep -v 'libcuda.so'; then echo "[ERROR] the CUDA backend misses libraries"; exit 1; fi
+  if [ "${YUE_CUDA13:-0}" = "1" ]; then
+    backend=desktop/src-tauri/resources/yue2-cpp/cuda13/libggml-cuda.so
+    [ -f "$backend" ] || { echo "[ERROR] the engine was built without its CUDA 13 backend"; exit 1; }
+    if ldd "$backend" | grep -i 'not found' | grep -v 'libcuda.so'; then echo "[ERROR] the CUDA 13 backend misses libraries"; exit 1; fi
+  fi
   backend12=desktop/src-tauri/resources/yue2-cpp/cuda12/libggml-cuda.so
   [ -f "$backend12" ] || { echo "[ERROR] the engine was built without its CUDA 12 backend"; exit 1; }
+  if ldd "$backend12" | grep -i 'not found' | grep -v 'libcuda.so'; then echo "[ERROR] the CUDA 12 backend misses libraries"; exit 1; fi
   # the engine answers --help with its usage and a non-zero code
   "$engine" --help > /tmp/engine-help.txt 2>&1 || true
   grep -q 'Usage' /tmp/engine-help.txt || { echo "[ERROR] the engine does not start"; head -5 /tmp/engine-help.txt; exit 1; }
@@ -94,4 +103,4 @@ cache="${2:-$HOME/yue2-linux2204-cache}"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$out" "$cache"
 cp "$repo/scripts/build-linux-docker.sh" "$out/.build-linux-docker.sh"
-docker run --rm -v "$repo:/src:ro" -v "$(cd "$out" && pwd):/out" -v "$cache:/cache" ubuntu:22.04 bash /out/.build-linux-docker.sh --inside
+docker run --rm -e YUE_CUDA13="${YUE_CUDA13:-0}" -v "$repo:/src:ro" -v "$(cd "$out" && pwd):/out" -v "$cache:/cache" ubuntu:22.04 bash /out/.build-linux-docker.sh --inside

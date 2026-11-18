@@ -1,6 +1,7 @@
 #!/bin/bash
 # Builds YuE2 Studio for Linux x86-64: a .deb and an AppImage with the pinned
-# yue2.cpp engine on Vulkan and CUDA 13 and the audio-to-MIDI transcriber bundled. Model weights are downloaded in the app.
+# yue2.cpp engine on Vulkan and CUDA 12 (CUDA 13 too when YUE_CUDA13=1) and the
+# audio-to-MIDI transcriber bundled. Model weights are downloaded in the app.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"

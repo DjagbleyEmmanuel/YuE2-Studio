@@ -34,12 +34,13 @@ server="$(find "$worktree/build-linux" -maxdepth 2 -type f -name yue-server | he
 cp "$server" "$output/"
 # -a keeps the version symlinks; the binary finds them through $ORIGIN.
 find "$worktree/build-linux" -maxdepth 2 -name 'lib*.so*' -exec cp -a {} "$output/" \;
-# The CUDA backend, when this machine has the CUDA 13 toolkit: ggml-cuda alone, loaded by the engine from cuda13/ when
-# the studio names it, device code for every architecture CUDA 13 targets, no PTX. Its CUDA runtime and cuBLAS are not
-# shipped: the studio downloads NVIDIA's wheels into one folder the engine and the audio.cpp server share, and names it
-# in LD_LIBRARY_PATH.
+# The CUDA 13 backend, when this machine has the CUDA 13 toolkit and the package was asked for it (YUE_CUDA13=1):
+# ggml-cuda alone, loaded by the engine from cuda13/ when the studio names it, device code for every architecture
+# CUDA 13 targets, no PTX. This fork ships the CUDA 12 build alone, which serves every card CUDA 13 does.
+# Its CUDA runtime and cuBLAS are not shipped: the studio downloads NVIDIA's wheels into one folder the engine and
+# the audio.cpp server share, and names it in LD_LIBRARY_PATH.
 backend="vulkan"
-if command -v nvcc >/dev/null 2>&1; then
+if [ "${YUE_CUDA13:-0}" = "1" ] && command -v nvcc >/dev/null 2>&1; then
     rm -rf "$worktree/build-linux-cuda13"
     cmake -S "$worktree" -B "$worktree/build-linux-cuda13" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FA_ALL_QUANTS=ON \
