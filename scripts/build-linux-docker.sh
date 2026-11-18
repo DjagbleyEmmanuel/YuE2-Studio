@@ -39,13 +39,13 @@ if [ "${1:-}" = "--inside" ]; then
   apt-get update -q >/dev/null
   if [ "${YUE_CUDA13:-0}" = "1" ]; then
     echo "[..] CUDA $cuda"
-    apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives=/cache/apt cuda-nvcc-$cuda cuda-cudart-dev-$cuda libcublas-dev-$cuda >/dev/null
+    apt-get install -y -q --no-install-recommends -o Acquire::Retries=5 -o Dir::Cache::Archives=/cache/apt cuda-nvcc-$cuda cuda-cudart-dev-$cuda libcublas-dev-$cuda >/dev/null
     export PATH=/usr/local/cuda-13.3/bin:$PATH
   else
     echo "[..] CUDA 13 skipped (YUE_CUDA13=0): the package carries the CUDA 12 build"
   fi
   # the CUDA 12 backend's toolkit, from the same repository (the audio.cpp server's CUDA 12 build is 12.9 too)
-  apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives=/cache/apt cuda-nvcc-12-9 cuda-cudart-dev-12-9 libcublas-dev-12-9 >/dev/null
+  apt-get install -y -q --no-install-recommends -o Acquire::Retries=5 -o Dir::Cache::Archives=/cache/apt cuda-nvcc-12-9 cuda-cudart-dev-12-9 libcublas-dev-12-9 >/dev/null
   export CUDA12_ROOT=/usr/local/cuda-12.9
   echo "[..] source $(git -c safe.directory=/src -C /src rev-parse --short HEAD)"
   rm -rf /cache/src && mkdir -p /cache/src
