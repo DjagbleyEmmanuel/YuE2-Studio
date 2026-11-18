@@ -6,8 +6,8 @@
 set -euo pipefail
 
 if [ "${1:-}" = "--inside" ]; then
-  export DEBIAN_FRONTEND=noninteractive APPIMAGE_EXTRACT_AND_RUN=1 RUSTUP_TOOLCHAIN=stable CARGO_TERM_COLOR=never
-  export CARGO_HOME=/cache/cargo RUSTUP_HOME=/cache/rustup npm_config_cache=/cache/npm PATH=/cache/cargo/bin:/cache/node/bin:$PATH
+  export DEBIAN_FRONTEND=noninteractive APPIMAGE_EXTRACT_AND_RUN=1 RUSTUP_TOOLCHAIN=stable CARGO_TERM_COLOR=never NODE_OPTIONS=--dns-result-order=ipv4first
+  export CARGO_HOME=/cache/cargo RUSTUP_HOME=/cache/rustup npm_config_cache=/cache/npm XDG_CACHE_HOME=/cache/xdg PATH=/cache/cargo/bin:/cache/node/bin:$PATH
   # this machine's DNS answers AAAA first and the IPv6 routes go nowhere: apt would wait on them forever
   printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99ipv4
   echo "[..] packages"
@@ -77,6 +77,7 @@ if [ "${1:-}" = "--inside" ]; then
   git -c safe.directory=/src -C /src archive HEAD | tar -x -C /cache/src
   cd /cache/src
   export CARGO_TARGET_DIR=/cache/target
+  mkdir -p /cache/target
   ln -sfn /cache/target desktop/src-tauri/target
   echo "[..] build (log: build.log)"
   bash scripts/build-release-linux.sh > /out/build.log 2>&1 || { echo "[ERROR] build failed"; tail -40 /out/build.log; exit 1; }

@@ -21,8 +21,9 @@ if [ ! -x "$midi/music-midi" ] || [ ! -x "$midi/music-caption" ] || [ "$(cat "$m
 fi
 
 cd "$root"
-npm --prefix app ci --no-audit --no-fund
-npm --prefix desktop ci --no-audit --no-fund
+# a slow link reads a tarball for minutes: give npm the time and retries, and reuse what the cache holds
+npm --prefix app ci --no-audit --no-fund --prefer-offline --fetch-retries=5 --fetch-retry-maxtimeout=120000 --fetch-timeout=900000
+npm --prefix desktop ci --no-audit --no-fund --prefer-offline --fetch-retries=5 --fetch-retry-maxtimeout=120000 --fetch-timeout=900000
 cd desktop
 # the display driver's libcuda and the CUDA libraries the studio downloads are never packed
 export LINUXDEPLOY_EXCLUDED_LIBRARIES="libcuda.so*;libcudart.so*;libcublas.so*;libcublasLt.so*"
