@@ -31,19 +31,10 @@ fn recommended_profile() -> &'static str {
     crate::hardware::recommended_local_profile()
 }
 
-/// The download state of a folder, kept in the folder it describes.
-const DOWNLOAD_STATE_FILE: &str = ".studio-download-state.json";
-
 #[derive(Clone)]
 pub struct ModelManager {
-    /// The folder the weights live in. Shared and behind a lock because the
-    /// folder can be changed while the studio runs - the model sets are the
-    /// largest thing it owns, and moving them to another disk is the whole
-    /// point - and every clone of the manager the service holds must follow to
-    /// the same place.
-    root: Arc<std::sync::RwLock<PathBuf>>,
-    /// The download state file of the folder above. It moves with the folder.
-    state_path: Arc<std::sync::RwLock<PathBuf>>,
+    root: PathBuf,
+    state_path: PathBuf,
     http: reqwest::Client,
     state: Arc<RwLock<PersistentState>>,
     cancelled: Arc<AtomicBool>,
@@ -139,11 +130,26 @@ pub struct DownloadJob {
 pub struct ProfileModelFiles {
     pub backbone: String,
     pub vae: String,
+    /// A file holding a decoder alone, which decodes in place of the VAE's
+    /// own; the VAE keeps encoding.
+    pub vae_decoder: Option<String>,
     /// SheetSage2 is optional: without it the studio generates but cannot
     /// read a recording into a score.
     pub transcriber: Option<String>,
     /// The decoder adapter paired with the tokenizer head of the training codes.
     pub companion: String,
+}
+
+
+/// A set's decoder that is not on disk yet, as the update screen names it.
+#[derive(Debug, Clone)]
+pub struct MissingDecoder {
+    pub id: &'static str,
+    pub filename: &'static str,
+    pub url: String,
+    pub bytes: u64,
+    /// What an unfinished download of it left on disk.
+    pub partial: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,15 +168,11 @@ struct PersistentState {
 
 impl ModelManager {
     pub fn from_environment() -> Result<Self> {
-        Self::over(models_root_from_environment())
-    }
-
-    /// A manager over the given folder. The folder itself is created by the
-    /// first install, not here: a studio pointed at a disk that is not mounted
-    /// yet still starts, and says what is wrong where a download would begin.
-    pub fn over(root: PathBuf) -> Result<Self> {
+        let root = env::var_os("YUE_MODELS_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_model_root);
         validate_model_root(&root)?;
-        let state_path = root.join(DOWNLOAD_STATE_FILE);
+        let state_path = root.join(".studio-download-state.json");
         let mut state = fs::read_to_string(&state_path)
             .ok()
             .and_then(|body| serde_json::from_str(&body).ok())
@@ -180,8 +182,8 @@ impl ModelManager {
         }
         remove_retired_files(&root);
         Ok(Self {
-            root: Arc::new(std::sync::RwLock::new(root)),
-            state_path: Arc::new(std::sync::RwLock::new(state_path)),
+            root,
+            state_path,
             http: crate::net::download_client(),
             state: Arc::new(RwLock::new(state)),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -189,100 +191,9 @@ impl ModelManager {
         })
     }
 
-    /// The folder the weights live in, as it is now, by value: a user can change
-    /// it under the running service, and holding the lock across the work that
-    /// follows - a download, a hash of eleven gigabytes - would block that.
-    fn root(&self) -> PathBuf {
-        self.root.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
-    }
-
-    fn state_path(&self) -> PathBuf {
-        self.state_path.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
-    }
-
     /// Where the weights live, for anything that needs to check a file exists.
-    pub fn models_directory(&self) -> PathBuf {
-        self.root()
-    }
-
-    /// Free and total bytes on the filesystem the weights are on. A model set is
-    /// four to twenty-six gigabytes, so the folder is only half the answer: the
-    /// studio says what room is left there before a download fills it.
-    pub fn models_space(&self) -> (u64, u64) {
-        space_at(&self.root())
-    }
-
-    /// Points the manager at another folder, taking the downloads already made
-    /// with it when asked.
-    ///
-    /// A person who has filled one disk with model sets and buys another should
-    /// not download twenty-six gigabytes to use it. Files still downloading are
-    /// never carried over and the call refuses while one is running, so what
-    /// moves is always a set of finished weights.
-    pub async fn relocate(&self, target: PathBuf, move_existing: bool) -> Result<RelocationReport> {
-        if self.state.read().await.active.as_ref().is_some_and(|job| matches!(job.status, DownloadStatus::Downloading)) {
-            bail!("a model download is running; cancel it before changing the models folder");
-        }
-        validate_model_root(&target)?;
-        let previous = self.root();
-        fs::create_dir_all(&target).with_context(|| format!("create the models folder {}", target.display()))?;
-        // A folder that cannot be written to is a download that fails an hour
-        // later, after the first gigabytes.
-        probe_writable(&target)?;
-
-        let mut moved: Vec<MovedFile> = Vec::new();
-        let mut failed: Vec<RefusedMove> = Vec::new();
-        if move_existing && previous != target {
-            for component in components() {
-                // The half-downloaded file comes too: resuming it on the new
-                // disk beats starting eleven gigabytes again.
-                for name in [component.filename.to_string(), format!("{}.part", component.filename)] {
-                    let source = previous.join(&name);
-                    if !source.is_file() {
-                        continue;
-                    }
-                    let destination = target.join(&name);
-                    // Whatever the new folder already holds is what the studio
-                    // would use; a move never overwrites it.
-                    if destination.exists() {
-                        continue;
-                    }
-                    let bytes = fs::metadata(&source).map(|meta| meta.len()).unwrap_or(0);
-                    match take_across(&source, &destination) {
-                        Ok(()) => moved.push(MovedFile { file: name, bytes }),
-                        Err(error) => failed.push(RefusedMove { file: name, error: error.to_string() }),
-                    }
-                }
-            }
-        }
-
-        let state_path = target.join(DOWNLOAD_STATE_FILE);
-        {
-            let mut root = self.root.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-            *root = target.clone();
-        }
-        {
-            let mut path = self.state_path.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-            *path = state_path.clone();
-        }
-        // The job of the folder left behind describes files that are not here.
-        {
-            let mut state = self.state.write().await;
-            state.active = None;
-            let _ = persist_state_file(&state_path, &state);
-        }
-
-        let (free_bytes, total_bytes) = space_at(&target);
-        Ok(RelocationReport {
-            previous: previous.display().to_string(),
-            directory: target.display().to_string(),
-            moved_existing: move_existing,
-            moved_bytes: moved.iter().map(|file| file.bytes).sum(),
-            moved,
-            failed,
-            free_bytes,
-            total_bytes,
-        })
+    pub fn models_directory(&self) -> &Path {
+        &self.root
     }
 
     pub fn catalog(&self) -> Catalog {
@@ -299,7 +210,7 @@ impl ModelManager {
     /// How much of a component a download left behind unfinished: its part file's pieces, or 0. The next download
     /// of it resumes them; removing the component takes them away.
     pub fn partial_bytes(&self, filename: &str) -> u64 {
-        crate::chunked::on_disk(&part_path(&self.root().join(filename)))
+        crate::chunked::on_disk(&part_path(&self.root.join(filename)))
     }
 
     /// `target` is the set the user actually selected. Progress and readiness
@@ -307,7 +218,7 @@ impl ModelManager {
     /// set is never told it is missing the hardware-recommended download.
     pub async fn status(&self, target: Option<InstallRequest>) -> ManagerStatus {
         let active = self.state.read().await.active.clone();
-        let root = self.root();
+        let root = self.root.clone();
         let components = self.catalog().components;
         // SHA-256 over a GGUF can take seconds. Keep it off the Tokio request
         // workers so setup polling and cancellation remain available.
@@ -345,7 +256,7 @@ impl ModelManager {
                 .iter()
                 .find(|component| component.id == *id)
                 .with_context(|| format!("unknown component '{id}'"))?;
-            let path = self.root().join(&component.filename);
+            let path = self.root.join(&component.filename);
             let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
             match fs::remove_file(&path) {
                 Ok(()) => {
@@ -357,7 +268,7 @@ impl ModelManager {
             }
             // A half-finished download of the same component is just as much
             // disk as the finished one.
-            let part = part_path(&self.root().join(&component.filename));
+            let part = part_path(&self.root.join(&component.filename));
             let _ = fs::remove_file(crate::chunked::manifest_path(&part));
             let _ = fs::remove_file(part);
         }
@@ -372,17 +283,22 @@ impl ModelManager {
                 .is_some_and(|job| job.component_ids.iter().any(|id| component_ids.contains(id)));
             if resumes_removed {
                 state.active = None;
-                let _ = persist_state_file(&self.state_path(), &state);
+                let _ = persist_state_file(&self.state_path, &state);
             }
         }
         Ok(RemovalReport { removed, freed_bytes })
     }
 
     pub async fn install(&self, request: InstallRequest) -> Result<DownloadJob> {
-        let mut selection = resolve_install(request)?;
-        fs::create_dir_all(self.root())
-            .with_context(|| format!("create model root {}", self.root().display()))?;
-        preflight_space(&self.root(), &selection)?;
+        self.start(resolve_install(request)?).await
+    }
+
+    /// Starts the one download the manager runs at a time: a second is refused while it runs, since four connections
+    /// are the whole budget of the files' host.
+    async fn start(&self, mut selection: ResolvedInstall) -> Result<DownloadJob> {
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("create model root {}", self.root.display()))?;
+        preflight_space(&self.root, &selection)?;
         // Progress starts from what is already published on disk. This uses the
         // cheap size check rather than a SHA-256 sweep: hashing a resumed 10 GB
         // set here would block this request — and every setup/status poll behind
@@ -391,7 +307,7 @@ impl ModelManager {
         selection.already_present_bytes = selection
             .components
             .iter()
-            .filter(|component| published_component(&self.root().join(component.filename), component))
+            .filter(|component| published_component(&self.root.join(component.filename), component))
             .map(|component| component.bytes)
             .sum();
         let mut state = self.state.write().await;
@@ -442,6 +358,57 @@ impl ModelManager {
         self.installed_files_from_selection(selection, "selected custom component set")
     }
 
+
+    /// The decoder of the chosen set that is not on disk while the rest of the set is: what the update screen
+    /// offers a studio whose set was installed before the decoder was published.
+    pub fn decoder_to_fetch(&self, profile_id: Option<&str>, component_ids: Option<&[String]>) -> Option<MissingDecoder> {
+        let request = match (component_ids, profile_id) {
+            (Some(ids), _) => InstallRequest { profile_id: None, component_ids: ids.to_vec() },
+            (None, Some(profile)) => InstallRequest { profile_id: Some(profile.into()), component_ids: vec![] },
+            (None, None) => return None,
+        };
+        let selection = resolve_install(request).ok()?;
+        let on_disk = |component: &Component| published_component(&self.root.join(component.filename), component);
+        if !selection.components.iter().filter(|component| !optional_kind(component.kind)).all(on_disk) {
+            return None;
+        }
+        let decoder = selection.components.iter().find(|component| component.kind == "vae-decoder" && !on_disk(component))?;
+        Some(MissingDecoder { id: decoder.id, filename: decoder.filename, url: decoder.url(), bytes: decoder.bytes, partial: self.partial_bytes(decoder.filename) })
+    }
+
+    /// The bytes of a component on disk: all of them once it is published, else what its download left.
+    pub fn arrived_bytes(&self, id: &str) -> u64 {
+        components().iter().find(|component| component.id == id).map_or(0, |component| {
+            if published_component(&self.root.join(component.filename), component) { component.bytes } else { self.partial_bytes(component.filename) }
+        })
+    }
+
+    /// Downloads one component a set runs without, beside the set already on disk, and returns when it is there. It
+    /// is the manager's one download while it runs: the window shows its progress, and a set's download waits for it.
+    pub async fn fetch_optional(&self, id: &str) -> Result<()> {
+        let component = components()
+            .into_iter()
+            .find(|component| component.id == id && optional_kind(component.kind))
+            .with_context(|| format!("'{id}' is not a component a set runs without"))?;
+        if verified_file_async(self.root.join(component.filename), component.clone()).await? {
+            return Ok(());
+        }
+        let total_bytes = component.bytes;
+        let job = self.start(ResolvedInstall { profile_id: None, components: vec![component], total_bytes, already_present_bytes: 0 }).await?;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let state = self.state.read().await;
+            let Some(active) = state.active.as_ref().filter(|active| active.id == job.id) else {
+                bail!("the download of {id} was replaced by another before it ended");
+            };
+            match active.status {
+                DownloadStatus::Downloading => continue,
+                DownloadStatus::Completed => return Ok(()),
+                _ => bail!("{id} was not downloaded: {}", active.error.as_deref().unwrap_or("the download was stopped")),
+            }
+        }
+    }
+
     /// A saved hand-picked set stays chosen while the files picked for it are
     /// there. The companion is not the user's pick: missing, it is fetched
     /// with the set rather than dropping the set for the recommended one.
@@ -451,17 +418,22 @@ impl ModelManager {
                 .components
                 .iter()
                 .filter(|component| component.id != COMPANION && !optional_kind(component.kind))
-                .all(|component| published_component(&self.root().join(component.filename), component))
+                .all(|component| published_component(&self.root.join(component.filename), component))
         })
     }
 
-    /// The files of a set to start the engine on. A transcriber not on disk
-    /// yet leaves the set without one rather than keeping the engine down.
+    /// The files of a set to start the engine on. A transcriber or a decoder
+    /// not on disk yet leaves the set without one rather than keeping the
+    /// engine down: the VAE's own decoder decodes then.
     fn installed_files_from_selection(&self, selection: ResolvedInstall, label: &str) -> Result<ProfileModelFiles> {
-        let mut transcriber_complete = true;
+        let (mut transcriber_complete, mut decoder_there) = (true, true);
         for component in &selection.components {
-            let path = self.root().join(component.filename);
+            let path = self.root.join(component.filename);
             if !published_component(&path, component) {
+                if component.kind == "vae-decoder" {
+                    decoder_there = false;
+                    continue;
+                }
                 if optional_kind(component.kind) {
                     transcriber_complete = false;
                     continue;
@@ -473,6 +445,9 @@ impl ModelManager {
         if !transcriber_complete {
             files.transcriber = None;
         }
+        if !decoder_there {
+            files.vae_decoder = None;
+        }
         Ok(files)
     }
 
@@ -482,7 +457,7 @@ impl ModelManager {
                 if self.cancelled.load(Ordering::SeqCst) {
                     bail!("cancelled");
                 }
-                if verified_file_async(self.root().join(component.filename), component.clone()).await? {
+                if verified_file_async(self.root.join(component.filename), component.clone()).await? {
                     self.set_published_progress(&selection).await?;
                     continue;
                 }
@@ -533,9 +508,12 @@ impl ModelManager {
     /// is the whole budget: Hugging Face's Xet storage drops them above that,
     /// and a dropped range leaves a hole in a file of exactly the right size.
     async fn download_component(&self, component: &Component) -> Result<()> {
-        let target = self.root().join(component.filename);
+        let target = self.root.join(component.filename);
         let part = part_path(&target);
         let url = crate::net::model_url(&component.url());
+        if let Some(folder) = target.parent() {
+            tokio::fs::create_dir_all(folder).await.with_context(|| format!("create {}", folder.display()))?;
+        }
 
         // another program of timoncool's has this file: taken through the same checksum a download passes
         let name = Path::new(component.filename).file_name().unwrap_or_default();
@@ -605,7 +583,7 @@ impl ModelManager {
         let published: u64 = selection
             .components
             .iter()
-            .filter(|component| published_component(&self.root().join(component.filename), component))
+            .filter(|component| published_component(&self.root.join(component.filename), component))
             .map(|component| component.bytes)
             .sum::<u64>()
             .saturating_sub(selection.already_present_bytes);
@@ -627,7 +605,7 @@ impl ModelManager {
     }
 
     fn persist_locked(&self, state: &PersistentState) -> Result<()> {
-        persist_state_file(&self.state_path(), state)
+        persist_state_file(&self.state_path, state)
     }
 }
 
@@ -647,22 +625,9 @@ fn persist_state_file(path: &Path, state: &PersistentState) -> Result<()> {
     Ok(())
 }
 
-/// The folder the weights live in before anything is picked: the environment's
-/// word when it is given - the explicit override a developer build needs - the
-/// user's saved choice otherwise, and the studio's own data folder last. The
-/// desktop shell resolves the same order, so a studio started by its own icon
-/// and one started by hand agree on where the models are.
-fn models_root_from_environment() -> PathBuf {
-    env::var_os("YUE_MODELS_ROOT")
-        .map(PathBuf::from)
-        .filter(|root| !root.as_os_str().is_empty())
-        .or_else(crate::saved_models_directory)
-        .unwrap_or_else(default_model_root)
-}
-
 /// Direct `music-server` launches use the same data location as the shell;
 /// the environment variable stays the explicit override.
-pub fn default_model_root() -> PathBuf {
+fn default_model_root() -> PathBuf {
     // Models are the largest thing the studio owns, so they follow its data
     // root: beside the executable when it is portable.
     if let Some(root) = crate::studio_data_root() {
@@ -694,36 +659,6 @@ pub fn default_model_root() -> PathBuf {
 pub struct RemovalReport {
     pub removed: Vec<String>,
     pub freed_bytes: u64,
-}
-
-/// One file carried to the folder the user picked.
-#[derive(Debug, Clone, Serialize)]
-pub struct MovedFile {
-    pub file: String,
-    pub bytes: u64,
-}
-
-/// A file that stayed where it was, and why.
-#[derive(Debug, Clone, Serialize)]
-pub struct RefusedMove {
-    pub file: String,
-    pub error: String,
-}
-
-/// What pointing the studio at another folder did.
-#[derive(Debug, Clone, Serialize)]
-pub struct RelocationReport {
-    pub previous: String,
-    pub directory: String,
-    /// Whether the files already downloaded were carried over.
-    pub moved_existing: bool,
-    pub moved: Vec<MovedFile>,
-    pub moved_bytes: u64,
-    pub failed: Vec<RefusedMove>,
-    /// Room on the filesystem the folder is on, so the window can say whether
-    /// the set that is about to be downloaded fits.
-    pub free_bytes: u64,
-    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -792,6 +727,9 @@ fn validate_complete_set(selected: &[Component]) -> Result<()> {
             bail!("a runnable YuE2 installation requires exactly one {kind} component");
         }
     }
+    if selected.iter().filter(|component| component.kind == "vae-decoder").count() > 1 {
+        bail!("a YuE2 installation takes at most one decoder beside its VAE");
+    }
     let heads: Vec<&Component> = selected.iter().filter(|component| component.kind == "transcriber").collect();
     if heads.len() > 1 {
         bail!("a YuE2 installation takes at most one transcriber");
@@ -808,50 +746,10 @@ fn profile_files_from_components(components: &[Component]) -> ProfileModelFiles 
     ProfileModelFiles {
         backbone: filename("backbone").expect("complete set"),
         vae: filename("vae").expect("complete set"),
+        vae_decoder: filename("vae-decoder"),
         transcriber: filename("transcriber"),
         companion: filename("companion").expect("complete set"),
     }
-}
-
-/// Free and total bytes on the filesystem a path is on. A model set is four to
-/// twenty-six gigabytes, so the folder alone is half an answer.
-pub fn space_at(path: &Path) -> (u64, u64) {
-    // The folder itself may not be there yet: then the filesystem that would
-    // hold it is the one its nearest existing parent is on.
-    let existing = path
-        .ancestors()
-        .find(|candidate| candidate.exists())
-        .unwrap_or(path);
-    (
-        fs2::available_space(existing).unwrap_or(0),
-        fs2::total_space(existing).unwrap_or(0),
-    )
-}
-
-/// Whether a folder can be written to, proved by writing to it.
-fn probe_writable(folder: &Path) -> Result<()> {
-    let probe = folder.join(".studio-write-probe");
-    fs::write(&probe, b"yue2 studio").with_context(|| format!("write into {}", folder.display()))?;
-    let _ = fs::remove_file(&probe);
-    Ok(())
-}
-
-/// Takes one file to another folder: a rename, which is instant on the same
-/// filesystem, and a copy otherwise, which leaves the original in place until
-/// the copy is whole. A move that fails - a disk that filled up - never leaves
-/// half a set of weights on either disk.
-fn take_across(source: &Path, destination: &Path) -> Result<()> {
-    if fs::rename(source, destination).is_ok() {
-        return Ok(());
-    }
-    let staged = part_path(destination);
-    if let Err(error) = fs::copy(source, &staged) {
-        let _ = fs::remove_file(&staged);
-        return Err(error).with_context(|| format!("copy {} to {}", source.display(), destination.display()));
-    }
-    fs::rename(&staged, destination).with_context(|| format!("publish {}", destination.display()))?;
-    let _ = fs::remove_file(source);
-    Ok(())
 }
 
 fn preflight_space(root: &Path, selection: &ResolvedInstall) -> Result<()> {
@@ -961,7 +859,7 @@ fn link_from_neighbors(root: &Path, components: &[Component]) {
 
 fn validate_model_root(root: &Path) -> Result<()> {
     if root.as_os_str().is_empty() || root.parent().is_none() || root.file_name().is_none() {
-        bail!("the models folder must be a folder of its own, not a drive root (YUE_MODELS_ROOT)");
+        bail!("YUE_MODELS_ROOT must be a specific non-root directory");
     }
     Ok(())
 }
@@ -975,6 +873,21 @@ fn part_path(path: &Path) -> PathBuf {
 /// The parts of a declared set, named in the statistics beside it.
 pub fn profile_components(profile_id: &str) -> Vec<String> {
     PROFILE_SETS.iter().find(|set| set.0 == profile_id).map(|set| set.2.iter().map(|id| id.to_string()).collect()).unwrap_or_default()
+}
+
+
+/// The decoder and the community fine-tune of the "Ruach Studio" preset: their v1 decoder, their own default, and
+/// the fine-tune they call their choice.
+pub const PRESET_DECODER: &str = "vae-rs-x3-v1";
+pub const PRESET_MODEL: &str = "rs-tw-2.0x0.75";
+
+/// `ids` with `decoder` as their one decoder: any other decoder among them gives way to it.
+pub fn with_decoder(ids: &[String], decoder: &str) -> Vec<String> {
+    let catalog = components();
+    let is_decoder = |id: &str| catalog.iter().any(|component| component.id == id && component.kind == "vae-decoder");
+    let mut ids: Vec<String> = ids.iter().filter(|id| !is_decoder(id)).cloned().collect();
+    ids.push(decoder.to_string());
+    ids
 }
 
 /// The declared set whose components are exactly these, whatever order they
@@ -1038,6 +951,26 @@ fn components() -> Vec<Component> {
         c("backbone-q5", "backbone", "YuE2-3B-Q5_K_M.gguf", 2622936832, "cd3efd250b734a229172800f08f33a893ad1f66b521666e176cdae4a0729b281"),
         // The VAE ships in F32 only: its weights are the audio.
         c("vae-f32", "vae", "YuE2-Vae-F32.gguf", 530497344, "93e49dfb1970e89ad64cacb17cf13b5d05f6bb30ef7ed3adae3050bcb728638a"),
+        // Ruach Studio's float32 decoders, YuE2-VAE-RS x3 v1 and v2 (CC BY-NC 4.0, like YuE2): F32 only, as released. They need an engine
+        // whose VAE reader knows their keys (decoder_pre_units, decoder_extra_units, halo_frames, weights_f32): timoncool/yue2.cpp#2
+        Component {
+            id: "vae-rs-x3-v1",
+            kind: "vae-decoder",
+            filename: "VAE-RS/YuE2-VAE-RS-x3_v1-F32.gguf",
+            bytes: 803056768,
+            sha256: "368a91278f0b25e67bc14b1a894f9e8c341c5fccb70afa880fbc1de6afdb4959",
+            repository: RUACH_VAE_REPOSITORY,
+            revision: RUACH_VAE_REVISION,
+        },
+        Component {
+            id: "vae-rs-x3-v2",
+            kind: "vae-decoder",
+            filename: "VAE-RS/YuE2-VAE-RS-x3_v2-F32.gguf",
+            bytes: 803056768,
+            sha256: "93de6e8a18246670f4cf49d5f4f193aece95dda48463eda13a303e7f0d313f97",
+            repository: RUACH_VAE_REPOSITORY,
+            revision: RUACH_VAE_REVISION,
+        },
         // SheetSage2's head; the MERT encoder it reads is a file of its own
         c("transcriber-f32", "transcriber", "SheetSage2-F32.gguf", 228738176, "4988c01b64c2812dd71eb89a9ab1937a3385ff2ba869bf495ccb69af4ec744cd"),
         c("transcriber-q8", "transcriber", "SheetSage2-Q8_0.gguf", 105629856, "95d8fa8761753b4833782a52b68d5c0afa3bd3cfbc03d3dcbbf8ded0c13f611e"),
@@ -1056,9 +989,8 @@ fn components() -> Vec<Component> {
     ]
 }
 
-/// The parts of a set the studio runs without: SheetSage2 and the MERT it reads.
 fn optional_kind(kind: &str) -> bool {
-    matches!(kind, "transcriber" | "transcriber-base")
+    matches!(kind, "transcriber" | "transcriber-base" | "vae-decoder")
 }
 
 /// Transcribers of the single-file release, read as the nearest one published now.
@@ -1092,6 +1024,10 @@ fn precision(filename: &str) -> &str {
     stem.rsplit_once('-').map_or(stem, |(_, tail)| tail)
 }
 
+/// Ruach Studio's decoders: https://huggingface.co/goldhub/YuE2-VAE-RS-x3, pinned.
+const RUACH_VAE_REPOSITORY: &str = "goldhub/YuE2-VAE-RS-x3";
+const RUACH_VAE_REVISION: &str = "be7adad4d8f345549cfb59f94af26e9e3ca6ae67";
+
 fn c(id: &'static str, kind: &'static str, filename: &'static str, bytes: u64, sha256: &'static str) -> Component {
     Component { id, kind, filename, bytes, sha256, repository: REPOSITORY, revision: REVISION }
 }
@@ -1100,94 +1036,13 @@ fn c(id: &'static str, kind: &'static str, filename: &'static str, bytes: u64, s
 mod tests {
     use super::*;
 
-    /// Two folders of their own, for the tests of moving a model set between
-    /// disks. The names say which is which in a failure.
-    fn two_folders() -> (PathBuf, PathBuf) {
-        let from = std::env::temp_dir().join(format!("yue2-from-{}", uuid::Uuid::now_v7()));
-        let to = std::env::temp_dir().join(format!("yue2-to-{}", uuid::Uuid::now_v7()));
-        fs::create_dir_all(&from).unwrap();
-        fs::create_dir_all(&to).unwrap();
-        (from, to)
-    }
-
-    #[tokio::test]
-    async fn a_downloaded_set_moves_to_the_folder_the_user_picks() {
-        // Someone whose disk has filled up picks another one. The weights are
-        // four to twenty-six gigabytes; carrying them over is the difference
-        // between a choice and downloading everything a second time.
-        let (from, to) = two_folders();
-        let manager = ModelManager::over(from.clone()).unwrap();
-        let picked = vec!["backbone-q6".to_string(), "vae-f32".to_string()];
-        let size = |id: &str| components().iter().find(|component| component.id == id).unwrap().bytes;
-        for (id, name) in [("backbone-q6", "YuE2-3B-Q6_K.gguf"), ("vae-f32", "YuE2-Vae-F32.gguf")] {
-            fs::File::create(from.join(name)).unwrap().set_len(size(id)).unwrap();
-        }
-        assert!(manager.picked_components_installed(&picked));
-
-        let report = manager.relocate(to.clone(), true).await.unwrap();
-
-        assert_eq!(report.directory, to.display().to_string());
-        assert_eq!(report.moved.len(), 2, "{:?}", report.moved);
-        assert_eq!(report.moved_bytes, size("backbone-q6") + size("vae-f32"));
-        assert!(report.failed.is_empty() && report.moved_existing);
-        assert!(!from.join("YuE2-3B-Q6_K.gguf").exists(), "the folder left behind keeps no second copy");
-        assert_eq!(manager.models_directory(), to);
-        // The set is found where it now lives: nothing is downloaded again.
-        assert!(manager.picked_components_installed(&picked));
-        let (free, total) = manager.models_space();
-        assert!(free <= total && total > 0, "the disk the folder is on is measured");
-        let _ = fs::remove_dir_all(&from);
-        let _ = fs::remove_dir_all(&to);
-    }
-
-    #[tokio::test]
-    async fn a_move_never_covers_what_the_new_folder_already_holds() {
-        // Pointing the studio at a folder that already has some of the set uses
-        // what is there; the move must not write over a file of the user's.
-        let (from, to) = two_folders();
-        let manager = ModelManager::over(from.clone()).unwrap();
-        let size = |id: &str| components().iter().find(|component| component.id == id).unwrap().bytes;
-        fs::File::create(from.join("YuE2-3B-Q6_K.gguf")).unwrap().set_len(size("backbone-q6")).unwrap();
-        fs::write(to.join("YuE2-Vae-F32.gguf"), b"the vae this folder already had").unwrap();
-
-        let report = manager.relocate(to.clone(), true).await.unwrap();
-
-        assert_eq!(report.moved.len(), 1, "{:?}", report.moved);
-        assert_eq!(report.moved[0].file, "YuE2-3B-Q6_K.gguf");
-        assert_eq!(fs::read(to.join("YuE2-Vae-F32.gguf")).unwrap(), b"the vae this folder already had");
-        assert_eq!(manager.models_directory(), to);
-        let _ = fs::remove_dir_all(&from);
-        let _ = fs::remove_dir_all(&to);
-    }
-
-    #[tokio::test]
-    async fn the_folder_does_not_change_under_a_running_download() {
-        // The download is writing into the folder it was started on. Moving it
-        // out from under the job would leave the files where nothing looks.
-        let (from, to) = two_folders();
-        let manager = ModelManager::over(from.clone()).unwrap();
-        manager.state.write().await.active = Some(DownloadJob {
-            id: "job".into(),
-            profile_id: Some("light".into()),
-            component_ids: vec!["backbone-q5".into()],
-            status: DownloadStatus::Downloading,
-            downloaded_bytes: 1,
-            total_bytes: 2,
-            error: None,
-        });
-
-        assert!(manager.relocate(to.clone(), true).await.is_err());
-        assert_eq!(manager.models_directory(), from, "the running download keeps its folder");
-        let _ = fs::remove_dir_all(&from);
-        let _ = fs::remove_dir_all(&to);
-    }
-
     #[test]
     fn a_hand_picked_set_equal_to_a_declared_one_is_that_set() {
         let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<_>>();
         assert_eq!(profile_matching(&ids(&["transcriber-f32", "mert-f32", "backbone-bf16", "vae-f32"])), Some("native"));
         assert_eq!(profile_matching(&ids(&["transcriber-f32", "mert-f32", "backbone-bf16", "vae-f32", COMPANION])), Some("native"));
         assert_eq!(profile_matching(&ids(&["backbone-q8", "vae-f32", "transcriber-q8", "mert-q8"])), Some("quality-q8"));
+        assert_eq!(profile_matching(&ids(&["backbone-q8", "vae-f32", "vae-rs-x3-v1", "transcriber-q8", "mert-q8"])), None, "a set picked with a decoder is the person's own");
         assert_eq!(profile_matching(&ids(&["backbone-q8", "vae-f32"])), None);
         assert_eq!(profile_matching(&ids(&["backbone-q8", "vae-f32", "transcriber-f32"])), None);
     }
@@ -1250,7 +1105,14 @@ mod tests {
     fn a_missing_transcriber_leaves_the_set_runnable_without_one() {
         let root = std::env::temp_dir().join(format!("yue2-optional-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&root).unwrap();
-        let manager = ModelManager::over(root.clone()).unwrap();
+        let manager = ModelManager {
+            root: root.clone(),
+            state_path: root.join("state.json"),
+            http: reqwest::Client::new(),
+            state: Arc::new(RwLock::new(PersistentState::default())),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            hub: Arc::default(),
+        };
         for component in components().iter().filter(|component| ["backbone-q8", "vae-f32", COMPANION].contains(&component.id)) {
             fs::File::create(root.join(component.filename)).unwrap().set_len(component.bytes).unwrap();
         }
@@ -1266,6 +1128,68 @@ mod tests {
         assert!(manager.installed_profile_files("quality-q8").unwrap().transcriber.is_none());
         let _ = fs::remove_dir_all(root);
     }
+
+
+    /// The sets decode with the VAE's own decoder. A set picked with Ruach Studio's decoder runs on the VAE's own until
+    /// the decoder is on disk, is offered it meanwhile, and names it once it is there.
+    #[test]
+    fn a_set_without_its_decoder_on_disk_decodes_with_the_vae_and_takes_the_decoder_when_it_arrives() {
+        let root = std::env::temp_dir().join(format!("yue2-decoder-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let manager = ModelManager {
+            root: root.clone(),
+            state_path: root.join("state.json"),
+            http: reqwest::Client::new(),
+            state: Arc::new(RwLock::new(PersistentState::default())),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            hub: Arc::default(),
+        };
+        for component in components().iter().filter(|component| ["backbone-q8", "vae-f32", COMPANION].contains(&component.id)) {
+            fs::File::create(root.join(component.filename)).unwrap().set_len(component.bytes).unwrap();
+        }
+        assert!(profiles().iter().all(|profile| !profile.components.iter().any(|id| id.starts_with("vae-rs"))), "no set carries the decoder");
+        assert_eq!(manager.installed_profile_files("quality-q8").unwrap().vae_decoder, None);
+        assert!(manager.decoder_to_fetch(Some("quality-q8"), None).is_none(), "a set is not offered a decoder nobody picked");
+
+        let with_decoder: Vec<String> = ["backbone-q8", "vae-f32", "vae-rs-x3-v1"].map(String::from).to_vec();
+        let files = manager.installed_component_files(&with_decoder).unwrap();
+        assert_eq!((files.vae.as_str(), files.vae_decoder), ("YuE2-Vae-F32.gguf", None));
+        let offered = manager.decoder_to_fetch(None, Some(&with_decoder)).expect("the picked decoder is offered");
+        assert_eq!((offered.id, offered.bytes, offered.partial), ("vae-rs-x3-v1", 803056768, 0));
+        let on_light: Vec<String> = ["backbone-q5", "vae-f32", "vae-rs-x3-v1"].map(String::from).to_vec();
+        assert!(manager.decoder_to_fetch(None, Some(&on_light)).is_none(), "a set that is not on disk is not offered its decoder alone");
+
+        let decoder = components().into_iter().find(|component| component.id == "vae-rs-x3-v1").unwrap();
+        assert_eq!(decoder.kind, "vae-decoder");
+        fs::create_dir_all(root.join(decoder.filename).parent().unwrap()).unwrap();
+        fs::File::create(root.join(decoder.filename)).unwrap().set_len(decoder.bytes).unwrap();
+        assert_eq!(manager.installed_component_files(&with_decoder).unwrap().vae_decoder.as_deref(), Some(decoder.filename));
+        assert!(manager.decoder_to_fetch(None, Some(&with_decoder)).is_none());
+        assert_eq!(manager.arrived_bytes("vae-rs-x3-v1"), decoder.bytes);
+        // a hand-picked set without a decoder stays without one, and two decoders are not a set
+        let picked: Vec<String> = ["backbone-q8", "vae-f32"].map(String::from).to_vec();
+        assert_eq!(manager.installed_component_files(&picked).unwrap().vae_decoder, None);
+        let two: Vec<String> = ["backbone-q8", "vae-f32", "vae-rs-x3-v1", "vae-rs-x3-v2"].map(String::from).to_vec();
+        assert!(resolve_install(InstallRequest { profile_id: None, component_ids: two }).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+
+    /// The Ruach Studio preset keeps the chosen set and puts its decoder beside the VAE, in place of any other decoder.
+    #[test]
+    fn the_preset_puts_its_decoder_beside_the_chosen_set() {
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let set = profile_components("quality-q8");
+        let with = with_decoder(&set, PRESET_DECODER);
+        assert_eq!(with.len(), set.len() + 1);
+        assert!(resolve_install(InstallRequest { profile_id: None, component_ids: with.clone() }).is_ok());
+        assert_eq!(with_decoder(&with, PRESET_DECODER), with, "applied twice it is the same set");
+        let other = with_decoder(&ids(&["backbone-q5", "vae-f32", "vae-rs-x3-v2"]), PRESET_DECODER);
+        assert_eq!(other, ids(&["backbone-q5", "vae-f32", "vae-rs-x3-v1"]));
+        assert!(components().iter().any(|component| component.id == PRESET_DECODER && component.kind == "vae-decoder"));
+        assert!(crate::community::catalog().iter().any(|model| model.id == PRESET_MODEL), "the preset's fine-tune is in the community catalog");
+    }
+
 
     #[test]
     fn the_single_file_transcriber_is_cleared_and_a_head_goes_with_its_mert() {
@@ -1293,7 +1217,14 @@ mod tests {
     fn a_picked_set_stays_chosen_while_only_the_companion_is_missing() {
         let root = std::env::temp_dir().join(format!("yue2-picked-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&root).unwrap();
-        let manager = ModelManager::over(root.clone()).unwrap();
+        let manager = ModelManager {
+            root: root.clone(),
+            state_path: root.join("state.json"),
+            http: reqwest::Client::new(),
+            state: Arc::new(RwLock::new(PersistentState::default())),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            hub: Arc::default(),
+        };
         let picked = vec!["backbone-q6".to_string(), "vae-f32".to_string()];
         assert!(!manager.picked_components_installed(&picked));
         let catalog = components();
@@ -1319,9 +1250,13 @@ mod tests {
 
     #[test]
     fn catalog_pins_every_published_file() {
-        assert_eq!(components().len(), 10);
+        assert_eq!(components().len(), 12);
         assert!(components().iter().all(|component| component.sha256.len() == 64 && component.revision.len() == 40));
-        assert!(components().iter().filter(|component| component.id != COMPANION).all(|component| component.revision == REVISION));
+        let ruach = |component: &&Component| component.repository == RUACH_VAE_REPOSITORY;
+        assert!(components().iter().filter(|component| component.id != COMPANION && !ruach(component)).all(|component| component.revision == REVISION));
+        // the Ruach Studio decoders: their own pinned repository, float32 only, offered as VAEs
+        assert!(components().iter().filter(ruach).all(|component| component.revision == RUACH_VAE_REVISION && component.kind == "vae-decoder" && component.filename.ends_with("-F32.gguf")));
+        assert_eq!(components().iter().filter(ruach).count(), 2);
     }
 
     #[tokio::test]

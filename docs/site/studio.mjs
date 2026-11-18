@@ -5,8 +5,8 @@ export const STUDIO = {
   name: 'YuE2 Studio',
   repo: 'https://github.com/timoncool/YuE2-Studio',
   site: 'https://timoncool.github.io/YuE2-Studio/',
-  installerMB: 316,
-  updated: '2026-11-13',
+  installerMB: 331,
+  updated: '2026-11-16',
   speed: {
     en: {
       title: 'How fast is it',
@@ -97,6 +97,24 @@ export const STUDIO = {
         ['그래픽 카드 없음 (프로세서)', '약 2.5시간', '0.02×'],
       ],
       note: '우리 컴퓨터(RTX 4090, Ryzen 9 9950X3D, Windows 11, Q8_0 세트)에서는 1분 노래 20초, 4분 노래 54초, 10분 노래 약 3분이 걸리며, 작업 중 카드는 5–8 GB를 씁니다.',
+    },
+    pt: {
+      title: 'Quão rápido é',
+      sub: 'Quanto demora uma música de 3 minutos, por placa gráfica. São médias do que as instalações do YuE2 Studio comunicaram em 30 dias (versão 3.8, com o carregamento dos modelos incluído; as pessoas usam conjuntos de modelos diferentes, por isso o seu resultado pode ser outro).',
+      head: ['A sua placa gráfica', 'Uma música de 3 minutos', 'Velocidade'],
+      rows: [
+        ['NVIDIA, 24 GB ou mais', 'cerca de 1 minuto', '2,7× mais rápido do que o tempo real'],
+        ['NVIDIA, 16 GB', 'cerca de 2 minutos', '1,6×'],
+        ['NVIDIA, 12 GB', 'cerca de 2 minutos', '1,4×'],
+        ['NVIDIA, 8 GB ou menos', 'cerca de 5 minutos', '0,6×'],
+        ['AMD, 16 GB ou mais (Vulkan)', '3–4 minutos', '0,9×'],
+        ['Intel Arc, 12 GB (Vulkan)', 'cerca de 7 minutos', '0,4×'],
+        ['Apple silicon, 24 GB ou mais', 'cerca de 8 minutos', '0,4×'],
+        ['Apple silicon, 16 GB', 'cerca de 15 minutos', '0,2×'],
+        ['AMD, 8 GB ou menos (Vulkan)', 'cerca de uma hora', '0,05×'],
+        ['Sem placa gráfica (processador)', 'cerca de 2,5 horas', '0,02×'],
+      ],
+      note: 'Na nossa máquina (RTX 4090, Ryzen 9 9950X3D, Windows 11, conjunto Q8_0): uma música de 1 minuto em 20 s, uma de 4 minutos em 54 s, uma de 10 minutos em cerca de 3 minutos; a placa ocupa 5–8 GB enquanto trabalha.',
     },
   },
   bento: [

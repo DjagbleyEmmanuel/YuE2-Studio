@@ -20,8 +20,8 @@ desktop/src-tauri/gen/schemas/linux-schema.json
 *.db-shm
 *.db-wal
 
-# The downloaded model folders can be put on this disk from the LoRA page (the
-# downloads folder), which leaves them in the checkout: gigabytes, never a commit.
+# The downloaded folders can be moved to any disk from Settings, including a
+# checkout, which leaves gigabytes here; they are never a commit.
 /adapters/
 /audiocpp/
 /karaoke/

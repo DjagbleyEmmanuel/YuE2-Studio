@@ -26,7 +26,9 @@ import {
     FileMusic,
     Wand2,
     Piano,
+    FileOutput,
 } from 'lucide-react';
+import { openExport } from './ExportDialog';
 
 /** The one menu of a song. Its actions come from the app through
  *  SongActionsContext, so every place that opens it offers the same items. */
@@ -213,7 +215,7 @@ export const SongDropdownMenu: React.FC<SongDropdownMenuProps> = ({
             : `${window.location.origin}${song.audioUrl}`;
         // AudioMass is a fully client-side editor shipped as static assets, so
         // it runs without any backend service - in a window of the studio.
-        void openAudioEditor(audioUrl, song.title);
+        void openAudioEditor(audioUrl);
         onClose();
     };
 
@@ -357,6 +359,11 @@ export const SongDropdownMenu: React.FC<SongDropdownMenuProps> = ({
                 icon={<Download size={14} />}
                 label={t('download')}
                 onClick={handleDownload}
+            />
+            <MenuItem
+                icon={<FileOutput size={14} />}
+                label={t('exportMenu')}
+                onClick={() => handleAction(() => openExport(song))}
             />
 
             {/* Owner-only Actions */}
