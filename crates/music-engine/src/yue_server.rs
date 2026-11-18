@@ -442,6 +442,10 @@ pub struct YueServerSupervisor {
     /// thread, not to the process: a signal 9 with that thread gone is the death
     /// explained, and a signal 9 with it still running is a killer from outside.
     spawned_by: Option<u32>,
+    /// Ends the thread that spawned the engine, which on Linux is the thread
+    /// `PR_SET_PDEATHSIG` follows. Kept while the engine lives; dropped after
+    /// it is gone, so the thread does not outlive its child.
+    keeper: Option<std::sync::mpsc::Sender<()>>,
 }
 
 /// The caller's thread as the system numbers it, so a log line about the engine
@@ -467,6 +471,41 @@ fn thread_is_running(tid: u32) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn thread_is_running(_tid: u32) -> bool {
     false
+}
+
+/// Starts the engine on a thread of its own that lives as long as the engine.
+///
+/// Linux delivers `PR_SET_PDEATHSIG` when the thread that forked the child
+/// ends, not when the process does. The supervisor is called through
+/// `tokio::task::block_in_place`, and tokio may hand that worker's core to a
+/// replacement thread and let the original one retire - which killed engines
+/// the studio was still using. This thread only waits, so its end still means
+/// the supervisor let the engine go (or the studio did).
+fn spawn_with_keeper(mut command: Command, executable: &Path) -> Result<(Child, Option<u32>, std::sync::mpsc::Sender<()>)> {
+    let (spawned, child) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    thread::Builder::new()
+        .name("yue-server-parent".into())
+        .spawn(move || match command.spawn() {
+            Ok(child) => {
+                let tid = current_thread_id();
+                // If nobody took the child the thread is about to end, and
+                // with it the child it just started.
+                if spawned.send(Ok((child, tid))).is_ok() {
+                    // The supervisor drops `release` once the child is gone.
+                    let _ = released.recv();
+                }
+            }
+            Err(error) => {
+                let _ = spawned.send(Err(error));
+            }
+        })
+        .with_context(|| format!("start the thread that owns yue-server {}", executable.display()))?;
+    match child.recv() {
+        Ok(Ok((child, tid))) => Ok((child, tid, release)),
+        Ok(Err(error)) => Err(error).with_context(|| format!("start yue-server {}", executable.display())),
+        Err(_) => bail!("the thread that starts yue-server ended before it started"),
+    }
 }
 
 impl YueServerLocation {
@@ -540,7 +579,7 @@ impl YueServerSupervisor {
     pub fn new(config: YueServerLaunchConfig) -> Result<Self> {
         canonical_file(&config.executable, "yue-server executable")?;
         validate_loopback_host(&config.host)?;
-        Ok(Self { config, child: None, spawned_by: None })
+        Ok(Self { config, child: None, spawned_by: None, keeper: None })
     }
 
     pub fn config(&self) -> &YueServerLaunchConfig {
@@ -612,13 +651,12 @@ impl YueServerSupervisor {
             }
         }
         configure_child_process(&mut command);
-        let spawned_by = current_thread_id();
-        let child = command
-            .spawn()
-            .with_context(|| format!("start yue-server {}", self.config.executable.display()))?;
+        let executable = self.config.executable.clone();
+        let (child, spawned_by, keeper) = spawn_with_keeper(command, &executable)?;
         // The engine must not outlive the studio, however the studio ends.
         music_core::process::adopt(&child);
         self.spawned_by = spawned_by;
+        self.keeper = Some(keeper);
         self.child = Some(child);
         if let Err(error) = self.wait_until_healthy(readiness_timeout) {
             let _ = self.stop(Duration::from_secs(1));
@@ -641,6 +679,7 @@ impl YueServerSupervisor {
             ));
             self.child = None;
             self.spawned_by = None;
+            self.keeper = None;
             return Ok(StopOutcome { was_running: false, graceful: true });
         }
 
@@ -653,6 +692,7 @@ impl YueServerSupervisor {
             if child.try_wait().context("wait for yue-server shutdown")?.is_some() {
                 self.child = None;
                 self.spawned_by = None;
+                self.keeper = None;
                 return Ok(StopOutcome { was_running: true, graceful: true });
             }
             thread::sleep(Duration::from_millis(50));
@@ -668,6 +708,7 @@ impl YueServerSupervisor {
         child.wait().context("wait for force-stopped yue-server")?;
         self.child = None;
         self.spawned_by = None;
+        self.keeper = None;
         Ok(StopOutcome { was_running: true, graceful: false })
     }
 
@@ -711,6 +752,7 @@ impl YueServerSupervisor {
                 ));
                 self.child = None;
                 self.spawned_by = None;
+                self.keeper = None;
             }
         }
         Ok(())
@@ -1094,5 +1136,38 @@ mod tests {
     #[test]
     fn health_check_is_false_without_a_server() {
         assert!(!health_check("127.0.0.1", 65534, Duration::from_millis(10)));
+    }
+
+    /// The engine is started through `block_in_place`, and tokio may retire the
+    /// worker that ran it as soon as the call returns. On Linux the engine dies
+    /// with the thread that forked it, so the spawn gets a keeper thread of its
+    /// own: the engine must outlive the thread that asked for it, and go when
+    /// the supervisor lets it go.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_engine_outlives_the_thread_that_started_it() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30");
+        configure_child_process(&mut command);
+        let (ready, spawned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = ready.send(spawn_with_keeper(command, Path::new("test engine")));
+        });
+        let (mut child, tid, keeper) = spawned.recv().unwrap().unwrap();
+        assert!(tid.is_some(), "the keeper thread is the engine's parent and can be named");
+        thread::sleep(Duration::from_millis(300));
+        assert!(child.try_wait().unwrap().is_none(), "the engine died with the thread that started it");
+        // The supervisor has let the engine go: the keeper ends and the child
+        // follows, so no engine is left behind.
+        drop(keeper);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        panic!("the engine outlived the keeper thread");
     }
 }

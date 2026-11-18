@@ -844,7 +844,7 @@ enum KvCache {
 }
 
 /// The KV cache a start runs with, and why: `set` (chosen in Settings), `fits` and `does_not_fit` (Auto against the
-/// card's free memory, with the GiB F16 needs and the GiB free), `unmeasured` (Auto on a set or a card not measured),
+/// card's free memory, with the GiB F16 needs and the GiB free), `unmeasured` (Auto on a model or a card not measured),
 /// or the reason Q8 cannot apply (`kv_q8_off_reason`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 struct KvChoice {
@@ -888,14 +888,32 @@ impl<'de> Deserialize<'de> for KeepLoaded {
 }
 
 /// What `Auto` decides for a start, and why: `set` (chosen in Settings), `fits` and `does_not_fit` (against the card's
-/// free memory, with the GiB needed and free), `not_on_card`, `free_unknown`, `unmeasured` (a set whose weight kept
-/// loaded was not measured).
+/// free memory, with the GiB needed and free), `not_on_card`, `free_unknown`, `unmeasured` (a model whose size could
+/// not be read).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct KeepDecision {
     keep: bool,
     reason: &'static str,
     need_gib: Option<f64>,
     free_gib: Option<f64>,
+}
+
+/// What a backbone's weights take on the card, in GiB, as `Auto` counts them:
+/// the measured set from `SET_RESIDENT_GIB`, else the GGUF file's own size.
+/// A file of the person's own is not in the table, and its bytes are what the
+/// engine loads: measured against its log, the file and the loaded tensors
+/// agreed to the hundredth of a GiB. Kept whole, the engine also holds what a
+/// set's measured figures show it adds (`3.8` GiB, the smaller of the two), so
+/// a card is never told it fits when it would not.
+fn resident_gib(backbone: &std::path::Path, kept: bool) -> Option<f64> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const KEPT_ADDS_GIB: f64 = 3.8;
+    let name = backbone.file_name()?.to_string_lossy().to_ascii_uppercase();
+    if let Some((_, _, gib)) = SET_RESIDENT_GIB.iter().find(|(set, keeps, _)| name.contains(set) && *keeps == kept) {
+        return Some(*gib);
+    }
+    let bytes = fs::metadata(backbone).ok()?.len();
+    (bytes > 0).then(|| bytes as f64 / GIB + if kept { KEPT_ADDS_GIB } else { 0.0 })
 }
 
 /// `resident_gib`: what the set keeps on the card with its models loaded (`SET_RESIDENT_GIB`, kept); `kv_gib`: one
@@ -1127,8 +1145,7 @@ impl EngineOptions {
     /// measured.
     fn tracks_for_request(&self, backbone: &std::path::Path, free_gib: f64, context: u32, seconds: f64, guided: bool, q8: bool, asked: u32) -> Option<u32> {
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-        let name = backbone.file_name()?.to_string_lossy().to_ascii_uppercase();
-        let resident = SET_RESIDENT_GIB.iter().find(|(set, kept, _)| name.contains(set) && *kept == self.keeps()).map(|(_, _, gib)| *gib)?;
+        let resident = resident_gib(backbone, self.keeps())?;
         let frames = (seconds.max(0.0) * 25.0).ceil();
         let tokens = (2.0 * frames + 3500.0).min(f64::from(context));
         let sets = if guided { 2.0 } else { 1.0 };
@@ -1199,15 +1216,15 @@ impl EngineOptions {
     /// the set kept whole (`SET_RESIDENT_GIB`), a full-context cache for each track from Settings and the reserve.
     fn keep_choice(&self, backbone: Option<&std::path::Path>, on_card: bool, free_gib: Option<f64>) -> KeepDecision {
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-        let name = backbone.and_then(|backbone| backbone.file_name()).map(|name| name.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
-        let resident = SET_RESIDENT_GIB.iter().find(|(set, kept, _)| name.contains(set) && *kept).map(|(_, _, gib)| *gib);
+        let resident = backbone.and_then(|backbone| resident_gib(backbone, true));
         let kv = f64::from(self.effective_max_seq(backbone).unwrap_or(MODEL_CONTEXT)) * KV_BYTES_PER_TOKEN / GIB;
         keep_decision(self.keep_loaded, on_card, resident, kv, self.effective_max_batch(), free_gib)
     }
 
     /// The KV cache of a start: Q8 or F16 as chosen, Q8 only on a card with flash attention; Auto, F16 while the set, a
     /// full-context cache for each track from Settings and the reserve fit `free_gib`, the card's memory free before
-    /// the weights load, and Q8 when they do not. Auto stays F16 on a set or a card not measured.
+    /// the weights load, and Q8 when they do not. Auto stays F16 when the model's size or the card's free memory is
+    /// not measured.
     fn kv_cache_choice(&self, backbone: Option<&std::path::Path>, free_gib: Option<f64>) -> KvChoice {
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
         let choice = |q8: bool, reason: &'static str, need_gib: Option<f64>| KvChoice { q8, reason, need_gib, free_gib };
@@ -1218,8 +1235,7 @@ impl EngineOptions {
             KvCache::Q8 => choice(true, "set", None),
             KvCache::F16 => choice(false, "set", None),
             KvCache::Auto => {
-                let name = backbone.and_then(|backbone| backbone.file_name()).map(|name| name.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
-                let resident = SET_RESIDENT_GIB.iter().find(|(set, kept, _)| name.contains(set) && *kept == self.keeps()).map(|(_, _, gib)| *gib);
+                let resident = backbone.and_then(|backbone| resident_gib(backbone, self.keeps()));
                 let (Some(resident), Some(free)) = (resident, free_gib) else { return choice(false, "unmeasured", None) };
                 let kv = f64::from(self.effective_max_seq(backbone).unwrap_or(MODEL_CONTEXT)) * KV_BYTES_PER_TOKEN / GIB;
                 let need = resident + kv * f64::from(self.effective_max_batch()) + TRACKS_RESERVE_GIB;
@@ -10435,9 +10451,9 @@ fn kv_cache_line(kv: &KvChoice, tracks: u32, context: u32) -> String {
     let tracks = if tracks == 1 { "1 track".to_string() } else { format!("{tracks} tracks") };
     match (kv.reason, kv.need_gib, kv.free_gib) {
         ("does_not_fit", Some(need), Some(free)) => {
-            format!("KV cache Q8, chosen automatically: F16 needs {need:.1} GiB for the set and {tracks} at {context} tokens, {free:.1} GiB free")
+            format!("KV cache Q8, chosen automatically: F16 needs {need:.1} GiB for the model and {tracks} at {context} tokens, {free:.1} GiB free")
         }
-        ("fits", Some(need), Some(free)) => format!("KV cache F16 (Auto): {need:.1} GiB of {free:.1} GiB free for the set and {tracks} at {context} tokens"),
+        ("fits", Some(need), Some(free)) => format!("KV cache F16 (Auto): {need:.1} GiB of {free:.1} GiB free for the model and {tracks} at {context} tokens"),
         ("set", _, _) => format!("KV cache {kind}, set in Settings"),
         ("unmeasured", _, _) => "KV cache F16 (Auto): the set or the card's free memory is not measured".to_string(),
         (reason, _, _) => format!("KV cache {kind}: Q8 does not apply here ({reason})"),
@@ -12763,6 +12779,33 @@ mod tests {
         assert_eq!(auto.keep_choice(Some(q8), false, Some(64.0)).reason, "not_on_card");
         assert!(EngineOptions { keep_loaded: KeepLoaded::Yes, ..auto }.keep_choice(Some(q8), true, Some(1.0)).keep);
         assert!(roomy.line().contains("GB needed"), "{}", roomy.line());
+    }
+
+    /// A YuE2 model of the person's own is not in the set table, and the studio used to call it unmeasured: Auto kept
+    /// every decision at its fallback, F16 cache and models per song, whatever the card could hold. The file's own size
+    /// is what the engine loads, so it measures the model as well as the table measures a set.
+    #[cfg(unix)]
+    #[test]
+    fn a_model_of_one_s_own_is_measured_by_its_file() {
+        use music_engine::yue_server::ComputeBackend;
+        // a 2.74 GiB GGUF, sparse so the test writes no bytes
+        let folder = tempfile::tempdir().unwrap();
+        let own = folder.path().join("YuE2-3B-RS-TW-2.0x0.75-Q6_K.gguf");
+        std::fs::File::create(&own).unwrap().set_len(2_943_332_480).unwrap();
+        let resident = resident_gib(&own, false).unwrap();
+        assert!((resident - 2.74).abs() < 0.01, "{resident}");
+        assert!(resident_gib(&own, true).unwrap() >= resident + 3.0, "kept whole it needs what a measured set needs");
+        assert_eq!(resident_gib(&folder.path().join("gone.gguf"), false), None, "a file that cannot be read is unmeasured");
+        // the set's own file is measured the same way, so its Q5_K_M stops being unmeasured too
+        let q5 = std::path::Path::new("YuE2-3B-Q5_K_M.gguf");
+        assert_eq!(resident_gib(q5, false), None, "this test does not put the set's file on disk");
+        if hardware::hardware().cuda.is_some() {
+            let auto = EngineOptions { backend: ComputeBackend::Cuda, flash_attention: FlashAttention::On, ..EngineOptions::default() };
+            // 4 GB of card: F16 for the full context would not fit, so Auto takes the Q8 cache
+            let kv = auto.kv_cache_choice(Some(&own), Some(3.7));
+            assert_eq!((kv.q8, kv.reason), (true, "does_not_fit"), "{kv:?}");
+            assert_eq!(auto.keep_choice(Some(&own), true, Some(3.7)).reason, "does_not_fit");
+        }
     }
 
     /// Kept models go a while after the last song, once a spell; before the first song there is nothing to unload.

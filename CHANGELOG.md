@@ -3,6 +3,18 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## 2026-11-18 — 4.0.3
+
+Upstream 4.0.0, plus this fork's own work: the audio editor is a panel of the
+studio, the downloads folder can sit on any disk, and Web Audio keeps playing
+on Linux when the system interrupts it. 4.0.3 keeps the engine alive for the
+whole song it is making, and lets Auto measure a YuE2 model of your own.
+
+### Fixed
+
+- **The engine no longer dies with the thread that started it**: on Linux the engine is tied to the thread that spawned it (`PR_SET_PDEATHSIG`), and the studio starts it from a tokio worker through `block_in_place`. Tokio may hand that worker's core to a replacement thread and retire the original as soon as the start returns, which killed the engine mid-song - the log's `signal: 9` with "the thread that started it is gone". The start now happens on a dedicated thread that stays alive as long as the engine does, so a signal 9 means an outside killer again and a song is not cut off when a start finishes.
+- **A YuE2 model of your own is measured like a set**: Auto kept every memory decision at its fallback for a model it did not know - F16 cache even where Q8 was the only one that fit, models loaded per song whatever the card held - which is what made a Q6_K model on a 4 GB card run out of memory at the 8711-token prefill. The GGUF file's size is what the engine loads (in the log the file and the loaded tensors agreed to the hundredth of a GiB), so Auto now weighs it like a set: the Q6_K on the GTX 1050 takes the Q8 cache, and the prefill graph fits. A cache fitted after the card ran out of memory is kept as before.
+
 ## 2026-11-15 — 4.0.2
 
 Upstream 4.0.0, plus this fork's own work: the audio editor is a panel of the
