@@ -8,9 +8,11 @@ set -euo pipefail
 if [ "${1:-}" = "--inside" ]; then
   export DEBIAN_FRONTEND=noninteractive APPIMAGE_EXTRACT_AND_RUN=1 RUSTUP_TOOLCHAIN=stable CARGO_TERM_COLOR=never
   export CARGO_HOME=/cache/cargo RUSTUP_HOME=/cache/rustup npm_config_cache=/cache/npm PATH=/cache/cargo/bin:/cache/node/bin:$PATH
+  # this machine's DNS answers AAAA first and the IPv6 routes go nowhere: apt would wait on them forever
+  printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99ipv4
   echo "[..] packages"
   apt-get update -q >/dev/null
-  apt-get install -y -q --no-install-recommends build-essential pkg-config cmake ninja-build nasm autoconf automake libtool \
+  apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives=/cache/apt build-essential pkg-config cmake ninja-build nasm autoconf automake libtool \
     curl ca-certificates git unzip xz-utils libssl-dev libasound2-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
     librsvg2-dev patchelf file libfuse2 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav libvulkan-dev >/dev/null
   if [ ! -x /cache/node/bin/node ]; then
@@ -33,20 +35,43 @@ if [ "${1:-}" = "--inside" ]; then
   # the engine's CUDA backends: 12.9 serves Maxwell, Pascal, Volta and every card CUDA 13 does; CUDA 13 is added only
   # when asked (YUE_CUDA13=1), and this fork's packages carry the CUDA 12 build alone.
   cuda=13-3
-  curl -sSfL -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-  dpkg -i /tmp/cuda-keyring.deb >/dev/null
+  nvidia_repo() {
+    curl -sSfL -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+    dpkg -i /tmp/cuda-keyring.deb >/dev/null
+    apt-get update -q >/dev/null
+  }
   mkdir -p /cache/apt
-  apt-get update -q >/dev/null
   if [ "${YUE_CUDA13:-0}" = "1" ]; then
     echo "[..] CUDA $cuda"
+    nvidia_repo
     apt-get install -y -q --no-install-recommends -o Acquire::Retries=5 -o Dir::Cache::Archives=/cache/apt cuda-nvcc-$cuda cuda-cudart-dev-$cuda libcublas-dev-$cuda >/dev/null
     export PATH=/usr/local/cuda-13.3/bin:$PATH
   else
     echo "[..] CUDA 13 skipped (YUE_CUDA13=0): the package carries the CUDA 12 build"
   fi
-  # the CUDA 12 backend's toolkit, from the same repository (the audio.cpp server's CUDA 12 build is 12.9 too)
-  apt-get install -y -q --no-install-recommends -o Acquire::Retries=5 -o Dir::Cache::Archives=/cache/apt cuda-nvcc-12-9 cuda-cudart-dev-12-9 libcublas-dev-12-9 >/dev/null
+  # the CUDA 12 backend's toolkit (the audio.cpp server's CUDA 12 build is 12.9 too). 12.9's nvcc is needed rather than
+  # an older CUDA 12 one: the backend records device code for sm_120a, the Blackwell cards, which 12.8 added. NVIDIA's
+  # repository throttles to tens of kB/s, so its 900 MB of cuBLAS development packages are skipped when the caller
+  # mounts a CUDA 12 toolkit at /cuda12-host: its cuBLAS headers and libraries serve instead, since the CUDA 12 ABI is
+  # stable across minor versions and only the .so.12 sonames are recorded in the backend.
   export CUDA12_ROOT=/usr/local/cuda-12.9
+  if [ -d /cuda12-host/targets/x86_64-linux/lib ]; then
+    echo "[..] CUDA 12.9 from the package cache, cuBLAS from the mounted toolkit"
+    # the two cuda-toolkit-*-config-common packages the cache lacks only carry apt metadata: their absence is forced
+    dpkg -i --force-depends /cache/apt/cuda-*-12-9_*.deb /cache/apt/cuda-toolkit-config-common_*.deb >/dev/null 2>&1
+    cp -a /cuda12-host/targets/x86_64-linux/include/cublas*.h "$CUDA12_ROOT/targets/x86_64-linux/include/"
+    cp -a /cuda12-host/targets/x86_64-linux/lib/libcublas*.so* "$CUDA12_ROOT/targets/x86_64-linux/lib/"
+    # the cuda-toolkit-config-common packages that would register this folder come from the same slow repository
+    echo "$CUDA12_ROOT/targets/x86_64-linux/lib" > /etc/ld.so.conf.d/cuda-12-9.conf
+    ldconfig
+    [ -x "$CUDA12_ROOT/bin/nvcc" ] || { echo "[ERROR] the CUDA 12 compiler did not unpack"; exit 1; }
+    ldconfig -p | grep -q 'libcudart.so.12' || { echo "[ERROR] the CUDA 12 runtime is missing"; exit 1; }
+    ldconfig -p | grep -q 'libcublas.so.12' || { echo "[ERROR] the cuBLAS libraries are missing"; exit 1; }
+  else
+    echo "[..] CUDA 12.9 from the NVIDIA repository"
+    nvidia_repo
+    apt-get install -y -q --no-install-recommends -o Acquire::Retries=5 -o Dir::Cache::Archives=/cache/apt cuda-nvcc-12-9 cuda-cudart-dev-12-9 libcublas-dev-12-9 >/dev/null
+  fi
   echo "[..] source $(git -c safe.directory=/src -C /src rev-parse --short HEAD)"
   rm -rf /cache/src && mkdir -p /cache/src
   git -c safe.directory=/src -C /src archive HEAD | tar -x -C /cache/src
@@ -103,4 +128,17 @@ cache="${2:-$HOME/yue2-linux2204-cache}"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$out" "$cache"
 cp "$repo/scripts/build-linux-docker.sh" "$out/.build-linux-docker.sh"
-docker run --rm -e YUE_CUDA13="${YUE_CUDA13:-0}" -v "$repo:/src:ro" -v "$(cd "$out" && pwd):/out" -v "$cache:/cache" ubuntu:22.04 bash /out/.build-linux-docker.sh --inside
+# A complete CUDA 12 toolkit on this machine saves the container from NVIDIA's throttled repository: the build needs
+# only its cuBLAS headers and libraries, and 12.9's nvcc comes from the package cache.
+cuda12_host="${YUE_CUDA12_HOST:-}"
+if [ -z "$cuda12_host" ]; then
+  for candidate in /usr/local/cuda-12.9 /usr/local/cuda-12; do
+    if [ -x "$candidate/bin/nvcc" ]; then cuda12_host="$candidate"; break; fi
+  done
+fi
+mounts=()
+if [ -n "$cuda12_host" ]; then
+  echo "[..] cuBLAS from $cuda12_host"
+  mounts=(-v "$cuda12_host:/cuda12-host:ro")
+fi
+docker run --rm -e YUE_CUDA13="${YUE_CUDA13:-0}" -v "$repo:/src:ro" -v "$(cd "$out" && pwd):/out" -v "$cache:/cache" ${mounts[@]+"${mounts[@]}"} ubuntu:22.04 bash /out/.build-linux-docker.sh --inside
