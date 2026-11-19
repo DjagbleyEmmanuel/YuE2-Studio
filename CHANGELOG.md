@@ -3,6 +3,30 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## 2026-11-19 — 4.1.2
+
+A model and a set of LoRAs can now stay on the disk they are already on: the studio reads them there instead of
+asking for a move into its own folder.
+
+### Added
+
+- **Your own YuE2 GGUF files from a folder of your choosing** (Settings - Models): the folder is read in place,
+  beside the studio's own `models/yue2-cpp/own`, and a file on another partition works as it stands. Community
+  models still download into the studio's folder, so both are listed together. Removing a file takes it from the
+  folder it is really in. Nothing is copied.
+- **LoRA folders kept in place** (Adapters): a folder you keep for ComfyUI, a trainer or anything else, and its
+  subfolders, is remembered and read again whenever the page opens, so a file added there needs no import. Each
+  LoRA is a symlink (or a hard link on the same disk) inside the studio's adapter folder - a few hundred bytes of
+  bookkeeping, never a copy of the weights - and the engine reads the weights where they are. Removing a LoRA
+  deletes only its link; your file is untouched.
+- **Agents** reach both through `models_own_folder`, `lora_folder_keep` and `lora_folder_forget`.
+
+### Fixed
+
+- **A LoRA taken from another disk is no longer copied**: linking tried a hard link and fell back to a copy, so a
+  folder on a second partition duplicated every weight. It now falls back to a symbolic link first, and copies only
+  where the filesystem can make neither.
+
 ## 2026-11-18 — 4.1.1
 
 Upstream 4.1.0, which already carries this fork's own work - the audio editor
