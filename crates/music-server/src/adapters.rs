@@ -245,6 +245,33 @@ pub fn engine_views(props: &Value, slot_ids: &[&str]) -> BTreeMap<String, Engine
     views
 }
 
+/// One LoRA found in a folder a person keeps: its record, the name it was found by, and whether it was taken now or
+/// was already in the library. `copied` is true only when the drive offered neither a hard nor a symbolic link.
+#[derive(Debug, Serialize)]
+pub struct Taken {
+    pub meta: AdapterMeta,
+    pub name: String,
+    pub copied: bool,
+    pub already: bool,
+}
+
+/// Puts a file into an adapter's folder without moving or copying the person's own: a hard link where the drive can
+/// make one, a symbolic link across drives, and a copy only where neither can be made (a filesystem without links).
+/// Says whether a copy was taken.
+fn link_into(file: &Path, target: &Path) -> Result<bool> {
+    if fs::hard_link(file, target).is_ok() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        if std::os::unix::fs::symlink(file, target).is_ok() {
+            return Ok(false);
+        }
+    }
+    fs::copy(file, target).with_context(|| format!("copy {}", file.display()))?;
+    Ok(true)
+}
+
 pub struct AdapterLibrary {
     root: PathBuf,
     engine: String,
@@ -253,13 +280,15 @@ pub struct AdapterLibrary {
     /// set, the way the model screen fetches its components: one progress,
     /// one cancel, the files four at a time.
     installing: std::sync::Mutex<Vec<String>>,
+    /// One folder is read at a time, so two reads of the same folder cannot each take its LoRAs.
+    scanning: std::sync::Mutex<()>,
 }
 
 impl AdapterLibrary {
     /// The library of one engine's adapters, under the studio data root.
     pub fn new(data_root: &Path, engine: &str) -> Self {
         let root = data_root.join("adapters");
-        Self { downloader: Downloader::new(root.clone()), root, engine: engine.to_string(), installing: std::sync::Mutex::new(Vec::new()) }
+        Self { downloader: Downloader::new(root.clone()), root, engine: engine.to_string(), installing: std::sync::Mutex::new(Vec::new()), scanning: std::sync::Mutex::new(()) }
     }
 
     fn installing_now(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
@@ -542,31 +571,45 @@ impl AdapterLibrary {
         })
     }
 
-    /// Installs a LoRA from files on this computer without a second copy: each
-    /// file is hard-linked into the adapter's folder, and copied only where the
-    /// drive cannot link it. Says whether a copy was taken.
-    pub fn import_linked(&self, name: &str, files: &[PathBuf], origin: Origin) -> Result<(AdapterMeta, bool)> {
-        if !files.iter().any(|file| file.extension().is_some_and(|extension| extension == "safetensors")) {
-            bail!("an adapter needs at least one .safetensors file");
+    /// Takes every LoRA of a folder and its subfolders into the library, leaving the files where they are: each one
+    /// already known is left as it is, and the rest are linked in. A folder on another disk works as it stands.
+    pub fn take_folder(&self, folder: &Path, depth: usize) -> Result<Vec<Taken>> {
+        let _one = self.scanning.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut taken = Vec::new();
+        for (name, files) in found_in(folder, depth) {
+            if let Some(meta) = self.imported_from(&files) {
+                taken.push(Taken { meta, name, copied: false, already: true });
+                continue;
+            }
+            let (meta, copied) = self.import_linked(&name, &files, Origin::Imported)?;
+            taken.push(Taken { meta, name, copied, already: false });
         }
-        let id = format!("{}-{}", slug(name), &uuid::Uuid::now_v7().simple().to_string()[..8]);
-        let folder = self.folder(&id)?;
-        fs::create_dir_all(&folder)?;
-        let mut copied = false;
-        let mut trigger = None;
-        let placed = files.iter().try_for_each(|file| -> Result<()> {
-            let file_name = file.file_name().and_then(|value| value.to_str()).context("a file without a name")?;
-            if file_name == "lora.json" {
-                trigger = fs::read(file).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()).and_then(|value| value.get("trigger").and_then(Value::as_str).map(str::to_owned));
-                return Ok(());
-            }
-            let target = folder.join(file_name);
-            if fs::hard_link(file, &target).is_err() {
-                fs::copy(file, &target).with_context(|| format!("copy {}", file.display()))?;
-                copied = true;
-            }
-            Ok(())
-        });
+        Ok(taken)
+    }
+
+    /// Installs a LoRA from files on this computer without a second copy: each file is hard-linked into the adapter's
+    /// folder, or linked across drives, and copied only where no link can be made. Says whether a copy was taken.
+    pub fn import_linked(&self, name: &str, files: &[PathBuf], origin: Origin) -> Result<(AdapterMeta, bool)> {
+    if !files.iter().any(|file| file.extension().is_some_and(|extension| extension == "safetensors")) {
+        bail!("an adapter needs at least one .safetensors file");
+    }
+    let id = format!("{}-{}", slug(name), &uuid::Uuid::now_v7().simple().to_string()[..8]);
+    let folder = self.folder(&id)?;
+    fs::create_dir_all(&folder)?;
+    let mut copied = false;
+    let mut trigger = None;
+    let placed = files.iter().try_for_each(|file| -> Result<()> {
+        let file_name = file.file_name().and_then(|value| value.to_str()).context("a file without a name")?;
+        if file_name == "lora.json" {
+            trigger = fs::read(file).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()).and_then(|value| value.get("trigger").and_then(Value::as_str).map(str::to_owned));
+            return Ok(());
+        }
+        let target = folder.join(file_name);
+        if link_into(file, &target)? {
+            copied = true;
+        }
+        Ok(())
+    });
         if let Err(error) = placed {
             // the folder holds only this attempt's links and copies; the user's files stay where they are
             fs::remove_dir_all(&folder).ok();
@@ -1056,7 +1099,14 @@ impl AdapterLibrary {
 
 fn folder_bytes(folder: &Path) -> u64 {
     fs::read_dir(folder)
-        .map(|entries| entries.flatten().filter_map(|entry| entry.metadata().ok()).map(|meta| meta.len()).sum())
+        .map(|entries| {
+            entries
+                .flatten()
+                // metadata follows a link, so weights left on another drive count at their real size
+                .filter_map(|entry| fs::metadata(entry.path()).ok())
+                .map(|meta| meta.len())
+                .sum()
+        })
         .unwrap_or(0)
 }
 
@@ -1324,5 +1374,33 @@ mod tests {
         fs::write(folder.join("native-nar.safetensors"), bytes).unwrap();
         assert!(library.trained_in_sentence("trained"));
         assert!(!library.trained_in_sentence("missing"));
+    }
+
+    #[test]
+    fn a_folder_kept_elsewhere_is_read_in_place_and_taken_once() {
+        let root = std::env::temp_dir().join(format!("adapters-folder-{}", uuid::Uuid::now_v7()));
+        let kept = root.join("another-disk").join("loras");
+        fs::create_dir_all(kept.join("peft")).unwrap();
+        fs::write(kept.join("metal.safetensors"), b"weights").unwrap();
+        fs::write(kept.join("peft").join("adapter_config.json"), b"{}").unwrap();
+        fs::write(kept.join("peft").join("adapter_model.safetensors"), b"peft").unwrap();
+        let library = AdapterLibrary::new(&root.join("data"), "yue2");
+
+        let taken = library.take_folder(&kept, 2).unwrap();
+        assert_eq!(taken.len(), 2);
+        assert!(taken.iter().all(|entry| !entry.already && !entry.copied), "the same drive links, it does not copy");
+        assert_eq!(fs::read(kept.join("metal.safetensors")).unwrap(), b"weights", "the file stays where it was");
+        // the library's name is a link: changing the kept file changes what the engine reads
+        fs::write(kept.join("metal.safetensors"), b"changed").unwrap();
+        let metal = taken.iter().find(|entry| entry.name == "metal").unwrap();
+        let linked = library.root().join(&metal.meta.id).join("metal.safetensors");
+        assert_eq!(fs::read(&linked).unwrap(), b"changed", "a link, not a copy");
+
+        // reading the folder again takes nothing twice, so every visit does not grow the list
+        let again = library.take_folder(&kept, 2).unwrap();
+        assert_eq!(again.len(), 2);
+        assert!(again.iter().all(|entry| entry.already));
+        assert_eq!(library.installed(None).len(), 2);
+        fs::remove_dir_all(&root).ok();
     }
 }

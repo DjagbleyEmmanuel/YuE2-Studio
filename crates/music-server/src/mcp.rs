@@ -469,6 +469,8 @@ const JOURNAL: &[(&str, &str, &str)] = &[
     ("lora_install_hf", "installed", "lora"),
     ("lora_import_files", "installed", "lora"),
     ("lora_import_folder", "installed", "lora"),
+    ("lora_folder_keep", "installed", "lora"),
+    ("lora_folder_forget", "updated", "settings"),
     ("lora_update", "updated", "lora"),
     ("lora_delete", "deleted", "lora"),
     ("lora_export_comfyui", "exported", "lora"),
@@ -504,6 +506,7 @@ const JOURNAL: &[(&str, &str, &str)] = &[
     ("models_select", "updated", "settings"),
     ("models_preset", "updated", "settings"),
     ("models_own_select", "updated", "settings"),
+    ("models_own_folder", "updated", "settings"),
     ("models_own_cancel", "cancelled", "download"),
     ("models_own_discard", "deleted", "download"),
     ("models_own_remove", "deleted", "model"),
@@ -1067,7 +1070,7 @@ fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "models_own_list",
-                description: "Your own YuE2 models: the GGUF files in models/yue2-cpp/own (folder), each by name and size, the one the engine runs in place of the set's backbone (selected, none for the set's own), and missing when that file is gone; community, the catalog of community fine-tunes (Ruach Studio, CC BY-NC-SA 4.0) with each quantisation's file, size and whether it is downloaded; card_quant, the quantisation this card takes; download, the one under way. The VAE and the rest come from the chosen set.",
+                description: "Your own YuE2 models: the GGUF files in the folders read for them - the studio's own models/yue2-cpp/own and the one chosen with models_own_folder (folders, folder, download_folder) - each by name and size, the one the engine runs in place of the set's backbone (selected, none for the set's own), and missing when that file is gone; community, the catalog of community fine-tunes (Ruach Studio, CC BY-NC-SA 4.0) with each quantisation's file, size and whether it is downloaded; card_quant, the quantisation this card takes; download, the one under way. The VAE and the rest come from the chosen set.",
                 schema: nothing,
                 call: |_| get("/setup/own-model".into()),
             },
@@ -1096,8 +1099,14 @@ fn tools() -> &'static [Tool] {
                 call: |args| post("/setup/own-model/remove".into(), args.clone()),
             },
             Tool {
+                name: "models_own_folder",
+                description: "Set the folder your own YuE2 GGUF files are read from, in place: nothing is moved or copied, so a folder on another disk works as it stands. The studio's download folder (models/yue2-cpp/own) is always read too, so community models still arrive there. folder left out or empty keeps to the studio's folder alone. models_own_list then names every file found.",
+                schema: || object(json!({ "folder": { "type": "string", "description": "a full path, e.g. /media/Pride/yue2 models" } }), &[]),
+                call: |args| send(Method::PUT, "/setup/own-model/folder".into(), args.clone()),
+            },
+            Tool {
                 name: "models_own_reveal",
-                description: "Open the folder of your own YuE2 models (models/yue2-cpp/own) in the file manager, making it first when it is not there.",
+                description: "Open the folder of your own YuE2 models - the one chosen with models_own_folder, else models/yue2-cpp/own - in the file manager, making it first when it is not there.",
                 schema: nothing,
                 call: |_| post("/setup/own-model/reveal".into(), json!({})),
             },
@@ -1907,7 +1916,7 @@ fn tools() -> &'static [Tool] {
             // ---------------------------------------------------------------- LoRA
             Tool {
                 name: "lora_list",
-                description: "Installed LoRA (id, name, trigger word, slots, default strengths) and the catalogue of ready ones in one line each, with download progress. Pass an installed id with a strength per slot in song_create adapters. response_format detailed gives every field in every language.",
+                description: "Installed LoRA (id, name, trigger word, slots, default strengths) and the catalogue of ready ones in one line each, with download progress and the folders kept in place (folders: every LoRA in them is linked in, never copied; lora_folder_keep adds one). Pass an installed id with a strength per slot in song_create adapters. response_format detailed gives every field in every language.",
                 schema: || object(json!({ "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "detailed gives every field" } }), &[]),
                 call: |_| get("/v1/adapters".into()),
             },
@@ -2369,9 +2378,21 @@ fn tools() -> &'static [Tool] {
             },
             Tool {
                 name: "lora_import_folder",
-                description: "Install every LoRA of a folder on this computer and its subfolders without copying it: a folder with adapter_config.json is one LoRA, elsewhere each .safetensors is one; files are hard-linked, and copied only from another drive (copied: true says which).",
+                description: "Install every LoRA of a folder on this computer and its subfolders without copying it: a folder with adapter_config.json is one LoRA, elsewhere each .safetensors is one; files are hard-linked, or linked across drives, and copied only where no link can be made (copied: true says which).",
                 schema: || object(json!({ "path": { "type": "string", "description": "the folder, e.g. the LoRA folder ComfyUI or a trainer uses" } }), &["path"]),
                 call: |args| post("/v1/adapters/import-folder".into(), json!({ "path": text(args, "path")? })),
+            },
+            Tool {
+                name: "lora_folder_keep",
+                description: "Keep a folder of LoRAs in place: it is saved as one the studio reads, every LoRA in it and its subfolders is linked into the library (copied only where no link can be made), and it is read again whenever the LoRA page is opened, so a file added there needs no import. lora_list names the folders kept.",
+                schema: || object(json!({ "path": { "type": "string" } }), &["path"]),
+                call: |args| post("/v1/adapters/folders".into(), json!({ "path": text(args, "path")? })),
+            },
+            Tool {
+                name: "lora_folder_forget",
+                description: "Stop reading a folder kept in place (path, one of lora_list's folders). The LoRAs already linked from it stay installed, and their files stay where they are.",
+                schema: || object(json!({ "path": { "type": "string" } }), &["path"]),
+                call: |args| send(Method::DELETE, "/v1/adapters/folders".into(), json!({ "path": text(args, "path")? })),
             },
             Tool {
                 name: "lora_import_files",
@@ -3497,6 +3518,8 @@ mod tests {
         ("POST", "/v1/files/save/{id}", "a save dialog for the person: the tools write to the path the agent names"),
         ("POST", "/v1/files/reveal", "shows a file in the person's file manager"),
         ("POST", "/v1/storage/pick", "a folder dialog for the person: storage_set takes the folder's path"),
+        ("POST", "/setup/own-model/folder/pick", "a folder dialog for the person: models_own_folder takes the folder's path"),
+        ("GET", "/v1/adapters/folders", "the folders kept in place: lora_list carries the same list"),
         ("GET", "/v1/exports/{id}/file", "the window's Save dialog reads an export from here: song_export writes into the folder the agent names and song_export_get answers the path"),
         ("GET", "/v1/library/songs/{id}/midi/parts/{part}", "the window's Save dialog reads a part's MIDI from here: library_song_midi_part_write writes it into the folder the agent names"),
         ("GET", "/v1/exports/live/{id}/file", "the window's Save dialog reads a Live project from here: song_export_live writes it into the folder the agent names"),

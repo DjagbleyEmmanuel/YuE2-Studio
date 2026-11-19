@@ -28,7 +28,8 @@ import {
   localized,
   megabytes,
   updateAdapter,
-  importAdapterFolder,
+  addAdapterFolder,
+  removeAdapterFolder,
 } from '../services/adapters';
 
 /**
@@ -502,26 +503,38 @@ export function AdaptersPage(): React.ReactElement {
     setImporting(true);
     setError(null);
     try {
-      const answer = await importAdapterFolder();
+      const answer = await addAdapterFolder();
       if (!answer.picked) return;
       setTab('installed');
-      const copied = answer.imported.filter(entry => entry.copied).map(entry => entry.name);
-      const taken = answer.imported.filter(entry => !entry.already).length;
-      const already = answer.imported.length - taken;
-      const message = answer.imported.length === 0
+      const imported = answer.imported ?? [];
+      const copied = imported.filter(entry => entry.copied).map(entry => entry.name);
+      const taken = imported.filter(entry => !entry.already).length;
+      const already = imported.length - taken;
+      const message = imported.length === 0
         ? t('adaptersFolderNone')
         : [
           taken ? t('adaptersFolderImported').replace('{count}', String(taken)) : '',
           already ? t('adaptersFolderAlready').replace('{count}', String(already)) : '',
           copied.length ? t('adaptersFolderCopied').replace('{names}', copied.join(', ')) : '',
         ].filter(Boolean).join(' ');
-      window.dispatchEvent(new CustomEvent('yue:toast', { detail: { message, type: answer.imported.length ? 'success' : 'info' } }));
+      window.dispatchEvent(new CustomEvent('yue:toast', { detail: { message, type: imported.length ? 'success' : 'info' } }));
       window.dispatchEvent(new CustomEvent('yue:adapters-changed'));
       await refresh();
     } catch (problem) {
       setError(problem instanceof Error ? problem.message : String(problem));
     } finally {
       setImporting(false);
+    }
+  };
+
+  const dropFolder = async (folder: string) => {
+    setError(null);
+    try {
+      await removeAdapterFolder(folder);
+      window.dispatchEvent(new CustomEvent('yue:toast', { detail: { message: t('adaptersFolderRemoved'), type: 'info' } }));
+      await refresh();
+    } catch (problem) {
+      setError(problem instanceof Error ? problem.message : String(problem));
     }
   };
 
@@ -670,6 +683,29 @@ export function AdaptersPage(): React.ReactElement {
                   onChange={event => void importFiles(Array.from(event.target.files ?? []))}
                 />
               </div>
+              {(state?.folders ?? []).length > 0 && (
+                <div className="mt-3 border-t border-zinc-200 pt-3 dark:border-white/10">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">{t('adaptersFoldersTitle')}</p>
+                  <p className="mt-1 text-[11px] leading-4 text-zinc-500 dark:text-zinc-400">{t('adaptersFoldersHint')}</p>
+                  <ul className="mt-2 space-y-1">
+                    {(state?.folders ?? []).map(folder => (
+                      <li key={folder} className="flex items-center gap-2 text-[11px] text-zinc-600 dark:text-zinc-300">
+                        <FolderOpen size={12} className="shrink-0" />
+                        <span className="min-w-0 flex-1 break-all font-mono">{folder}</span>
+                        <button
+                          type="button"
+                          onClick={() => void dropFolder(folder)}
+                          title={t('adaptersFolderRemove')}
+                          aria-label={t('adaptersFolderRemove')}
+                          className="shrink-0 rounded-lg border border-zinc-300 p-1 hover:border-rose-400 hover:text-rose-600 dark:border-white/15"
+                        >
+                          <X size={12} />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </section>
 
             {state && !state.engine_checked && state.installed.some(adapter => adapter.slots.length === 0) && (

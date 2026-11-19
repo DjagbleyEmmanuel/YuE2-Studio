@@ -14,6 +14,10 @@ export type CommunityModel = {
 
 export type OwnModelStatus = {
   folder: string;
+  /** Where community models are downloaded; always read, whatever folder is chosen. */
+  download_folder?: string;
+  /** Every folder read for own models, the download folder first. */
+  folders?: string[];
   files: { name: string; bytes: number }[];
   selected: string | null;
   missing: boolean;
@@ -118,6 +122,24 @@ export const OwnModelPanel: React.FC = () => {
     }
   };
 
+  // the chosen folder holds the files where they are: the engine opens them there, nothing is moved
+  const [picking, setPicking] = useState(false);
+  const pickFolder = async () => {
+    setPicking(true);
+    try {
+      const response = await fetch('/setup/own-model/folder/pick', { method: 'POST' });
+      const picked = await response.json().catch(() => null) as { picked?: boolean; folder?: string; error?: string } | null;
+      if (!response.ok) throw new Error(picked?.error || `${response.status} ${response.statusText}`);
+      if (!picked?.picked || !picked.folder) return;
+      await send('/setup/own-model/folder', 'PUT', { folder: picked.folder });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setPicking(false);
+    }
+  };
+  const useStudioFolder = () => send('/setup/own-model/folder', 'PUT', { folder: null });
+
   const communityFiles = new Set((status?.community ?? []).flatMap((model) => model.files.map((file) => file.file)));
   const ownFiles = (status?.files ?? []).filter((file) => !communityFiles.has(file.name));
   const percent = status?.download && status.download.total_bytes > 0 ? Math.floor((status.download.downloaded_bytes / status.download.total_bytes) * 100) : 0;
@@ -189,7 +211,38 @@ export const OwnModelPanel: React.FC = () => {
       {status?.missing && status.selected && (
         <p role="alert" className="mt-1 text-[11px] leading-4 text-amber-600 dark:text-amber-300">{tt('ownModelMissing').replace('{file}', status.selected)}</p>
       )}
-      {status?.folder && <p className="mt-1 break-all font-mono text-[11px] text-zinc-600 dark:text-zinc-300">{status.folder}</p>}
+      {status?.folder && (
+        <div className="mt-2 rounded-lg border border-zinc-200 p-2 dark:border-white/10">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">{tt('ownModelFolderTitle')}</p>
+          <p className="mt-1 break-all font-mono text-[11px] text-zinc-600 dark:text-zinc-300">{status.folder}</p>
+          <p className="mt-1 text-[11px] leading-4 text-zinc-500 dark:text-zinc-400">{tt('ownModelFolderHint')}</p>
+          {status.download_folder && status.folder !== status.download_folder && (
+            <p className="mt-1 break-all text-[11px] leading-4 text-zinc-500 dark:text-zinc-400">{tt('ownModelFolderDownloads').replace('{folder}', status.download_folder)}</p>
+          )}
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void pickFolder()}
+              disabled={busy || picking}
+              className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 px-2 py-1 text-[11px] font-medium text-zinc-600 hover:border-pink-400 hover:text-pink-600 disabled:opacity-50 dark:border-white/15 dark:text-zinc-300"
+            >
+              {picking ? <Loader2 size={13} className="animate-spin" /> : <FolderOpen size={13} />}
+              {tt('ownModelFolderChange')}
+            </button>
+            {status.download_folder && status.folder !== status.download_folder && (
+              <button
+                type="button"
+                onClick={() => void useStudioFolder()}
+                disabled={busy}
+                className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 px-2 py-1 text-[11px] font-medium text-zinc-600 hover:border-pink-400 hover:text-pink-600 disabled:opacity-50 dark:border-white/15 dark:text-zinc-300"
+              >
+                <RotateCw size={13} />
+                {tt('ownModelFolderDefault')}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
       <div className="mt-2 flex flex-wrap gap-2">
         <button
           type="button"

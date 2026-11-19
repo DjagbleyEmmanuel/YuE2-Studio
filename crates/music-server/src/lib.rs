@@ -82,7 +82,7 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use music_core::{Capability, EngineDescriptor, ExecutionMode, StudioConfiguration};
@@ -110,8 +110,14 @@ struct AppState {
     selected_component_ids: Arc<RwLock<Option<Vec<String>>>>,
     /// The file in `models/yue2-cpp/own` that the engine runs in place of the set's backbone; none runs the set's.
     own_backbone: Arc<RwLock<Option<String>>>,
+    /// A folder the person keeps their own GGUF files in, read in place beside the studio's download folder; none reads
+    /// the download folder alone.
+    own_models_folder: Arc<RwLock<Option<PathBuf>>>,
     /// Downloads of community models (`community`) into `models/yue2-cpp/own`.
     community_downloads: Arc<downloads::Downloader>,
+    /// Folders the person keeps LoRAs in, read in place: each is scanned and linked into the adapter library, never
+    /// copied, so a folder on another disk works as it stands.
+    adapter_folders: Arc<RwLock<Vec<PathBuf>>>,
     settings_path: PathBuf,
     openrouter_catalog: Arc<RwLock<OpenRouterCatalogState>>,
     library: library::Library,
@@ -760,6 +766,12 @@ struct PersistedStudioSettings {
     selected_component_ids: Option<Vec<String>>,
     #[serde(default)]
     own_backbone: Option<String>,
+    /// A folder the person's own GGUF files are read from, in place; none keeps to the studio's download folder.
+    #[serde(default)]
+    own_models_folder: Option<String>,
+    /// Folders the person's LoRAs are read from, in place.
+    #[serde(default)]
+    adapter_folders: Vec<String>,
     #[serde(default)]
     cover_templates: Option<Vec<cover_prompt::CoverTemplate>>,
     #[serde(default)]
@@ -1552,6 +1564,15 @@ pub async fn serve() -> anyhow::Result<()> {
         selected_profile_id: Arc::new(RwLock::new(selected_profile_id)),
         selected_component_ids: Arc::new(RwLock::new(selected_component_ids)),
         own_backbone: Arc::new(RwLock::new(persisted.as_ref().and_then(|settings| settings.own_backbone.clone()))),
+        own_models_folder: Arc::new(RwLock::new(
+            persisted.as_ref().and_then(|settings| settings.own_models_folder.as_deref()).map(PathBuf::from),
+        )),
+        adapter_folders: Arc::new(RwLock::new(
+            persisted
+                .as_ref()
+                .map(|settings| settings.adapter_folders.iter().map(PathBuf::from).collect())
+                .unwrap_or_default(),
+        )),
         community_downloads,
         settings_path,
         openrouter_catalog: Arc::new(RwLock::new(OpenRouterCatalogState::default())),
@@ -1698,6 +1719,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/adapters", get(list_adapters))
         .route("/v1/adapters/import", post(import_adapter))
         .route("/v1/adapters/import-folder", post(import_adapter_folder))
+        .route("/v1/adapters/folders", get(list_adapter_folders).post(add_adapter_folder).delete(remove_adapter_folder))
         .route("/v1/adapters/cancel", post(cancel_adapter_download))
         .route("/v1/adapters/install", post(install_catalog_adapters))
         .route("/v1/adapters/hub", get(search_hub_adapters))
@@ -1820,6 +1842,8 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/setup/select", post(setup_select))
         .route("/setup/preset", post(setup_preset))
         .route("/setup/own-model", get(own_model_status).put(own_model_select))
+        .route("/setup/own-model/folder", put(own_model_set_folder))
+        .route("/setup/own-model/folder/pick", post(own_model_pick_folder))
         .route("/setup/own-model/reveal", post(own_model_reveal))
         .route("/setup/own-model/cancel", post(own_model_cancel))
         .route("/setup/own-model/discard", post(own_model_discard))
@@ -2708,6 +2732,18 @@ async fn install_separation_model(State(state): State<AppState>) -> Result<Json<
 /// the download in progress. The engine is asked only when it is already up;
 /// a stopped engine leaves the slots the studio remembered.
 async fn list_adapters(State(state): State<AppState>) -> Json<Value> {
+    // a folder the person keeps their LoRAs in is read again on every visit: a file added there needs no restart
+    let folders = state.adapter_folders.read().await.clone();
+    for folder in &folders {
+        let library = state.adapters.clone();
+        let searched = folder.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(error) = library.take_folder(&searched, 2) {
+                eprintln!("[ERROR] adapters: {} was not read: {error:#}", searched.display());
+            }
+        })
+        .await;
+    }
     let slot_ids: Vec<&str> = music_engine::yue_server::ADAPTER_SLOTS.iter().map(|slot| slot.id).collect();
     let views = match tokio::time::timeout(std::time::Duration::from_secs(3), state.music_server.props()).await {
         Ok(Ok(props)) => Some(adapters::engine_views(&props, &slot_ids)),
@@ -2722,6 +2758,8 @@ async fn list_adapters(State(state): State<AppState>) -> Json<Value> {
         "engine_checked": views.is_some(),
         "download": state.adapters.downloader().active_for(adapters::SCOPE).await,
         "installing": state.adapters.installing(),
+        // the folders read in place, in the order they are read
+        "folders": folders.iter().map(|folder| folder.display().to_string()).collect::<Vec<_>>(),
     }))
 }
 
@@ -2834,21 +2872,98 @@ async fn import_adapter_folder(State(state): State<AppState>, body: axum::body::
     let library = state.adapters.clone();
     let searched = folder.clone();
     let imported = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
-        let mut imported = Vec::new();
-        for (name, files) in adapters::found_in(&searched, 2) {
-            if let Some(meta) = library.imported_from(&files) {
-                imported.push(serde_json::json!({ "id": meta.id, "name": name, "copied": false, "already": true }));
-                continue;
-            }
-            let (meta, copied) = library.import_linked(&name, &files, adapters::Origin::Imported)?;
-            imported.push(serde_json::json!({ "id": meta.id, "name": name, "copied": copied }));
-        }
-        Ok(imported)
+        Ok(library
+            .take_folder(&searched, 2)?
+            .into_iter()
+            .map(|taken| serde_json::json!({ "id": taken.meta.id, "name": taken.name, "copied": taken.copied, "already": taken.already }))
+            .collect())
     })
     .await
     .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
     Ok(Json(serde_json::json!({ "picked": true, "folder": folder.display().to_string(), "imported": imported })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AdapterFolderRequest {
+    /// A folder an agent names; the window leaves it out and the person picks one in a dialog.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+fn adapter_folder_list(folders: &[PathBuf]) -> Vec<String> {
+    folders.iter().map(|folder| folder.display().to_string()).collect()
+}
+
+/// The folders the person's LoRAs are read from in place.
+async fn list_adapter_folders(State(state): State<AppState>) -> Json<Value> {
+    let folders = state.adapter_folders.read().await.clone();
+    Json(serde_json::json!({ "folders": adapter_folder_list(&folders) }))
+}
+
+/// Keeps a folder of LoRAs in place: it is remembered as one of the studio's folders and read again on every visit, and
+/// every LoRA in it and its subfolders is linked into the library - never moved, and copied only where no link can be
+/// made. The folder is picked in a dialog when none is named.
+async fn add_adapter_folder(State(state): State<AppState>, body: axum::body::Bytes) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let named = serde_json::from_slice::<AdapterFolderRequest>(&body).unwrap_or_default().path.map(PathBuf::from);
+    let picked = match named {
+        Some(folder) => Some(folder),
+        None => tokio::task::spawn_blocking(|| rfd::FileDialog::new().set_title("Folder with LoRA").pick_folder())
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+    };
+    let Some(folder) = picked else {
+        return Ok(Json(serde_json::json!({ "picked": false })));
+    };
+    if !folder.is_absolute() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "the folder must be a full path".into()));
+    }
+    if !folder.is_dir() {
+        return Err(api_error(StatusCode::BAD_REQUEST, format!("{} is not a folder", folder.display())));
+    }
+    {
+        let mut folders = state.adapter_folders.write().await;
+        if !folders.iter().any(|known| known == &folder) {
+            folders.push(folder.clone());
+        }
+    }
+    persist_studio_settings(&state)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("the folder was not saved: {error:#}")))?;
+    let library = state.adapters.clone();
+    let searched = folder.clone();
+    let taken = tokio::task::spawn_blocking(move || library.take_folder(&searched, 2))
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    let folders = state.adapter_folders.read().await.clone();
+    Ok(Json(serde_json::json!({
+        "picked": true,
+        "folder": folder.display().to_string(),
+        "folders": adapter_folder_list(&folders),
+        "imported": taken
+            .into_iter()
+            .map(|taken| serde_json::json!({ "id": taken.meta.id, "name": taken.name, "copied": taken.copied, "already": taken.already }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+/// Stops reading a folder in place. The LoRAs already taken from it stay installed: their files are where they were.
+async fn remove_adapter_folder(State(state): State<AppState>, body: axum::body::Bytes) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let path = serde_json::from_slice::<AdapterFolderRequest>(&body)
+        .unwrap_or_default()
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "name the folder to stop reading".into()))?;
+    state.adapter_folders.write().await.retain(|folder| folder != &path);
+    persist_studio_settings(&state)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("the folder was not saved: {error:#}")))?;
+    let folders = state.adapter_folders.read().await.clone();
+    Ok(Json(serde_json::json!({ "folders": adapter_folder_list(&folders) })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -6353,14 +6468,13 @@ pub(crate) async fn processor_chosen(state: &AppState) -> bool {
 async fn selected_engine_models(state: &AppState) -> Result<music_engine::yue_server::YueModelFiles, String> {
     let mut models = set_engine_models(state).await?;
     if let Some(name) = state.own_backbone.read().await.clone() {
-        let folder = own_models_folder(state);
-        let file = folder.join(&name);
-        if !file.is_file() {
+        let folders = own_model_folders(state).await;
+        let Some(file) = find_own_model(&folders, &name) else {
             return Err(format!(
-                "your own model {name} is not in {}: put it back, or choose Do not use under Your own YuE2 model in Settings - Models",
-                folder.display()
+                "your own model {name} is not in {}: put it back, choose another folder under Your own YuE2 model in Settings - Models, or choose Do not use",
+                folders.iter().map(|folder| folder.display().to_string()).collect::<Vec<_>>().join(" or ")
             ));
-        }
+        };
         models.backbone = file;
     }
     Ok(models)
@@ -6390,29 +6504,63 @@ async fn set_engine_models(state: &AppState) -> Result<music_engine::yue_server:
     })
 }
 
-/// The folder of the person's own YuE2 weights, `models/yue2-cpp/own`: any GGUF there can stand in for the set's
-/// backbone. The studio neither downloads nor checks these files.
-fn own_models_folder(state: &AppState) -> PathBuf {
+/// The folder community models are downloaded into, `models/yue2-cpp/own`. It is always read: the studio's own
+/// downloads stay there whatever folder the person chooses for their files.
+fn own_model_download_folder(state: &AppState) -> PathBuf {
     state.model_manager.models_directory().join("own")
 }
 
-/// The GGUF files of `folder` by name with their sizes, in name order; none when the folder is not there.
-fn own_model_files(folder: &std::path::Path) -> Vec<(String, u64)> {
-    let mut files: Vec<(String, u64)> = fs::read_dir(folder)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file() || kind.is_symlink()))
-                .filter_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let gguf = std::path::Path::new(&name).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
-                    gguf.then(|| (name, entry.metadata().map(|meta| meta.len()).unwrap_or(0)))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+/// The folder the person chose for their own YuE2 weights, read in place; none keeps to the download folder.
+async fn own_models_folder(state: &AppState) -> PathBuf {
+    state
+        .own_models_folder
+        .read()
+        .await
+        .clone()
+        .unwrap_or_else(|| own_model_download_folder(state))
+}
+
+/// Every folder read for own models: the download folder first, then the person's chosen one. A chosen folder that is
+/// the download folder, or the same folder written another way, is not listed twice.
+async fn own_model_folders(state: &AppState) -> Vec<PathBuf> {
+    let download = own_model_download_folder(state);
+    let chosen = state.own_models_folder.read().await.clone();
+    match chosen {
+        Some(folder) if fs::canonicalize(&folder).ok() != fs::canonicalize(&download).ok() => vec![download, folder],
+        Some(folder) if fs::canonicalize(&folder).is_err() => vec![download, folder],
+        _ => vec![download],
+    }
+}
+
+/// The GGUF files of every folder by name with their sizes, in name order; a name found in the first folder wins.
+/// None when no folder is there.
+fn own_model_files(folders: &[PathBuf]) -> Vec<(String, u64)> {
+    let mut files: Vec<(String, u64)> = Vec::new();
+    for folder in folders {
+        let mut found: Vec<(String, u64)> = fs::read_dir(folder)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        let gguf = std::path::Path::new(&name).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
+                        // metadata follows a link, so a file left where it is reads at its real size
+                        gguf.then(|| (name, fs::metadata(entry.path()).map(|meta| meta.len()).unwrap_or(0)))
+                    })
+                    .filter(|(name, _)| !files.iter().any(|(known, _)| known == name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.sort();
+        files.extend(found);
+    }
     files.sort();
     files
+}
+
+/// Where the named own model really is, across every folder read: the download folder first, then the chosen one.
+fn find_own_model(folders: &[PathBuf], name: &str) -> Option<PathBuf> {
+    folders.iter().map(|folder| folder.join(name)).find(|path| path.is_file())
 }
 
 /// yue-server takes its weights at launch, so a different selection only takes
@@ -6960,6 +7108,8 @@ async fn persist_studio_settings(state: &AppState) -> anyhow::Result<()> {
         selected_profile_id: state.selected_profile_id.read().await.clone(),
         selected_component_ids: state.selected_component_ids.read().await.clone(),
         own_backbone: state.own_backbone.read().await.clone(),
+        own_models_folder: state.own_models_folder.read().await.as_ref().map(|folder| folder.display().to_string()),
+        adapter_folders: state.adapter_folders.read().await.iter().map(|folder| folder.display().to_string()).collect(),
         cover_templates: Some(state.cover_templates.read().await.clone()),
         cover_template_default: state.cover_template_default.read().await.clone(),
         separation: Some(state.separation_config.read().await.clone()),
@@ -9744,12 +9894,14 @@ async fn setup_preset(State(state): State<AppState>, Json(request): Json<SetupPr
     Ok(Json(serde_json::to_value(compose_setup_status(&state, manager_status).await).unwrap_or(Value::Null)))
 }
 
-/// The person's own YuE2 files in `models/yue2-cpp/own`, the one chosen, and whether that one is still there; the
+/// The person's own YuE2 files in the folders read for them, the one chosen, and whether that one is still there; the
 /// community models with each file's size, whether it is downloaded and how much an unfinished download of it left on
 /// disk, the quantisation the card takes, and the download under way.
 async fn own_model_status(State(state): State<AppState>) -> Json<Value> {
-    let folder = own_models_folder(&state);
-    let files = own_model_files(&folder);
+    let folders = own_model_folders(&state).await;
+    let folder = own_models_folder(&state).await;
+    let download_folder = own_model_download_folder(&state);
+    let files = own_model_files(&folders);
     let selected = state.own_backbone.read().await.clone();
     let missing = selected.as_ref().is_some_and(|name| !files.iter().any(|(file, _)| file == name));
     let card_quant = community::file(community::catalog()[0].id, None, hardware::hardware().total_vram_gb).map(|file| file.quant);
@@ -9774,6 +9926,8 @@ async fn own_model_status(State(state): State<AppState>) -> Json<Value> {
         .collect();
     Json(serde_json::json!({
         "folder": folder.display().to_string(),
+        "download_folder": download_folder.display().to_string(),
+        "folders": folders.iter().map(|folder| folder.display().to_string()).collect::<Vec<_>>(),
         "files": files.iter().map(|(name, bytes)| serde_json::json!({ "name": name, "bytes": bytes })).collect::<Vec<_>>(),
         "selected_name": selected.as_deref().and_then(community::name_of),
         "selected": selected,
@@ -9802,10 +9956,10 @@ struct OwnModelRequest {
 /// card's) already in the folder is chosen as its file; one not there yet is downloaded into it first and chosen
 /// once its digest matches the pin.
 async fn own_model_select(State(state): State<AppState>, Json(request): Json<OwnModelRequest>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let folder = own_models_folder(&state);
+    let folders = own_model_folders(&state).await;
     let chosen = if let Some(id) = request.community.as_deref().filter(|id| !id.trim().is_empty()) {
         let vram = hardware::hardware().total_vram_gb;
-        let on_disk: Vec<String> = own_model_files(&folder).into_iter().map(|(name, _)| name).collect();
+        let on_disk: Vec<String> = own_model_files(&folders).into_iter().map(|(name, _)| name).collect();
         let chosen_file = match community::choice(&on_disk, id.trim(), request.quant.as_deref(), vram) {
             community::Choice::Unknown => {
                 return Err(api_error(StatusCode::BAD_REQUEST, format!("{id} in {} is not a community model", request.quant.as_deref().unwrap_or("the card's quantisation"))));
@@ -9838,8 +9992,11 @@ async fn own_model_select(State(state): State<AppState>, Json(request): Json<Own
         request.file.map(|name| name.trim().to_string()).filter(|name| !name.is_empty())
     };
     if let Some(name) = &chosen {
-        if !own_model_files(&folder).iter().any(|(file, _)| file == name) {
-            return Err(api_error(StatusCode::BAD_REQUEST, format!("{name} is not a GGUF file in {}", folder.display())));
+        if !own_model_files(&folders).iter().any(|(file, _)| file == name) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("{name} is not a GGUF file in {}", folders.iter().map(|folder| folder.display().to_string()).collect::<Vec<_>>().join(" or ")),
+            ));
         }
     }
     *state.own_backbone.write().await = chosen;
@@ -9866,7 +10023,8 @@ async fn own_model_discard(State(state): State<AppState>, Json(request): Json<Ow
     let id = request.community.as_deref().map(str::trim).filter(|id| !id.is_empty()).ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "name the community model to discard".into()))?;
     let file = community::file(id, request.quant.as_deref(), hardware::hardware().total_vram_gb)
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, format!("{id} in {} is not a community model", request.quant.as_deref().unwrap_or("the card's quantisation"))))?;
-    if own_model_files(&own_models_folder(&state)).iter().any(|(name, _)| name == file.asset.relative_path) {
+    let folders = own_model_folders(&state).await;
+    if own_model_files(&folders).iter().any(|(name, _)| name == file.asset.relative_path) {
         return Err(api_error(StatusCode::CONFLICT, format!("{} arrived whole; remove it instead", file.asset.relative_path)));
     }
     if state.community_downloads.active().await.is_some_and(|progress| !progress.done && progress.asset_id == file.asset.id) {
@@ -9881,14 +10039,17 @@ struct OwnModelRemoveRequest {
     file: String,
 }
 
-/// Moves one file of the own-models folder to the system's recycle bin; the engine runs the set's model again when
-/// it was the chosen one.
+/// Moves one file of the own-models folders to the system's recycle bin; the engine runs the set's model again when
+/// it was the chosen one. The file goes from whichever folder it is really in.
 async fn own_model_remove(State(state): State<AppState>, Json(request): Json<OwnModelRemoveRequest>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let folder = own_models_folder(&state);
+    let folders = own_model_folders(&state).await;
     let name = request.file.trim().to_string();
-    if !own_model_files(&folder).iter().any(|(file, _)| *file == name) {
-        return Err(api_error(StatusCode::BAD_REQUEST, format!("{name} is not a GGUF file in {}", folder.display())));
-    }
+    let Some(path) = find_own_model(&folders, &name) else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{name} is not a GGUF file in {}", folders.iter().map(|folder| folder.display().to_string()).collect::<Vec<_>>().join(" or ")),
+        ));
+    };
     let was_chosen = state.own_backbone.read().await.as_deref() == Some(name.as_str());
     if was_chosen {
         *state.own_backbone.write().await = None;
@@ -9897,13 +10058,13 @@ async fn own_model_remove(State(state): State<AppState>, Json(request): Json<Own
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("the choice was not saved: {error:#}")))?;
         reload_engine_if_models_changed(&state).await;
     }
-    trash::delete(folder.join(&name)).map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{name} did not go to the recycle bin: {error}")))?;
+    trash::delete(&path).map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{name} did not go to the recycle bin: {error}")))?;
     Ok(own_model_status(State(state)).await)
 }
 
-/// Opens the own-models folder in the file manager, made first when it is not there yet.
+/// Opens the folder the person's own models are read from in the file manager, made first when it is not there yet.
 async fn own_model_reveal(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let folder = own_models_folder(&state);
+    let folder = own_models_folder(&state).await;
     fs::create_dir_all(&folder).map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("create {}: {error}", folder.display())))?;
     #[cfg(windows)]
     let opened = music_engine::process_group::detach_from_group(&mut std::process::Command::new("explorer.exe")).arg(&folder).spawn();
@@ -9913,6 +10074,49 @@ async fn own_model_reveal(State(state): State<AppState>) -> Result<Json<Value>, 
     let opened = music_engine::process_group::detach_from_group(&mut dub_core::proc::host_command("xdg-open")).arg(&folder).spawn();
     opened.map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({ "opened": folder.display().to_string() })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OwnModelFolderRequest {
+    /// A folder to read the person's own GGUF files from; null or empty goes back to the studio's download folder.
+    #[serde(default)]
+    folder: Option<String>,
+}
+
+/// Sets the folder the person's own YuE2 files are read from, or clears it back to the studio's download folder.
+/// Nothing moves or is copied: the files stay where they are and the engine opens them there. The download folder
+/// is always read too, so a community model still arrives where the studio expects it.
+async fn own_model_set_folder(State(state): State<AppState>, body: axum::body::Bytes) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let request = serde_json::from_slice::<OwnModelFolderRequest>(&body).unwrap_or_default();
+    let chosen = match request.folder.as_deref().map(str::trim).filter(|folder| !folder.is_empty()) {
+        Some(folder) => {
+            let folder = PathBuf::from(folder);
+            if !folder.is_absolute() {
+                return Err(api_error(StatusCode::BAD_REQUEST, "the folder must be a full path".into()));
+            }
+            if !folder.is_dir() {
+                return Err(api_error(StatusCode::BAD_REQUEST, format!("{} is not a folder", folder.display())));
+            }
+            Some(folder)
+        }
+        None => None,
+    };
+    *state.own_models_folder.write().await = chosen;
+    persist_studio_settings(&state)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("the folder was not saved: {error:#}")))?;
+    Ok(own_model_status(State(state)).await)
+}
+
+/// The folder dialog for the person's own YuE2 files; the window sets what comes back with `own_model_set_folder`.
+async fn own_model_pick_folder() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let picked = tokio::task::spawn_blocking(|| rfd::FileDialog::new().set_title("Folder with your own YuE2 models").pick_folder())
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "picked": picked.is_some(),
+        "folder": picked.map(|folder| folder.display().to_string()),
+    })))
 }
 
 /// The window told the person that Auto took the KV cache to Q8: it is not told again in this run of the studio.
@@ -13586,6 +13790,8 @@ mod tests {
             selected_profile_id: None,
             selected_component_ids: Some(vec!["backbone-q8".into(), "vae-f32".into()]),
             own_backbone: Some("YuE2-3B-RS-TW-2.0x0.75-Q8_0.gguf".into()),
+            own_models_folder: Some("/media/models/yue2".into()),
+            adapter_folders: vec!["/media/models/loras".into()],
             cover_templates: Some(cover_prompt::default_templates()),
             cover_auto: Some(true),
             cover_look: None,
@@ -13601,6 +13807,8 @@ mod tests {
         assert!(restored.selected_profile_id.is_none());
         assert_eq!(restored.selected_component_ids.unwrap(), vec!["backbone-q8", "vae-f32"]);
         assert_eq!(restored.own_backbone.as_deref(), Some("YuE2-3B-RS-TW-2.0x0.75-Q8_0.gguf"));
+        assert_eq!(restored.own_models_folder.as_deref(), Some("/media/models/yue2"), "a folder of own models survives a restart");
+        assert_eq!(restored.adapter_folders, vec!["/media/models/loras"], "and the folders LoRAs are read from");
         // Engine flags survive a restart, and the songs-per-request ceiling is
         // derived from them rather than assumed.
         assert_eq!(restored.engine_options.keep_loaded, KeepLoaded::Yes);
@@ -13896,5 +14104,41 @@ mod tests {
             assert!(allowed.is_match(set), "{set} is not a set id the hub takes");
         }
         std::fs::remove_dir_all(&data).ok();
+    }
+
+    #[test]
+    fn own_models_are_read_in_place_from_the_folders_chosen() {
+        let root = std::env::temp_dir().join(format!("own-models-{}", uuid::Uuid::now_v7()));
+        let downloads = root.join("data").join("yue2-cpp").join("own");
+        let chosen = root.join("another-disk").join("yue2");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::create_dir_all(&chosen).unwrap();
+        fs::write(downloads.join("community-Q8_0.gguf"), b"bought").unwrap();
+        fs::write(chosen.join("mine-Q6_K.gguf"), b"mine").unwrap();
+        fs::write(chosen.join("notes.txt"), b"not a model").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(chosen.join("mine-Q6_K.gguf"), chosen.join("linked-Q4_K_M.gguf")).unwrap();
+
+        let folders = vec![downloads.clone(), chosen.clone()];
+        let files = own_model_files(&folders);
+        let mut expected = vec!["community-Q8_0.gguf", "mine-Q6_K.gguf"];
+        #[cfg(unix)]
+        expected.push("linked-Q4_K_M.gguf");
+        expected.sort();
+        assert_eq!(files.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), expected, "only .gguf files, from every folder");
+        assert_eq!(files.iter().find(|(name, _)| name == "mine-Q6_K.gguf").unwrap().1, 4, "read where it lies");
+        #[cfg(unix)]
+        assert_eq!(
+            files.iter().find(|(name, _)| name == "linked-Q4_K_M.gguf").unwrap().1,
+            4,
+            "a link is weighed by the file it points at"
+        );
+        assert_eq!(find_own_model(&folders, "mine-Q6_K.gguf"), Some(chosen.join("mine-Q6_K.gguf")), "found in the chosen folder");
+        assert_eq!(find_own_model(&folders, "missing.gguf"), None);
+        // a name in the studio's download folder wins: what it downloaded is what it lists
+        fs::write(chosen.join("community-Q8_0.gguf"), b"not this one").unwrap();
+        assert_eq!(own_model_files(&folders).iter().filter(|(name, _)| name == "community-Q8_0.gguf").count(), 1);
+        assert_eq!(find_own_model(&folders, "community-Q8_0.gguf"), Some(downloads.join("community-Q8_0.gguf")));
+        fs::remove_dir_all(&root).ok();
     }
 }

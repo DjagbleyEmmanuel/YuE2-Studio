@@ -76,6 +76,8 @@ export interface AdapterState {
   download: AdapterDownload | null;
   /** The catalogue entries of the download running now. */
   installing: string[];
+  /** Folders kept in place: every LoRA in them is linked into the library, never copied. */
+  folders?: string[];
 }
 
 /** One adapter of a song: its folder and a strength per slot. */
@@ -198,9 +200,33 @@ export async function importAdapter(name: string, files: File[]): Promise<Instal
   return body;
 }
 
-/** LoRAs from a folder the user picks in a system dialog, linked in without a copy. */
-export async function importAdapterFolder(): Promise<{ picked: boolean; imported: Array<{ id: string; name: string; copied: boolean; already?: boolean }> }> {
-  const response = await fetch('/v1/adapters/import-folder', { method: 'POST' });
+/** One folder kept in place and what was taken from it. */
+export interface AdapterFolderResult {
+  picked: boolean;
+  folder?: string;
+  folders?: string[];
+  imported?: Array<{ id: string; name: string; copied: boolean; already?: boolean }>;
+}
+
+/** Keeps a folder of LoRAs in place: it is read again on every visit, and its files are linked into the library, not copied. */
+export async function addAdapterFolder(): Promise<AdapterFolderResult> {
+  const response = await fetch('/v1/adapters/folders', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `LoRA folder: HTTP ${response.status}`);
+  return body;
+}
+
+/** Stops reading a folder in place; the LoRAs already linked from it stay installed. */
+export async function removeAdapterFolder(path: string): Promise<{ folders: string[] }> {
+  const response = await fetch('/v1/adapters/folders', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || `LoRA folder: HTTP ${response.status}`);
   return body;
